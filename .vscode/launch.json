@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:nearfield}",
+            "name": "Debug Nearfield",
+            "target": "Nearfield",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Nearfield"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:nearfield}",
+            "name": "Release Nearfield",
+            "target": "Nearfield",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Nearfield"
+        }
+    ]
+}

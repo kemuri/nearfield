@@ -1,0 +1,17 @@
+.build/
+dist/
+Vendor/proxy-audio-device/build/
+.DS_Store
+*.xcuserstate
+.claude/
+*.dmg
+*.pkg
+*.zip
+appcast.xml
+*.p8
+*.p12
+*.cer
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile
