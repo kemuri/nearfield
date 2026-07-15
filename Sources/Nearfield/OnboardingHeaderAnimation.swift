@@ -4,12 +4,15 @@ struct NearfieldHeaderAnimation: View {
     var configuration = NearfieldHeaderAnimationConfiguration.onboarding
     /// When true the per-frame animation stops (used when the window is hidden).
     var paused: Bool = false
+    /// Transient visual response, used by Wave Lab only. This is deliberately not
+    /// part of the exported static configuration.
+    var audioLevel: Double = 0
 
     var body: some View {
         // The render effect is applied to the animation only — callers overlay
         // the logo and title on top, so those stay crisp and untouched.
         AnimationEffectsView(effect: configuration.effect, settings: configuration.effectSettings, paused: paused) {
-            CoreHeaderAnimation(configuration: configuration, paused: paused)
+            CoreHeaderAnimation(configuration: configuration, paused: paused, audioLevel: audioLevel)
         }
     }
 }
@@ -22,6 +25,7 @@ struct InterpolatedHeaderAnimation: View, @MainActor Animatable {
     let normal: NearfieldHeaderAnimationConfiguration
     let hover: NearfieldHeaderAnimationConfiguration
     var paused: Bool = false
+    var audioLevel: Double = 0
 
     var animatableData: Double {
         get { progress }
@@ -31,7 +35,8 @@ struct InterpolatedHeaderAnimation: View, @MainActor Animatable {
     var body: some View {
         NearfieldHeaderAnimation(
             configuration: .interpolated(from: normal, to: hover, t: progress),
-            paused: paused
+            paused: paused,
+            audioLevel: audioLevel
         )
     }
 }
@@ -47,6 +52,7 @@ private final class WavePhaseClock {
 private struct CoreHeaderAnimation: View {
     let configuration: NearfieldHeaderAnimationConfiguration
     var paused: Bool = false
+    var audioLevel: Double = 0
     @State private var startDate = Date()
     @State private var clock = WavePhaseClock()
 
@@ -54,27 +60,28 @@ private struct CoreHeaderAnimation: View {
     /// computing `elapsed * speed`. Changing the speed (including while it tweens
     /// between hover states) then only changes the rate going forward, instead of
     /// retroactively scrubbing the whole curve.
-    private func advancePhase(to now: Date) -> Double {
+    private func advancePhase(to now: Date, speed: Double) -> Double {
         let dt = min(max(clock.lastDate.map { now.timeIntervalSince($0) } ?? 0, 0), 0.1)
         clock.lastDate = now
-        clock.phase += dt * configuration.animationSpeed * 2 * Double.pi
+        clock.phase += dt * speed * 2 * Double.pi
         return clock.phase
     }
 
     var body: some View {
         TimelineView(.animation(paused: paused)) { timeline in
             let now = timeline.date
-            let phase = advancePhase(to: now)
+            let liveConfiguration = configuration.audioReactive(level: audioLevel)
+            let phase = advancePhase(to: now, speed: liveConfiguration.animationSpeed)
 
             // A frozen seed keeps the grain static; otherwise it advances at the
             // configured frame rate so the noise shimmers.
             let elapsed = now.timeIntervalSince(startDate)
-            let noiseSeed = configuration.noise.animated
-                ? Int(elapsed * Double(configuration.noise.framesPerSecond))
+            let noiseSeed = liveConfiguration.noise.animated
+                ? Int(elapsed * Double(liveConfiguration.noise.framesPerSecond))
                 : 0
 
             ZStack {
-                configuration.baseColor
+                liveConfiguration.baseColor
 
                 // Both crossing sine waves live inside a single progressive-blur
                 // group that fades sharp to soft across the width, then blends
@@ -84,29 +91,29 @@ private struct CoreHeaderAnimation: View {
                 Group {
                     if MetalEffectLibrary.isAvailable {
                         MetalProgressiveWaveLayer(
-                            waves: [configuration.primaryWave, configuration.secondaryWave],
+                            waves: [liveConfiguration.primaryWave, liveConfiguration.secondaryWave],
                             phase: phase,
-                            maximumBlurRadius: configuration.maximumProgressiveBlurRadius,
-                            exponent: configuration.progressiveBlurExponent,
-                            blurStrongOnLeft: configuration.blurStrongOnLeft
+                            maximumBlurRadius: liveConfiguration.maximumProgressiveBlurRadius,
+                            exponent: liveConfiguration.progressiveBlurExponent,
+                            blurStrongOnLeft: liveConfiguration.blurStrongOnLeft
                         )
                     } else {
                         ProgressiveSineWaveLayer(
-                            waves: [configuration.primaryWave, configuration.secondaryWave],
+                            waves: [liveConfiguration.primaryWave, liveConfiguration.secondaryWave],
                             phase: phase,
-                            segments: configuration.progressiveBlurSegments,
-                            maximumBlurRadius: configuration.maximumProgressiveBlurRadius,
-                            exponent: configuration.progressiveBlurExponent,
-                            blurStrongOnLeft: configuration.blurStrongOnLeft
+                            segments: liveConfiguration.progressiveBlurSegments,
+                            maximumBlurRadius: liveConfiguration.maximumProgressiveBlurRadius,
+                            exponent: liveConfiguration.progressiveBlurExponent,
+                            blurStrongOnLeft: liveConfiguration.blurStrongOnLeft
                         )
                     }
                 }
                 .compositingGroup()
-                .blendMode(configuration.waveBlendMode)
+                .blendMode(liveConfiguration.waveBlendMode)
 
-                HeaderNoiseLayer(configuration: configuration.noise, seed: noiseSeed)
+                HeaderNoiseLayer(configuration: liveConfiguration.noise, seed: noiseSeed)
                     .compositingGroup()
-                    .blendMode(configuration.noise.blendMode)
+                    .blendMode(liveConfiguration.noise.blendMode)
             }
             .drawingGroup()
         }
@@ -134,45 +141,45 @@ struct NearfieldHeaderAnimationConfiguration {
 
     /// Resting state shown on the welcome screen.
     static let onboarding = NearfieldHeaderAnimationConfiguration(
-        baseColor: Color(red: 0.9771, green: 0.6537, blue: 0.2700),
-        animationSpeed: 0.055,
+        baseColor: Color(red: 0.4901, green: 0.0157, blue: 0.9686),
+        animationSpeed: 0.259,
         loopResetInterval: 20_000,
         waveBlendMode: .softLight,
         primaryWave: HeaderSineWaveConfiguration(
-            color: .white,
-            opacity: 0.850,
-            lineWidth: 26,
-            frequency: 2.085,
-            amplitude: 0.335,
+            color: Color(red: 1.0000, green: 1.0000, blue: 1.0000),
+            opacity: 0.863,
+            lineWidth: 35.687,
+            frequency: 2.102,
+            amplitude: 0.367,
             amplitudeFalloff: 0,
             verticalPosition: 0.499,
             phaseOffset: -0.48,
             speedMultiplier: 1,
-            horizontalOverscan: 238,
+            horizontalOverscan: 242.9,
             blurRadius: 0
         ),
         secondaryWave: HeaderSineWaveConfiguration(
-            color: .white,
+            color: Color(red: 1.0000, green: 1.0000, blue: 1.0000),
             opacity: 0.329,
-            lineWidth: 26,
-            frequency: 2.085,
-            amplitude: 0.335,
+            lineWidth: 30.631,
+            frequency: 2.102,
+            amplitude: 0.367,
             amplitudeFalloff: 0,
             verticalPosition: 0.499,
             phaseOffset: -3.62,
             speedMultiplier: 1,
-            horizontalOverscan: 238,
+            horizontalOverscan: 242.9,
             blurRadius: 0
         ),
-        progressiveBlurSegments: 7,
-        maximumProgressiveBlurRadius: 15.25,
-        progressiveBlurExponent: 3.99,
+        progressiveBlurSegments: 6,
+        maximumProgressiveBlurRadius: 30.17,
+        progressiveBlurExponent: 4.00,
         blurStrongOnLeft: true,
         noise: HeaderNoiseConfiguration(
             opacity: 0,
-            density: 12000,
-            minimumDotSize: 1.80,
-            maximumDotSize: 0.92,
+            density: 4518,
+            minimumDotSize: 0.68,
+            maximumDotSize: 1.78,
             framesPerSecond: 11,
             animated: true,
             monochrome: false,
@@ -180,39 +187,56 @@ struct NearfieldHeaderAnimationConfiguration {
             blendMode: .softLight
         ),
         effect: .none,
-        effectSettings: .default
+        effectSettings: WaveLabEffectSettings(
+            greyscaleAmount: 1.00,
+            pixelBlockSize: 6.0,
+            ditherContrast: 1.50,
+            ditherCellSize: 3.0,
+            ditherLevels: 3,
+            glitchAmount: 5.0,
+            glitchSliceCount: 5,
+            glitchSliceDisplacement: 22.0,
+            glitchSpeed: 1.00
+        )
     )
+
+    /// Settings keeps the onboarding artwork but runs at one-third speed.
+    static let settings: NearfieldHeaderAnimationConfiguration = {
+        var configuration = onboarding
+        configuration.animationSpeed /= 3
+        return configuration
+    }()
 
     /// Hover state, used while the pointer is over the Install button.
     static let onboardingHover = NearfieldHeaderAnimationConfiguration(
-        baseColor: Color(red: 0.9961, green: 0.4702, blue: 0.1203),
-        animationSpeed: 1.093,
+        baseColor: Color(red: 0.6231, green: 0.2033, blue: 1.0000),
+        animationSpeed: 1.211,
         loopResetInterval: 20_000,
         waveBlendMode: .softLight,
         primaryWave: HeaderSineWaveConfiguration(
-            color: .white,
+            color: Color(red: 1.0000, green: 1.0000, blue: 1.0000),
             opacity: 0.850,
             lineWidth: 26,
-            frequency: 2.085,
-            amplitude: 0.335,
-            amplitudeFalloff: 0.314,
+            frequency: 2.475,
+            amplitude: 0.369,
+            amplitudeFalloff: 0.452,
             verticalPosition: 0.499,
             phaseOffset: -0.48,
             speedMultiplier: 1,
-            horizontalOverscan: 83.3,
+            horizontalOverscan: 250.8,
             blurRadius: 0
         ),
         secondaryWave: HeaderSineWaveConfiguration(
-            color: .white,
+            color: Color(red: 1.0000, green: 1.0000, blue: 1.0000),
             opacity: 0.329,
-            lineWidth: 17.833,
-            frequency: 2.085,
-            amplitude: 0.335,
-            amplitudeFalloff: 0.314,
+            lineWidth: 26,
+            frequency: 2.475,
+            amplitude: 0.369,
+            amplitudeFalloff: 0.452,
             verticalPosition: 0.499,
             phaseOffset: -3.62,
             speedMultiplier: 1,
-            horizontalOverscan: 83.3,
+            horizontalOverscan: 250.8,
             blurRadius: 0
         ),
         progressiveBlurSegments: 7,
@@ -231,7 +255,17 @@ struct NearfieldHeaderAnimationConfiguration {
             blendMode: .softLight
         ),
         effect: .none,
-        effectSettings: .default
+        effectSettings: WaveLabEffectSettings(
+            greyscaleAmount: 1.00,
+            pixelBlockSize: 6.0,
+            ditherContrast: 1.50,
+            ditherCellSize: 3.0,
+            ditherLevels: 3,
+            glitchAmount: 5.0,
+            glitchSliceCount: 5,
+            glitchSliceDisplacement: 22.0,
+            glitchSpeed: 1.00
+        )
     )
 }
 
@@ -265,6 +299,32 @@ struct HeaderNoiseConfiguration {
     // The base color used in monochrome mode: white when true, black when false.
     var monochromeIsWhite: Bool
     var blendMode: BlendMode
+}
+
+private extension NearfieldHeaderAnimationConfiguration {
+    func audioReactive(level: Double) -> NearfieldHeaderAnimationConfiguration {
+        let level = min(max(level, 0), 1.5)
+        guard level > 0 else { return self }
+
+        var copy = self
+        copy.animationSpeed = min(animationSpeed * (1 + level * 0.75), 5)
+        copy.maximumProgressiveBlurRadius = min(maximumProgressiveBlurRadius * CGFloat(1 + level * 0.2), 72)
+        copy.noise.opacity = min(noise.opacity + level * 0.1, 0.75)
+
+        copy.primaryWave.audioReact(level: level)
+        copy.secondaryWave.audioReact(level: level)
+        return copy
+    }
+}
+
+private extension HeaderSineWaveConfiguration {
+    mutating func audioReact(level: Double) {
+        let scalar = CGFloat(level)
+        amplitude = min(amplitude * (1 + scalar * 0.8), 0.9)
+        lineWidth = min(lineWidth * (1 + scalar * 0.55), 96)
+        opacity = min(opacity + level * 0.12, 1)
+        blurRadius = min(blurRadius + scalar * 5, 36)
+    }
 }
 
 /// GPU progressive blur: renders the crossing waves once and applies a separable

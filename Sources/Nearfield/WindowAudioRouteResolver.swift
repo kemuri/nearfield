@@ -3,10 +3,6 @@ import CoreGraphics
 
 @MainActor
 final class WindowAudioRouteResolver {
-    static let spotifyBundleID = "com.spotify.client"
-    static let zenBundleID = "app.zen-browser.zen"
-    static let defaultRoutingRules = "\(spotifyBundleID)=pair; \(zenBundleID)=window"
-
     private struct Rule {
         let bundleID: String
         let destination: String
@@ -40,8 +36,25 @@ final class WindowAudioRouteResolver {
         return resolvedRules.joined(separator: "; ")
     }
 
+    func fallbackRulesWithoutProcessOverrides(from rawRules: String) -> String {
+        parseRules(rawRules)
+            .map { rule in
+                let destination = isWindowScopedDestination(rule.destination)
+                    ? "pair"
+                    : normalizedDestination(rule.destination)
+                return "\(rule.bundleID)=\(destination)"
+            }
+            .joined(separator: "; ")
+    }
+
     func hasWindowScopedRoute(in rawRules: String) -> Bool {
         parseRules(rawRules).contains { isWindowScopedDestination($0.destination) }
+    }
+
+    func hasRunningWindowScopedRoute(in rawRules: String) -> Bool {
+        let bundleIDs = windowScopedSourceBundleIDs(in: rawRules)
+        guard !bundleIDs.isEmpty else { return false }
+        return isAnyBundleRunning(bundleIDs)
     }
 
     func currentRoute(
@@ -102,6 +115,13 @@ final class WindowAudioRouteResolver {
         return sourceBundleID.isEmpty ? rule.bundleID : sourceBundleID
     }
 
+    private func windowScopedSourceBundleIDs(in rawRules: String) -> [String] {
+        parseRules(rawRules)
+            .filter { isWindowScopedDestination($0.destination) }
+            .map { windowScopedSourceBundleID(for: $0) }
+            .uniquePreservingOrder()
+    }
+
     private func windowScopedRules(for bundleID: String) -> (processRules: [String], fallbackRoute: String) {
         let routes = visibleWindowRoutes(for: bundleID)
         guard !routes.isEmpty else {
@@ -142,6 +162,9 @@ final class WindowAudioRouteResolver {
         let runningPIDs = Set(NSWorkspace.shared.runningApplications
             .filter { $0.bundleIdentifier == bundleID && !$0.isTerminated }
             .map(\.processIdentifier))
+        // Spatial routing only reads required window-list metadata (PID, layer,
+        // bounds, and alpha). It never captures screen contents or window names,
+        // so Screen Recording authorization is neither needed nor requested.
         guard !runningPIDs.isEmpty,
               let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return []

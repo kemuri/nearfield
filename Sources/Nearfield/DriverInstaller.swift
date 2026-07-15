@@ -81,19 +81,17 @@ final class DriverInstaller {
     }
 
     func removeDriverAndRestartCoreAudio() throws {
-        let driverPath = installedDriverPath(Self.legacyProxyDriverBundleName)
-        let command = [
-            driverServiceRestartCommand(),
-            removeCommand(paths: temporaryDriverPaths(for: driverPath) + [driverPath]),
-            coreAudioRestartCommand()
-        ].joined(separator: "\n")
-        try runPrivilegedShell(command)
+        try removeAllInstalledDriversAndRestartCoreAudio()
     }
 
     func removeRouterDriverAndRestartCoreAudio() throws {
+        try removeAllInstalledDriversAndRestartCoreAudio()
+    }
+
+    func removeAllInstalledDriversAndRestartCoreAudio() throws {
         let command = [
             driverServiceRestartCommand(),
-            removeCommand(paths: installedRouterDriverPaths().flatMap { temporaryDriverPaths(for: $0) + [$0] }),
+            removeCommand(paths: Self.installedDriverRemovalPaths()),
             coreAudioRestartCommand()
         ].joined(separator: "\n")
         try runPrivilegedShell(command)
@@ -107,6 +105,18 @@ final class DriverInstaller {
             throw DriverInstallerError.driverBundleMissing(output)
         }
         return driverPath
+    }
+
+    static func installedDriverRemovalPaths() -> [String] {
+        routerDriverBundleNames
+            .map { "\(halDriverDirectory)/\($0)" }
+            .flatMap { driverPath in
+                [
+                    "\(driverPath).studiopair-installing",
+                    "\(driverPath).nearfield-installing",
+                    driverPath
+                ]
+            }
     }
 
     private func bundledRouterDriverPath() throws -> String? {

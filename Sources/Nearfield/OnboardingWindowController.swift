@@ -7,6 +7,7 @@ private enum OnboardingLayout {
     static let baseSize = NSSize(width: 307, height: 536)
     static let contentWidth = baseSize.width - 32
     static let ditherImageWidth = baseSize.width + 36.5
+    static let expandedHeaderHeight: CGFloat = 345
     static let windowSize = NSSize(width: baseSize.width * scale, height: baseSize.height * scale)
 }
 
@@ -35,8 +36,9 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private let model: OnboardingModel
+    private weak var hostingView: NSView?
 
-    init(delegate: SettingsWindowControllerDelegate) {
+    init(delegate: SettingsDelegate) {
         let model = OnboardingModel(delegate: delegate)
         self.model = model
 
@@ -53,7 +55,6 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.appearance = NSAppearance(named: .darkAqua)
         let fixedFrameSize = window.frameRect(forContentRect: contentRect).size
         window.minSize = fixedFrameSize
         window.maxSize = fixedFrameSize
@@ -62,16 +63,15 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
 
         window.delegate = self
-        if BuildConfiguration.debugToolsEnabled {
-            window.shortcutHandler = { [weak self] event in
-                self?.handleStepShortcut(event) ?? false
-            }
+        window.shortcutHandler = { [weak self] event in
+            self?.handleStepShortcut(event) ?? false
         }
 
         let hostingView = NSHostingView(rootView: OnboardingRootView(model: model))
         hostingView.frame = NSRect(origin: .zero, size: Metrics.size)
         hostingView.autoresizingMask = [.width, .height]
         window.contentView = hostingView
+        self.hostingView = hostingView
     }
 
     required init?(coder: NSCoder) {
@@ -83,20 +83,82 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         // Stop the header animation so the helper doesn't keep rendering frames
         // for a window that's no longer on screen.
         model.headerPaused = true
+        model.setWindowVisible(false)
         super.close()
     }
 
-    func show() {
+    func show(playsIntro: Bool = false) {
         reload()
         model.headerPaused = false
+        model.setWindowVisible(true)
+        let shouldFadeWindow = playsIntro || window?.isVisible != true
+        if shouldFadeWindow {
+            window?.alphaValue = 0
+        } else {
+            window?.alphaValue = 1
+        }
+        if playsIntro {
+            model.beginIntroAnimation()
+        }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if playsIntro {
+            animateWindowIntoFocus()
+        } else if shouldFadeWindow {
+            animateWindowFadeIn(duration: 0.18)
+        }
+        updateWindowLevel()
+        updateWindowAppearance()
+    }
+
+    private func animateWindowFadeIn(duration: TimeInterval) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window?.animator().alphaValue = 1
+        }
+    }
+
+    private func animateWindowIntoFocus() {
+        guard let window else { return }
+
+        let finalFrame = window.frame
+        let initialFrame = finalFrame.insetBy(dx: 4, dy: 4)
+        window.setFrame(initialFrame, display: false)
+
+        let blurFilter = CIFilter(name: "CIGaussianBlur")
+        blurFilter?.name = "introWindowBlur"
+        blurFilter?.setValue(14, forKey: kCIInputRadiusKey)
+
+        if let hostingView {
+            hostingView.wantsLayer = true
+            hostingView.layer?.masksToBounds = true
+            hostingView.layer?.filters = blurFilter.map { [$0] }
+            let blurAnimation = CABasicAnimation(keyPath: "filters.introWindowBlur.inputRadius")
+            blurAnimation.fromValue = 14
+            blurAnimation.toValue = 0
+            blurAnimation.duration = 0.72
+            blurAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            hostingView.layer?.add(blurAnimation, forKey: "introWindowBlur")
+            blurFilter?.setValue(0, forKey: kCIInputRadiusKey)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.78) { [weak hostingView] in
+                hostingView?.layer?.filters = nil
+            }
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.72
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 1
+            window.animator().setFrame(finalFrame, display: true)
+        }
     }
 
     func showOnboardingSimulation() {
         model.showOnboardingSimulation()
-        show()
+        show(playsIntro: true)
     }
 
     func showSettingsStage(showsPageIndicator: Bool = true) {
@@ -105,18 +167,27 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func reload() {
+        let wasInstallingDriver = model.isInstallingDriver
         model.refreshFromDelegate()
+        updateWindowLevel()
+        if model.isInstallingDriver, !wasInstallingDriver {
+            window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     // Pause the header animation whenever the window isn't actually on screen
     // (covered, minimized, on another Space, or closed) so it doesn't burn CPU.
     func windowDidChangeOcclusionState(_ notification: Notification) {
         guard let window else { return }
-        model.headerPaused = !window.occlusionState.contains(.visible)
+        let isVisible = window.occlusionState.contains(.visible)
+        model.headerPaused = !isVisible
+        model.setWindowVisible(isVisible)
     }
 
     func windowWillClose(_ notification: Notification) {
         model.headerPaused = true
+        model.setWindowVisible(false)
     }
 
     private func handleStepShortcut(_ event: NSEvent) -> Bool {
@@ -142,7 +213,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             case "h":
                 model.toggleHeaderGraphic()
             case "l":
-                model.toggleDebugLightMode()
+                model.toggleDebugColorSchemeOverride()
                 updateWindowAppearance()
             case "a":
                 guard model.step == .install else { return false }
@@ -158,7 +229,15 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func updateWindowAppearance() {
-        window?.appearance = NSAppearance(named: model.usesLightMode ? .aqua : .darkAqua)
+        guard let override = model.debugColorSchemeOverride else {
+            window?.appearance = nil
+            return
+        }
+        window?.appearance = NSAppearance(named: override == .light ? .aqua : .darkAqua)
+    }
+
+    private func updateWindowLevel() {
+        window?.level = model.isInstallingDriver ? .floating : .normal
     }
 }
 
@@ -239,11 +318,12 @@ private struct SpatialRoutingApp: Identifiable, Equatable {
 private final class OnboardingModel: ObservableObject {
     private enum Metrics {
         static let dummyInstallStepDurationNanoseconds: UInt64 = 2_500_000_000
+        static let liveEnvironmentStepDelayNanoseconds: UInt64 = 1_000_000_000
         static let defaultStepTransitionDuration: Double = 0.34
         static let slowStepTransitionDuration: Double = 2.4
     }
 
-    weak var delegate: SettingsWindowControllerDelegate?
+    weak var delegate: SettingsDelegate?
 
     @Published var step: OnboardingStep = .welcome
     @Published var isInstallHovered = false
@@ -256,27 +336,34 @@ private final class OnboardingModel: ObservableObject {
     @Published var balance: Double = 0
     @Published var driverInstalled = false
     @Published var isInstallingDriver = false
+    @Published var nearfieldDriverSelected = false
+    @Published var appVersionText = "Version 0.1.0"
+    @Published var studioDisplayCount = 0
     @Published var spatialRoutingEnabled = true
     @Published var spatialRoutingApps: [SpatialRoutingApp] = []
     @Published var selectedSpatialRoutingAppID: String?
     @Published var settingsScrollResetToken = 0
     @Published var showHeaderGraphic = true
     @Published var stepTransitionDuration = Metrics.defaultStepTransitionDuration
-    @Published var usesLightMode = false
+    @Published var debugColorSchemeOverride: ColorScheme?
+    @Published var introAnimationToken = 0
 
     private var dummyInstallTask: Task<Void, Never>?
+    private var pendingLiveInstallStartTask: Task<Void, Never>?
     private var liveInstallTask: Task<Void, Never>?
+    private var liveInstallRequestedAt: Date?
     private var spatialRoutingActivityTask: Task<Void, Never>?
+    private var isWindowVisible = false
     private var installScenario: OnboardingInstallScenario = .smooth
 
-    init(delegate: SettingsWindowControllerDelegate) {
+    init(delegate: SettingsDelegate) {
         self.delegate = delegate
         refreshFromDelegate()
-        startSpatialRoutingActivityRefresh()
     }
 
     deinit {
         dummyInstallTask?.cancel()
+        pendingLiveInstallStartTask?.cancel()
         liveInstallTask?.cancel()
         spatialRoutingActivityTask?.cancel()
     }
@@ -288,13 +375,19 @@ private final class OnboardingModel: ObservableObject {
         balance = Double(delegate.settingsBalance())
         driverInstalled = delegate.settingsDriverInstalled()
         isInstallingDriver = delegate.settingsIsInstallingDriver()
+        nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
+        appVersionText = delegate.settingsAppVersionText()
+        studioDisplayCount = delegate.settingsDevices().count
         spatialRoutingEnabled = delegate.settingsAppRoutingEnabled()
         syncSpatialRoutingApps(
             bundleIDs: delegate.settingsAppRoutingAppBundleIDs(),
             rawRules: delegate.settingsRoutingRules()
         )
         reconcileSpatialRoutingAliasesIfNeeded(rawRules: delegate.settingsRoutingRules())
-        refreshSpatialRoutingActivity(animated: false)
+        updateSpatialRoutingActivityRefresh()
+        if shouldRefreshSpatialRoutingActivity {
+            refreshSpatialRoutingActivity(animated: false)
+        }
     }
 
     func showOnboardingSimulation() {
@@ -303,6 +396,10 @@ private final class OnboardingModel: ObservableObject {
         installError = nil
         installProgressIndex = 0
         showStep(.welcome, animated: false)
+    }
+
+    func beginIntroAnimation() {
+        introAnimationToken += 1
     }
 
     func showSettingsStage(showsPageIndicator: Bool = true) {
@@ -333,6 +430,7 @@ private final class OnboardingModel: ObservableObject {
         } else {
             change()
         }
+        updateSpatialRoutingActivityRefresh()
     }
 
     func toggleHeaderGraphic() {
@@ -341,14 +439,23 @@ private final class OnboardingModel: ObservableObject {
         }
     }
 
-    func toggleDebugLightMode() {
+    func toggleDebugColorSchemeOverride() {
         withAnimation(.smooth(duration: 0.22)) {
-            usesLightMode.toggle()
+            debugColorSchemeOverride = debugColorSchemeOverride == .light ? .dark : .light
         }
     }
 
+    func setWindowVisible(_ isVisible: Bool) {
+        isWindowVisible = isVisible
+        updateSpatialRoutingActivityRefresh()
+    }
+
     func startInstallFlow() {
-        runLiveInstallFlow()
+        cancelInstallTasks()
+        installError = nil
+        installProgressIndex = driverInstalled ? OnboardingInstallStep.appRouting.rawValue : 0
+        showStep(.install)
+        startLiveInstallAfterStepTransition()
     }
 
     func runInstallScenario(_ scenario: OnboardingInstallScenario) {
@@ -362,6 +469,10 @@ private final class OnboardingModel: ObservableObject {
 
     func retryCurrentInstallStep() {
         guard let installError else { return }
+        if installError.step == .approveDriver {
+            requestDriverInstallApproval()
+            return
+        }
         cancelInstallSimulation()
         self.installError = nil
         installProgressIndex = installError.step.rawValue
@@ -375,8 +486,11 @@ private final class OnboardingModel: ObservableObject {
     private func cancelInstallTasks() {
         dummyInstallTask?.cancel()
         dummyInstallTask = nil
+        pendingLiveInstallStartTask?.cancel()
+        pendingLiveInstallStartTask = nil
         liveInstallTask?.cancel()
         liveInstallTask = nil
+        liveInstallRequestedAt = nil
     }
 
     func installStepState(for step: OnboardingInstallStep) -> OnboardingInstallStepState {
@@ -448,7 +562,11 @@ private final class OnboardingModel: ObservableObject {
             }
         }
         delegate?.settingsSetAppRoutingEnabled(enabled)
+        if enabled {
+            persistSpatialRoutingAppBundleIDs()
+        }
         refreshFromDelegate()
+        updateSpatialRoutingActivityRefresh()
     }
 
     func selectSpatialRoutingApp(_ id: String) {
@@ -591,42 +709,74 @@ private final class OnboardingModel: ObservableObject {
     }
 
     private func runLiveInstallFlow() {
-        cancelInstallTasks()
         installError = nil
-        installProgressIndex = driverInstalled ? OnboardingInstallStep.allCases.count : 0
-        showStep(.install)
+        installProgressIndex = driverInstalled ? OnboardingInstallStep.appRouting.rawValue : 0
 
         if driverInstalled {
-            showStep(.settings)
+            if nearfieldDriverSelected {
+                installProgressIndex = OnboardingInstallStep.allCases.count
+                showStep(.settings)
+            } else {
+                installProgressIndex = OnboardingInstallStep.routingDriver.rawValue
+                delegate?.settingsApplyConfiguration()
+                startLiveInstallSequence()
+            }
             return
         }
 
-        delegate?.settingsInstallDriver()
+        guard liveInstallCanCompleteConfiguration() else {
+            failLiveInstall(with: studioDisplayRequirementError(step: .environment))
+            return
+        }
+
+        withAnimation(.smooth(duration: 0.24)) {
+            installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
+        }
+    }
+
+    private func startLiveInstallAfterStepTransition() {
+        let transitionNanoseconds = UInt64(max(0, stepTransitionDuration) * 1_000_000_000)
+        pendingLiveInstallStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: transitionNanoseconds)
+            guard !Task.isCancelled, self.step == .install else { return }
+            try? await Task.sleep(nanoseconds: Metrics.liveEnvironmentStepDelayNanoseconds)
+            guard !Task.isCancelled, self.step == .install else { return }
+            self.pendingLiveInstallStartTask = nil
+            self.runLiveInstallFlow()
+        }
+    }
+
+    func requestDriverInstallApproval() {
+        guard step == .install else { return }
+        refreshFromDelegate()
+        guard !isInstallingDriver, liveInstallTask == nil else { return }
+
+        installError = nil
+        guard liveInstallCanCompleteConfiguration() else {
+            failLiveInstall(with: studioDisplayRequirementError(step: .environment))
+            return
+        }
+
+        withAnimation(.smooth(duration: 0.24)) {
+            installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
+        }
+        liveInstallRequestedAt = Date()
+        delegate?.settingsInstallDriver(requiresConfirmation: false, presentsErrors: false)
         startLiveInstallSequence()
     }
 
     private func startLiveInstallSequence() {
         liveInstallTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let startedAt = Date()
-            self.installProgressIndex = max(self.installProgressIndex, OnboardingInstallStep.environment.rawValue + 1)
+            let startedAt = self.liveInstallRequestedAt ?? Date()
+            self.installProgressIndex = max(self.installProgressIndex, OnboardingInstallStep.approveDriver.rawValue)
 
             while !Task.isCancelled, self.step == .install {
                 try? await Task.sleep(nanoseconds: 450_000_000)
                 guard !Task.isCancelled else { return }
 
                 self.refreshFromDelegate()
-
-                if self.driverInstalled {
-                    withAnimation(.smooth(duration: 0.24)) {
-                        self.installProgressIndex = OnboardingInstallStep.allCases.count
-                    }
-                    try? await Task.sleep(nanoseconds: 700_000_000)
-                    guard !Task.isCancelled else { return }
-                    self.liveInstallTask = nil
-                    self.showStep(.settings)
-                    return
-                }
 
                 if self.isInstallingDriver {
                     withAnimation(.smooth(duration: 0.24)) {
@@ -635,22 +785,69 @@ private final class OnboardingModel: ObservableObject {
                     continue
                 }
 
-                if Date().timeIntervalSince(startedAt) > 1.2 {
+                if self.driverInstalled, self.nearfieldDriverSelected {
                     withAnimation(.smooth(duration: 0.24)) {
-                        self.installError = OnboardingInstallError(
-                            step: .approveDriver,
-                            title: "Driver Install Not Approved",
-                            message: "Approve the macOS administrator prompt to install the Nearfield HAL driver."
-                        )
+                        self.installProgressIndex = OnboardingInstallStep.allCases.count
                     }
+                    try? await Task.sleep(nanoseconds: 700_000_000)
+                    guard !Task.isCancelled else { return }
                     self.liveInstallTask = nil
+                    self.liveInstallRequestedAt = nil
+                    self.showStep(.settings)
+                    return
+                }
+
+                if self.driverInstalled {
+                    self.failLiveInstall(
+                        with: OnboardingInstallError(
+                            step: .routingDriver,
+                            title: "Could Not Select Nearfield",
+                            message: "Nearfield was installed, but macOS did not switch to the Nearfield output."
+                        )
+                    )
+                    return
+                }
+
+                if Date().timeIntervalSince(startedAt) > 1.2 {
+                    self.failLiveInstall(
+                        with: OnboardingInstallError(
+                            step: .approveDriver,
+                            title: "Permissions Not Granted",
+                            message: "Admin permissions needed to install HAL Driver"
+                        )
+                    )
                     return
                 }
             }
         }
     }
 
+    private func liveInstallCanCompleteConfiguration() -> Bool {
+        NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(
+            studioDisplayCount: delegate?.settingsDevices().count ?? 0
+        )
+    }
+
+    private func studioDisplayRequirementError(step: OnboardingInstallStep) -> OnboardingInstallError {
+        let displayCount = delegate?.settingsDevices().count ?? 0
+        return OnboardingInstallError(
+            step: step,
+            title: "Studio Displays Required",
+            message: NearfieldError.notEnoughStudioDisplays(displayCount).localizedDescription
+        )
+    }
+
+    private func failLiveInstall(with error: OnboardingInstallError) {
+        withAnimation(.smooth(duration: 0.24)) {
+            installProgressIndex = error.step.rawValue
+            installError = error
+        }
+        liveInstallTask = nil
+        liveInstallRequestedAt = nil
+    }
+
     private func startSpatialRoutingActivityRefresh() {
+        guard spatialRoutingActivityTask == nil else { return }
         spatialRoutingActivityTask?.cancel()
         spatialRoutingActivityTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -662,6 +859,36 @@ private final class OnboardingModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
+    }
+
+    private func stopSpatialRoutingActivityRefresh() {
+        spatialRoutingActivityTask?.cancel()
+        spatialRoutingActivityTask = nil
+    }
+
+    private func updateSpatialRoutingActivityRefresh() {
+        guard shouldRefreshSpatialRoutingActivity else {
+            stopSpatialRoutingActivityRefresh()
+            clearSpatialRoutingActivity()
+            return
+        }
+        startSpatialRoutingActivityRefresh()
+    }
+
+    private var shouldRefreshSpatialRoutingActivity: Bool {
+        isWindowVisible &&
+            step == .settings &&
+            spatialRoutingEnabled &&
+            !spatialRoutingApps.isEmpty
+    }
+
+    private func clearSpatialRoutingActivity() {
+        guard spatialRoutingApps.contains(where: { $0.activeChannel != nil }) else { return }
+        var nextApps = spatialRoutingApps
+        for index in nextApps.indices {
+            nextApps[index].activeChannel = nil
+        }
+        spatialRoutingApps = nextApps
     }
 
     private func refreshSpatialRoutingActivity(animated: Bool = true) {
@@ -886,6 +1113,7 @@ private struct OnboardingRootView: View {
                     showsGraphic: model.showHeaderGraphic,
                     transitionDuration: model.stepTransitionDuration,
                     showsPageIndicator: model.showsPageIndicator,
+                    normalConfiguration: model.step == .settings ? .settings : .onboarding,
                     hoverActive: model.isInstallHovered && model.step == .welcome,
                     paused: model.headerPaused
                 )
@@ -917,7 +1145,8 @@ private struct OnboardingRootView: View {
 
             HeaderCopyOverlay(
                 copy: headerCopy,
-                transitionDuration: model.stepTransitionDuration
+                transitionDuration: model.stepTransitionDuration,
+                introAnimationToken: model.introAnimationToken
             )
             .allowsHitTesting(false)
         }
@@ -927,7 +1156,7 @@ private struct OnboardingRootView: View {
         .ignoresSafeArea()
         .animation(.smooth(duration: model.stepTransitionDuration), value: model.step)
         .animation(.smooth(duration: 0.22), value: model.showHeaderGraphic)
-        .preferredColorScheme(model.usesLightMode ? .light : .dark)
+        .preferredColorScheme(model.debugColorSchemeOverride)
         .scaleEffect(OnboardingLayout.scale, anchor: .topLeading)
         .frame(
             width: OnboardingLayout.windowSize.width,
@@ -950,7 +1179,7 @@ private struct OnboardingRootView: View {
     private var headerHeight: CGFloat {
         switch model.step {
         case .welcome:
-            345
+            OnboardingLayout.expandedHeaderHeight
         case .install, .settings:
             120
         }
@@ -1042,6 +1271,7 @@ private struct HeaderCopyContent: Equatable {
 private struct HeaderCopyOverlay: View {
     let copy: HeaderCopyContent
     let transitionDuration: Double
+    let introAnimationToken: Int
 
     @State private var displayedCopy: HeaderCopyContent?
     @State private var outgoingCopy: HeaderCopyContent?
@@ -1052,11 +1282,19 @@ private struct HeaderCopyOverlay: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             if let outgoingCopy {
-                HeaderCopyLayer(copy: outgoingCopy)
+                HeaderCopyLayer(
+                    copy: outgoingCopy,
+                    introAnimationToken: introAnimationToken,
+                    playsIntro: false
+                )
                     .opacity(outgoingOpacity)
             }
 
-            HeaderCopyLayer(copy: displayedCopy ?? copy)
+            HeaderCopyLayer(
+                copy: displayedCopy ?? copy,
+                introAnimationToken: introAnimationToken,
+                playsIntro: (displayedCopy ?? copy).title == "Nearfield"
+            )
                 .opacity(incomingOpacity)
         }
         .frame(width: OnboardingLayout.baseSize.width, height: OnboardingLayout.baseSize.height, alignment: .topLeading)
@@ -1107,29 +1345,139 @@ private struct HeaderCopyOverlay: View {
 
 private struct HeaderCopyLayer: View {
     let copy: HeaderCopyContent
+    let introAnimationToken: Int
+    var playsIntro = false
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             if copy.title == "Nearfield" {
-                NearfieldLogoMark()
-                    .frame(width: 30.264, height: 27.711)
-                    .offset(x: 18.868, y: 236.144)
+                IntroReveal(token: introAnimationToken, delay: 0.08, yOffset: 8, isEnabled: playsIntro) {
+                    NearfieldLogoMark()
+                        .frame(width: 30.264, height: 27.711)
+                }
+                .offset(x: 18.868, y: 236.144)
             }
 
-            Text(copy.title)
-                .font(.system(size: copy.titleSize, weight: .bold))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .frame(height: copy.titleHeight, alignment: .leading)
+            if playsIntro && copy.title == "Nearfield" {
+                AnimatedHeaderTitle(
+                    text: copy.title,
+                    fontSize: copy.titleSize,
+                    height: copy.titleHeight,
+                    token: introAnimationToken
+                )
                 .offset(x: 16, y: copy.titleTop)
+            } else {
+                Text(copy.title)
+                    .font(.system(size: copy.titleSize, weight: .bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .frame(height: copy.titleHeight, alignment: .leading)
+                    .offset(x: 16, y: copy.titleTop)
+            }
 
             if let subheadlineText = copy.subheadlineText {
-                HeaderSubheadline(text: subheadlineText, fontSize: copy.subheadlineFontSize)
-                    .frame(width: OnboardingLayout.baseSize.width - 32, alignment: .leading)
-                    .offset(x: 16, y: copy.subheadlineTop)
+                IntroReveal(token: introAnimationToken, delay: 0.36, yOffset: 8, isEnabled: playsIntro) {
+                    HeaderSubheadline(text: subheadlineText, fontSize: copy.subheadlineFontSize)
+                        .frame(width: OnboardingLayout.baseSize.width - 32, alignment: .leading)
+                }
+                .offset(x: 16, y: copy.subheadlineTop)
             }
         }
         .frame(width: OnboardingLayout.baseSize.width, height: OnboardingLayout.baseSize.height, alignment: .topLeading)
+    }
+}
+
+private struct AnimatedHeaderTitle: View {
+    let text: String
+    let fontSize: CGFloat
+    let height: CGFloat
+    let token: Int
+
+    @State private var revealedLetterCount = 0
+
+    private var characters: [String] {
+        text.map(String.init)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(characters.enumerated()), id: \.offset) { index, character in
+                Text(character)
+                    .font(.system(size: fontSize, weight: .bold))
+                    .foregroundStyle(.white)
+                    .opacity(index < revealedLetterCount ? 1 : 0)
+                    .blur(radius: index < revealedLetterCount ? 0 : 7)
+                    .offset(y: index < revealedLetterCount ? 0 : 50)
+            }
+        }
+        .frame(height: height, alignment: .leading)
+        .accessibilityLabel(text)
+        .onAppear(perform: runAnimation)
+        .onChange(of: token) { _, _ in
+            runAnimation()
+        }
+    }
+
+    private func runAnimation() {
+        revealedLetterCount = 0
+        for index in characters.indices {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14 + Double(index) * 0.046) {
+                withAnimation(.smooth(duration: 0.3)) {
+                    revealedLetterCount = max(revealedLetterCount, index + 1)
+                }
+            }
+        }
+    }
+}
+
+private struct IntroReveal<Content: View>: View {
+    let token: Int
+    let delay: Double
+    let duration: Double
+    let yOffset: CGFloat
+    let isEnabled: Bool
+    let content: Content
+
+    @State private var isVisible = false
+
+    init(
+        token: Int,
+        delay: Double,
+        duration: Double = 0.26,
+        yOffset: CGFloat = 10,
+        isEnabled: Bool = true,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.token = token
+        self.delay = delay
+        self.duration = duration
+        self.yOffset = yOffset
+        self.isEnabled = isEnabled
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .opacity(isEnabled ? (isVisible ? 1 : 0) : 1)
+            .blur(radius: isEnabled ? (isVisible ? 0 : 7) : 0)
+            .offset(y: isEnabled ? (isVisible ? 0 : yOffset) : 0)
+            .onAppear(perform: runAnimation)
+            .onChange(of: token) { _, _ in
+                runAnimation()
+            }
+    }
+
+    private func runAnimation() {
+        guard isEnabled else {
+            isVisible = true
+            return
+        }
+        isVisible = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            withAnimation(.smooth(duration: duration)) {
+                isVisible = true
+            }
+        }
     }
 }
 
@@ -1154,12 +1502,14 @@ private struct WelcomeOnboardingView: View {
         VStack(alignment: .leading, spacing: 0) {
             Spacer()
 
-            Button("Install") {
-                model.startInstallFlow()
+            IntroReveal(token: model.introAnimationToken, delay: 0.48, duration: 0.24, yOffset: 12) {
+                Button("Install") {
+                    model.startInstallFlow()
+                }
+                .buttonStyle(WelcomeInstallButtonStyle())
+                .focusable(false)
+                .onHover { model.isInstallHovered = $0 }
             }
-            .buttonStyle(WelcomeInstallButtonStyle())
-            .focusable(false)
-            .onHover { model.isInstallHovered = $0 }
             .padding(.leading, 16)
             .padding(.bottom, 16)
         }
@@ -1193,6 +1543,7 @@ private struct InstallOnboardingView: View {
                         step: step,
                         state: model.installStepState(for: step),
                         pendingOpacity: model.pendingInstallStepOpacity(for: step),
+                        requestAccess: model.requestDriverInstallApproval,
                         retry: model.retryCurrentInstallStep
                     )
                 }
@@ -1212,6 +1563,7 @@ private struct InstallStepRow: View {
     let step: OnboardingInstallStep
     let state: OnboardingInstallStepState
     let pendingOpacity: Double
+    let requestAccess: () -> Void
     let retry: () -> Void
 
     var body: some View {
@@ -1241,11 +1593,15 @@ private struct InstallStepRow: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
+                        if step == .approveDriver {
+                            InstallPermissionButton(title: "Request Access", action: requestAccess)
+                                .padding(.top, 7)
+                        }
                     }
                     Spacer()
                 }
                 .padding(.top, 11)
-                .frame(height: step.activeDetail.contains("\n") ? 65 : 54, alignment: .top)
+                .frame(height: activeRowHeight, alignment: .top)
             case .failed(let error):
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "xmark.circle.fill")
@@ -1260,18 +1616,24 @@ private struct InstallStepRow: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
+                        if step == .approveDriver {
+                            InstallPermissionButton(title: "Request Again", width: 123, action: retry)
+                                .padding(.top, 7)
+                        }
                     }
                     Spacer()
-                    Button {
-                        retry()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                    if step != .approveDriver {
+                        Button {
+                            retry()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Retry current step")
                     }
-                    .buttonStyle(.borderless)
-                    .help("Retry current step")
                 }
                 .padding(.top, 10)
-                .frame(height: 75, alignment: .top)
+                .frame(height: step == .approveDriver ? 101 : 75, alignment: .top)
             case .pending:
                 HStack {
                     Text(step.activeTitle)
@@ -1297,6 +1659,42 @@ private struct InstallStepRow: View {
             Theme.pendingRowBackground.opacity(pendingOpacity)
         }
     }
+
+    private var activeRowHeight: CGFloat {
+        if step == .approveDriver {
+            return 124
+        }
+        return step.activeDetail.contains("\n") ? 65 : 54
+    }
+}
+
+private struct InstallPermissionButton: View {
+    let title: String
+    var width: CGFloat = 132
+    let action: () -> Void
+
+    var body: some View {
+        Button(title, action: action)
+            .buttonStyle(InstallPermissionButtonStyle(width: width))
+            .focusable(false)
+    }
+}
+
+private struct InstallPermissionButtonStyle: ButtonStyle {
+    let width: CGFloat
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(.white)
+            .frame(width: width, height: 24)
+            .background(
+                Color(nsColor: .systemBlue)
+                    .opacity(configuration.isPressed ? 0.82 : 1),
+                in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+    }
 }
 
 private struct SettingsOnboardingView: View {
@@ -1317,6 +1715,13 @@ private struct SettingsOnboardingView: View {
                             .id("settingsTop")
 
                         VStack(alignment: .leading, spacing: 8) {
+                            StudioDisplayStatusPill(
+                                status: StudioDisplayConnectionStatus(
+                                    connectedCount: model.studioDisplayCount
+                                )
+                            )
+                            .frame(width: OnboardingLayout.contentWidth)
+
                             SettingsGroup {
                                 ToggleSettingRow(
                                     title: "Open at login",
@@ -1328,12 +1733,12 @@ private struct SettingsOnboardingView: View {
                                 SettingsDivider()
                                 ToggleSettingRow(
                                     title: "Show Menubar App",
-                                    detail: "Open Nearfield to show\nthis screen again",
+                                    detail: "Open Nearfield to show this screen again.",
                                     isOn: Binding(
                                         get: { model.showMenubarApp },
                                         set: { model.setShowMenubarApp($0) }
                                     ),
-                                    height: 62
+                                    height: 64
                                 )
                             }
 
@@ -1356,7 +1761,7 @@ private struct SettingsOnboardingView: View {
                                     DriverStatusRow(model: model)
                                     SettingsDivider()
                                     ActionSettingRow(
-                                        title: "Remove Virtual Drivers",
+                                        title: "Uninstall Nearfield",
                                         buttonTitle: "Uninstall",
                                         destructive: true
                                     ) {
@@ -1364,10 +1769,18 @@ private struct SettingsOnboardingView: View {
                                     }
                                 }
                             }
+
+                            Text(model.appVersionText)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 8)
+                            .padding(.top, 8)
+                            .frame(width: OnboardingLayout.contentWidth)
                         }
                         .padding(.horizontal, 16)
-                        .padding(.top, 16)
-                        .padding(.bottom, 18)
+                        .padding(.top, 14)
+                        .padding(.bottom, 20)
                     }
                     .coordinateSpace(name: "settingsScroll")
                     .onAppear {
@@ -1401,22 +1814,25 @@ private struct OnboardingGraphicHeader: View {
     let showsGraphic: Bool
     let transitionDuration: Double
     let showsPageIndicator: Bool
+    let normalConfiguration: NearfieldHeaderAnimationConfiguration
     var hoverActive: Bool = false
     var paused: Bool = false
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             if showsGraphic {
-                // Interpolates between the resting and hover configurations. The
-                // graphic area still shrinks per step (height changes); the wave
-                // settings themselves only change on Install-button hover.
+                // Keep the wave render surface fixed; step changes mask it by
+                // shrinking the outer header frame below.
                 InterpolatedHeaderAnimation(
                     progress: hoverActive ? 1 : 0,
-                    normal: .onboarding,
+                    normal: normalConfiguration,
                     hover: .onboardingHover,
                     paused: paused
                 )
-                .frame(width: OnboardingLayout.ditherImageWidth, height: height)
+                .frame(
+                    width: OnboardingLayout.ditherImageWidth,
+                    height: OnboardingLayout.expandedHeaderHeight
+                )
                 .clipped()
                 .transition(.opacity)
                 .animation(.easeInOut(duration: 0.35), value: hoverActive)
@@ -1463,12 +1879,13 @@ private struct SettingsSection<Content: View>: View {
         VStack(alignment: .leading, spacing: 8) {
             if let title {
                 Text(title)
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.primary)
-                    .frame(height: 16)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(height: 14)
+                    .padding(.leading, 8)
                     .padding(.top, 8)
             } else {
-                Color.clear.frame(height: 8)
+                Color.clear.frame(height: 4)
             }
             content
         }
@@ -1489,51 +1906,112 @@ private struct SettingsGroup<Content: View>: View {
     }
 }
 
+private struct NativeSettingsSwitch: NSViewRepresentable {
+    @Binding var isOn: Bool
+    var isEnabled = true
+
+    func makeNSView(context: Context) -> NSSwitch {
+        let control = NSSwitch()
+        control.controlSize = .mini
+        control.target = context.coordinator
+        control.action = #selector(Coordinator.valueChanged(_:))
+        return control
+    }
+
+    func updateNSView(_ nsView: NSSwitch, context: Context) {
+        let nextState: NSControl.StateValue = isOn ? .on : .off
+        if nsView.state != nextState {
+            nsView.state = nextState
+        }
+        nsView.isEnabled = isEnabled
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(isOn: $isOn)
+    }
+
+    final class Coordinator: NSObject {
+        private let isOn: Binding<Bool>
+
+        init(isOn: Binding<Bool>) {
+            self.isOn = isOn
+        }
+
+        @objc @MainActor func valueChanged(_ sender: NSSwitch) {
+            isOn.wrappedValue = sender.state == .on
+        }
+    }
+}
+
+private struct CompactSettingsSwitch: View {
+    @Binding var isOn: Bool
+    var isEnabled = true
+
+    var body: some View {
+        NativeSettingsSwitch(isOn: $isOn, isEnabled: isEnabled)
+            .frame(width: 50, height: 30)
+            .scaleEffect(0.72, anchor: .center)
+            .frame(width: 36, height: 22)
+    }
+}
+
 private struct ToggleSettingRow: View {
     let title: String
     var detail: String?
     @Binding var isOn: Bool
-    var height: CGFloat = 42
+    var height: CGFloat = 46
 
     var body: some View {
-        HStack(alignment: detail == nil ? .center : .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center, spacing: 12) {
                 Text(title)
                     .settingsTitleStyle()
-                if let detail {
-                    Text(detail)
-                        .settingsDetailStyle()
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Spacer(minLength: 8)
+                CompactSettingsSwitch(isOn: $isOn)
             }
-            Spacer(minLength: 8)
-            Toggle("", isOn: $isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .padding(.top, detail == nil ? 0 : 4)
+
+            if let detail {
+                Text(detail)
+                    .settingsDetailStyle()
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .padding(.horizontal, 10)
-        .frame(height: height)
+        .padding(.horizontal, 12)
+        .padding(.vertical, detail == nil ? 9 : 10)
+        .frame(minHeight: height, alignment: .center)
     }
 }
 
 private struct ActionSettingRow: View {
     let title: String
+    var detail: String?
     let buttonTitle: String
     var destructive = false
+    var height: CGFloat = 42
     let action: () -> Void
 
     var body: some View {
-        HStack {
-            Text(title)
-                .settingsTitleStyle()
-            Spacer()
-            Button(buttonTitle, action: action)
-                .controlSize(.small)
-                .foregroundStyle(destructive ? .red : .primary)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center, spacing: 12) {
+                Text(title)
+                    .settingsTitleStyle()
+                Spacer(minLength: 8)
+                Button(buttonTitle, action: action)
+                    .controlSize(.small)
+                    .foregroundStyle(destructive ? .red : .primary)
+            }
+
+            if let detail {
+                Text(detail)
+                    .settingsDetailStyle()
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .padding(.horizontal, 10)
-        .frame(height: 42)
+        .padding(.horizontal, 12)
+        .padding(.vertical, detail == nil ? 8 : 10)
+        .frame(minHeight: detail == nil ? height : max(height, 58), alignment: .center)
     }
 }
 
@@ -1617,23 +2095,22 @@ private struct SpatialRoutingHeaderRow: View {
     @Binding var isOn: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center, spacing: 12) {
                 Text("Spatial Routing")
                     .settingsTitleStyle()
-                Text("Route apps by window\nlocation.")
-                    .settingsDetailStyle()
-                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                CompactSettingsSwitch(isOn: $isOn)
             }
-            Spacer(minLength: 8)
-            Toggle("", isOn: $isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
+
+            Text("Route apps by window location.")
+                .settingsDetailStyle()
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.leading, 16)
-        .padding(.trailing, 12)
-        .padding(.top, 13)
-        .frame(height: 78, alignment: .top)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(minHeight: 76, alignment: .center)
     }
 }
 
@@ -1660,18 +2137,11 @@ private struct SpatialRoutingAppRow: View {
             .buttonStyle(.plain)
             .frame(maxWidth: .infinity, minHeight: 50)
 
-            Toggle("", isOn: $isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
+            CompactSettingsSwitch(isOn: $isOn)
         }
-        .padding(.leading, 16)
+        .padding(.leading, 12)
         .padding(.trailing, 12)
         .frame(height: 50)
-        .background {
-            Rectangle()
-                .fill(isSelected ? Color(nsColor: .selectedContentBackgroundColor) : Color.clear)
-        }
-        .clipShape(Rectangle())
     }
 }
 
@@ -1837,11 +2307,38 @@ private struct DriverStatusRow: View {
     }
 }
 
+private struct StudioDisplayStatusPill: View {
+    let status: StudioDisplayConnectionStatus
+
+    private var statusColor: Color {
+        status.isConnected ? .green : .yellow
+    }
+
+    private var statusSymbolName: String {
+        status.isConnected ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: statusSymbolName)
+                .font(.system(size: 11, weight: .medium))
+            Text(status.detail)
+                .font(.system(size: 11, weight: .medium))
+        }
+        .foregroundStyle(statusColor)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(statusColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct SettingsDivider: View {
     var body: some View {
         Rectangle()
             .fill(Theme.separator)
             .frame(height: 1)
+            .padding(.horizontal, 12)
     }
 }
 

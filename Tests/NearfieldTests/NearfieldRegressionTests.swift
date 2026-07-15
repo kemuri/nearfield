@@ -27,6 +27,79 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertEqual(volumes.right, 0.005, accuracy: 0.0001)
     }
 
+    func testSettingsHeaderAnimationRunsAtOneThirdOnboardingSpeed() {
+        XCTAssertEqual(
+            NearfieldHeaderAnimationConfiguration.settings.animationSpeed,
+            NearfieldHeaderAnimationConfiguration.onboarding.animationSpeed / 3,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testActivationPolicyDoesNotReactivateForReconnectAlone() {
+        XCTAssertFalse(
+            NearfieldActivationPolicy.shouldActivateRouter(
+                defaultOutputIsNearfield: false,
+                displaysJustReconnected: true,
+                shouldReactivateAfterReconnect: false
+            )
+        )
+    }
+
+    func testActivationPolicyReactivatesWhenNearfieldWasDefaultBeforeReconnect() {
+        XCTAssertTrue(
+            NearfieldActivationPolicy.shouldActivateRouter(
+                defaultOutputIsNearfield: false,
+                displaysJustReconnected: true,
+                shouldReactivateAfterReconnect: true
+            )
+        )
+    }
+
+    func testActivationPolicyKeepsNearfieldActiveWhenAlreadyDefaultOutput() {
+        XCTAssertTrue(
+            NearfieldActivationPolicy.shouldActivateRouter(
+                defaultOutputIsNearfield: true,
+                displaysJustReconnected: false,
+                shouldReactivateAfterReconnect: false
+            )
+        )
+    }
+
+    func testDriverInstallPolicySkipsConfigurationWithoutTwoStudioDisplays() {
+        XCTAssertFalse(NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 0))
+        XCTAssertFalse(NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 1))
+    }
+
+    func testDriverInstallPolicyConfiguresWhenTwoStudioDisplaysAreAvailable() {
+        XCTAssertTrue(NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 2))
+    }
+
+    func testRouterPublicationRequiresTwoStudioDisplays() {
+        XCTAssertFalse(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 0))
+        XCTAssertFalse(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 1))
+        XCTAssertTrue(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 2))
+    }
+
+    func testStudioDisplayConnectionStatusDescribesAvailability() {
+        XCTAssertFalse(StudioDisplayConnectionStatus(connectedCount: 0).isConnected)
+        XCTAssertEqual(StudioDisplayConnectionStatus(connectedCount: 0).title, "Not Connected")
+        XCTAssertEqual(StudioDisplayConnectionStatus(connectedCount: 0).detail, "No Studio Displays connected")
+        XCTAssertEqual(StudioDisplayConnectionStatus(connectedCount: 1).detail, "1 of 2 Studio Displays connected")
+        XCTAssertTrue(StudioDisplayConnectionStatus(connectedCount: 2).isConnected)
+        XCTAssertEqual(StudioDisplayConnectionStatus(connectedCount: 2).title, "Connected")
+        XCTAssertEqual(StudioDisplayConnectionStatus(connectedCount: 2).detail, "2 Studio Displays connected")
+    }
+
+    func testRouterCapabilityRequiresDriverOwnedTargetAggregate() {
+        XCTAssertTrue(
+            RouterAudioDriverManager.supportsDriverOwnedTargetAggregate(
+                in: "routing, driverOwnedTargetAggregate"
+            )
+        )
+        XCTAssertFalse(RouterAudioDriverManager.supportsDriverOwnedTargetAggregate(in: "routeRules="))
+        XCTAssertFalse(RouterAudioDriverManager.supportsDriverOwnedTargetAggregate(in: nil))
+    }
+
     func testDisplayOrderingUsesSelectedLeftDisplay() {
         let first = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
         let second = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)
@@ -73,6 +146,32 @@ final class NearfieldRegressionTests: XCTestCase {
 
         XCTAssertTrue(resolver.hasWindowScopedRoute(in: "app.zen-browser.zen=screen"))
         XCTAssertFalse(resolver.hasWindowScopedRoute(in: "com.spotify.client=pair; com.example=left"))
+    }
+
+    @MainActor
+    func testWindowScopedRunningGateIgnoresMissingApps() {
+        let resolver = WindowAudioRouteResolver()
+
+        XCTAssertFalse(resolver.hasRunningWindowScopedRoute(in: "com.example.DoesNotExist=window"))
+        XCTAssertFalse(resolver.hasRunningWindowScopedRoute(in: "com.example.DoesNotExist=window:com.example.MissingHost"))
+        XCTAssertFalse(resolver.hasRunningWindowScopedRoute(in: "com.example.DoesNotExist=pair"))
+    }
+
+    @MainActor
+    func testWindowScopedFallbackRulesRemoveProcessOverrides() {
+        let resolver = WindowAudioRouteResolver()
+
+        XCTAssertEqual(
+            resolver.fallbackRulesWithoutProcessOverrides(
+                from: "com.spotify.client=left; com.apple.Safari=window; com.apple.WebKit.GPU=window:com.apple.Safari"
+            ),
+            "com.spotify.client=left; com.apple.Safari=pair; com.apple.WebKit.GPU=pair"
+        )
+    }
+
+    func testDebugBuildConfigurationEnablesDebugTools() {
+        XCTAssertFalse(BuildConfiguration.isDistribution)
+        XCTAssertTrue(BuildConfiguration.debugToolsEnabled)
     }
 
     func testAppRoutingRulesUpsertAndPreserveOtherRules() {
@@ -165,6 +264,46 @@ final class NearfieldRegressionTests: XCTestCase {
                 expectedSuffix: "NearfieldAudioDevice.driver"
             )
         )
+    }
+
+    func testDriverRemovalPathsCoverCurrentAndLegacyBundlesOnce() {
+        let paths = DriverInstaller.installedDriverRemovalPaths()
+
+        XCTAssertEqual(paths.count, Set(paths).count)
+        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/NearfieldAudioDevice.driver"))
+        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/StudioPairRouterAudioDevice.driver"))
+        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver"))
+        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/NearfieldAudioDevice.driver.nearfield-installing"))
+        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/StudioPairRouterAudioDevice.driver.studiopair-installing"))
+        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver.nearfield-installing"))
+    }
+
+    func testAppRoutingRulesDefaultToEmptyForFreshInstall() {
+        let suiteName = "NearfieldTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated defaults suite")
+            return
+        }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        XCTAssertEqual(NearfieldPreferences.appRoutingRules(in: defaults), "")
+    }
+
+    func testAppRoutingRulesPreserveStoredPreference() {
+        let suiteName = "NearfieldTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated defaults suite")
+            return
+        }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        defaults.set("com.example.App=window", forKey: NearfieldPreferences.appRoutingRulesKey)
+
+        XCTAssertEqual(NearfieldPreferences.appRoutingRules(in: defaults), "com.example.App=window")
     }
 
     func testCleanupPreferenceClearsAppRoutingFlag() {

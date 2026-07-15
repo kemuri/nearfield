@@ -27,6 +27,29 @@ struct NearfieldState {
     }
 }
 
+struct StudioDisplayConnectionStatus: Equatable {
+    let connectedCount: Int
+
+    var isConnected: Bool {
+        NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: connectedCount)
+    }
+
+    var title: String {
+        isConnected ? "Connected" : "Not Connected"
+    }
+
+    var detail: String {
+        switch connectedCount {
+        case 0:
+            return "No Studio Displays connected"
+        case 1:
+            return "1 of 2 Studio Displays connected"
+        default:
+            return "\(connectedCount) Studio Displays connected"
+        }
+    }
+}
+
 struct AudioDevice: Equatable {
     let id: AudioObjectID
     let uid: String
@@ -96,6 +119,7 @@ final class StudioDisplayAudioManager {
     let aggregateName = "Nearfield Target"
     private var observerBlocks: [(address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)] = []
     private var observerCallback: (() -> Void)?
+    private var devicesCache: [AudioDevice]?
 
     func currentState() -> NearfieldState {
         let displays = studioDisplayOutputs()
@@ -109,6 +133,10 @@ final class StudioDisplayAudioManager {
 
     func studioDisplayDevices() -> [AudioDevice] {
         studioDisplayOutputs()
+    }
+
+    func invalidateCachedDevices() {
+        invalidateDeviceCache()
     }
 
     func orderedStudioDisplayUIDs(configuration: NearfieldConfiguration) throws -> [String] {
@@ -146,39 +174,8 @@ final class StudioDisplayAudioManager {
         }
     }
 
-    func rebuildAggregateAndSelect(configuration: NearfieldConfiguration) throws {
-        let aggregateID = try rebuildAggregate(configuration: configuration)
-        try setDefaultOutputDevice(aggregateID)
-    }
-
-    @discardableResult
-    func rebuildAggregate(configuration: NearfieldConfiguration) throws -> AudioObjectID {
-        let managedAggregates = managedNearfieldAggregates()
-        if managedAggregates.contains(where: { $0.id == defaultOutputDeviceID() || $0.id == defaultSystemOutputDeviceID() }) {
-            try moveDefaultOutputAwayFromNearfield()
-        }
-        for existing in managedAggregates {
-            if existing.id == defaultOutputDeviceID() || existing.id == defaultSystemOutputDeviceID() {
-                try moveDefaultOutputAwayFromNearfield()
-            }
-            try destroyAggregate(existing.id)
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-
-        let displays = studioDisplayOutputs()
-        guard displays.count >= 2 else {
-            throw NearfieldError.notEnoughStudioDisplays(displays.count)
-        }
-
-        let orderedDisplays = Self.orderedDisplays(from: displays, leftDeviceUID: configuration.leftDeviceUID)
-        return try createAggregate(from: orderedDisplays, mode: configuration.mode)
-    }
-
-    func selectAggregateAsDefaultOutput() throws {
-        guard let aggregate = device(matchingUID: aggregateUID) else {
-            throw NearfieldError.aggregateMissing
-        }
-        try setDefaultOutputDevice(aggregate.id)
+    func hasManagedNearfieldAggregates() -> Bool {
+        !managedNearfieldAggregates().isEmpty
     }
 
     func selectDeviceAsDefaultOutput(uid: String) throws {
@@ -206,7 +203,7 @@ final class StudioDisplayAudioManager {
 
     func moveDefaultOutputAwayFromNearfield() throws {
         let devices = allDevices()
-        let nearfieldAggregateIDs = Set(devices.filter { isNearfieldAggregate($0) }.map(\.id))
+        let nearfieldAggregateIDs = Set(managedNearfieldAggregates().map(\.id))
         guard !nearfieldAggregateIDs.isEmpty else {
             return
         }
@@ -335,6 +332,7 @@ final class StudioDisplayAudioManager {
                 mElement: kAudioObjectPropertyElementMain
             )
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.invalidateDeviceCache()
                 self?.observerCallback?()
             }
             let status = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
@@ -360,6 +358,20 @@ final class StudioDisplayAudioManager {
     }
 
     private func allDevices() -> [AudioDevice] {
+        if let devicesCache {
+            return devicesCache
+        }
+
+        let devices = fetchAllDevices()
+        devicesCache = devices
+        return devices
+    }
+
+    private func invalidateDeviceCache() {
+        devicesCache = nil
+    }
+
+    private func fetchAllDevices() -> [AudioDevice] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -390,9 +402,12 @@ final class StudioDisplayAudioManager {
 
     private func managedNearfieldAggregates() -> [AudioDevice] {
         var devices = allDevices().filter { isNearfieldAggregate($0) }
-        if let hiddenAggregate = device(matchingUID: aggregateUID),
-           !devices.contains(where: { $0.id == hiddenAggregate.id }) {
-            devices.append(hiddenAggregate)
+        for uid in managedAggregateUIDs {
+            if let hiddenAggregate = device(matchingUID: uid),
+               isNearfieldAggregate(hiddenAggregate),
+               !devices.contains(where: { $0.id == hiddenAggregate.id }) {
+                devices.append(hiddenAggregate)
+            }
         }
         return devices
     }
@@ -513,17 +528,25 @@ final class StudioDisplayAudioManager {
         guard classID(for: device.id) == kAudioAggregateDeviceClassID else {
             return false
         }
-        let managedAggregateUIDs: Set<String> = [
+        return managedAggregateUIDs.contains(device.uid) || managedAggregateNames.contains(device.name)
+    }
+
+    private var managedAggregateUIDs: Set<String> {
+        [
             aggregateUID,
+            RouterAudioDriverManager.driverTargetAggregateUID,
             "com.kemuri.StudioPair.Aggregate"
         ]
-        let managedAggregateNames: Set<String> = [
+    }
+
+    private var managedAggregateNames: Set<String> {
+        [
             aggregateName,
+            "Nearfield Driver Target",
             "Studio Pair Target",
             "Studio Pair",
             "Nearfield Target"
         ]
-        return managedAggregateUIDs.contains(device.uid) || managedAggregateNames.contains(device.name)
     }
 
     private func isAggregateDefaultOutput() -> Bool {
@@ -574,63 +597,13 @@ final class StudioDisplayAudioManager {
         return [left, right]
     }
 
-    private func createAggregate(from devices: [AudioDevice], mode: NearfieldOutputMode) throws -> AudioObjectID {
-        let outputChannelsPerDisplay: UInt32 = 1
-        let isStacked = mode == .stereo ? 1 : 0
-        let subdevices: [[String: Any]] = devices.enumerated().map { index, device in
-            [
-                kAudioSubDeviceUIDKey: device.uid,
-                kAudioSubDeviceNameKey: device.name,
-                kAudioSubDeviceOutputChannelsKey: min(device.outputChannelCount, outputChannelsPerDisplay),
-                kAudioSubDeviceDriftCompensationKey: index == 0 ? 0 : 1,
-                kAudioSubDeviceDriftCompensationQualityKey: kAudioAggregateDriftCompensationHighQuality
-            ]
-        }
-
-        let description: [String: Any] = [
-            kAudioAggregateDeviceUIDKey: aggregateUID,
-            kAudioAggregateDeviceNameKey: aggregateName,
-            kAudioAggregateDeviceSubDeviceListKey: subdevices,
-            kAudioAggregateDeviceMainSubDeviceKey: devices[0].uid,
-            kAudioAggregateDeviceIsPrivateKey: 0,
-            kAudioAggregateDeviceIsStackedKey: isStacked
-        ]
-
-        var aggregateID = AudioObjectID(0)
-        let status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateID)
-        guard status == noErr else {
-            throw NearfieldError.coreAudio(operation: "Creating aggregate device", status: status)
-        }
-        try hideDeviceIfSupported(aggregateID)
-        return aggregateID
-    }
-
-    private func hideDeviceIfSupported(_ deviceID: AudioObjectID) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyIsHidden,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var isSettable = DarwinBoolean(false)
-        let settableStatus = AudioObjectIsPropertySettable(deviceID, &address, &isSettable)
-        guard settableStatus == noErr, isSettable.boolValue else {
-            return
-        }
-        try setUInt32Property(
-            deviceID,
-            selector: kAudioDevicePropertyIsHidden,
-            scope: kAudioObjectPropertyScopeGlobal,
-            element: kAudioObjectPropertyElementMain,
-            value: 1,
-            operation: "Hiding Nearfield target device"
-        )
-    }
-
     private func destroyAggregate(_ deviceID: AudioObjectID) throws {
+        invalidateDeviceCache()
         let status = AudioHardwareDestroyAggregateDevice(deviceID)
         guard status == noErr else {
             throw NearfieldError.coreAudio(operation: "Removing existing aggregate device", status: status)
         }
+        invalidateDeviceCache()
     }
 
     private func setDefaultOutputDevice(_ deviceID: AudioObjectID) throws {

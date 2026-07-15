@@ -6265,16 +6265,15 @@ void ProxyAudioDevice::setTargetAggregateDevices(CFStringRef deviceUIDs) {
     Boolean shouldRebuild = false;
     {
         CAMutex::Locker locker(&stateMutex);
-        if (targetAggregateDevicesString &&
-            CFStringCompare(targetAggregateDevicesString, deviceUIDs, 0) == kCFCompareEqualTo) {
-            return;
-        }
-
-        if (targetAggregateDevicesString) {
+        const bool devicesChanged = !targetAggregateDevicesString ||
+            CFStringCompare(targetAggregateDevicesString, deviceUIDs, 0) != kCFCompareEqualTo;
+        if (devicesChanged && targetAggregateDevicesString) {
             CFRelease(targetAggregateDevicesString);
         }
-        targetAggregateDevicesString = CFStringCreateCopy(NULL, deviceUIDs);
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateDevices"), targetAggregateDevicesString);
+        if (devicesChanged) {
+            targetAggregateDevicesString = CFStringCreateCopy(NULL, deviceUIDs);
+            gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateDevices"), targetAggregateDevicesString);
+        }
         shouldRebuild = true;
     }
 

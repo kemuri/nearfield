@@ -3,6 +3,7 @@ set -euo pipefail
 
 PRODUCT_NAME="Nearfield"
 APP_NAME="${APP_NAME:-Nearfield}"
+APP_DISPLAY_NAME="${APP_DISPLAY_NAME:-$APP_NAME}"
 BUNDLE_ID="${BUNDLE_ID:-com.kemuri.Nearfield}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"
@@ -15,7 +16,6 @@ APP_BUNDLE="${NEARFIELD_APP_BUNDLE:-$DIST_DIR/$APP_NAME.app}"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_RESOURCES="$APP_CONTENTS/Resources"
-APP_FRAMEWORKS="$APP_CONTENTS/Frameworks"
 APP_DRIVERS="$APP_RESOURCES/Drivers"
 APP_BINARY="$APP_MACOS/$APP_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
@@ -35,7 +35,7 @@ BUILD_BIN_DIR="$(swift build --disable-sandbox --scratch-path "$SWIFT_BUILD_DIR"
 BUILD_BINARY="$BUILD_BIN_DIR/$PRODUCT_NAME"
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$APP_MACOS" "$APP_RESOURCES" "$APP_FRAMEWORKS" "$APP_DRIVERS"
+mkdir -p "$APP_MACOS" "$APP_RESOURCES" "$APP_DRIVERS"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
 
@@ -65,7 +65,7 @@ METAL_SRC="$ROOT_DIR/Sources/Nearfield/WaveLabEffects.metal"
 if [[ -f "$METAL_SRC" ]]; then
   if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
     METAL_AIR="$(mktemp -t WaveLabEffects).air"
-    xcrun -sdk macosx metal -O -c "$METAL_SRC" -o "$METAL_AIR"
+    xcrun -sdk macosx metal -O -fmodules-cache-path="$SWIFT_MODULE_CACHE_DIR" -c "$METAL_SRC" -o "$METAL_AIR"
     xcrun -sdk macosx metallib "$METAL_AIR" -o "$APP_RESOURCES/default.metallib"
     rm -f "$METAL_AIR"
     echo "compiled Metal effects -> $APP_RESOURCES/default.metallib"
@@ -86,11 +86,11 @@ cat >"$INFO_PLIST" <<PLIST
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_ID</string>
   <key>CFBundleName</key>
-  <string>$APP_NAME</string>
+  <string>$APP_DISPLAY_NAME</string>
   <key>CFBundleIconFile</key>
   <string>Nearfield</string>
   <key>CFBundleDisplayName</key>
-  <string>Nearfield</string>
+  <string>$APP_DISPLAY_NAME</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -105,9 +105,6 @@ cat >"$INFO_PLIST" <<PLIST
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
-PLIST
-
-cat >>"$INFO_PLIST" <<PLIST
 </dict>
 </plist>
 PLIST

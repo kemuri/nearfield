@@ -1,102 +1,116 @@
 # Nearfield
 
-Nearfield is a small macOS menu bar app that finds two Studio Display speaker
-outputs, creates a CoreAudio aggregate output named `Nearfield Target`, and
-routes a volume-controllable router output named `Nearfield` into it.
+Nearfield is an open-source macOS menu bar app that turns the speakers in two
+Apple Studio Displays into one volume-controllable stereo output.
 
-## Run
+[![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black)](https://www.apple.com/macos/)
+[![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+![Nearfield settings](screenshots/settings-pane-preview.svg)
+
+## What it does
+
+- Detects two connected Studio Display speaker outputs.
+- Publishes a single `Nearfield` stereo output with system volume control.
+- Lets you swap left and right displays, adjust balance, and play test tones.
+- Supports stereo and mono output modes.
+- Can route selected apps or app windows to the left display, right display,
+  both displays, or mute.
+- Includes an optional Wave Lab visualization and can launch at login.
+
+Nearfield is an early-stage project. App and per-window routing are experimental,
+and macOS may expose several windows from one app as a single audio process. In
+that case, Nearfield cannot split those windows into separate audio streams.
+
+## Requirements
+
+- macOS 14 Sonoma or later
+- Two Apple Studio Displays connected to the same Mac
+- Xcode with the macOS SDK and command-line tools
+- Administrator access to install the CoreAudio HAL driver
+
+## Run from source
 
 ```sh
+git clone https://github.com/kemuri/nearfield.git
+cd nearfield
 ./script/build_and_run.sh
 ```
 
-The Codex app `Run` action is wired to the same script.
+This builds an ad-hoc-signed `Nearfield Dev.app` under `dist/` and launches it.
+Complete the onboarding flow to install the bundled audio driver. Driver
+installation asks for an administrator password and restarts CoreAudio, which
+briefly interrupts system audio.
 
-## Build
-
-Local development builds use the normal debug path:
-
-```sh
-./script/build_and_run.sh
-```
-
-## Router Driver
-
-Nearfield vendors a router-capable Proxy Audio Device fork under
-`Vendor/app-router-audio-device`. It builds as
-`NearfieldAudioDevice.driver` and exposes the user-facing output
-`Nearfield`.
-
-```sh
-./script/build_router_driver.sh
-```
-
-Install or update the driver from Settings, or run:
+To install or update only the driver:
 
 ```sh
 ./script/install_router_driver.sh
 ```
 
-The install script copies `NearfieldAudioDevice.driver` into
-`/Library/Audio/Plug-Ins/HAL`, fixes ownership, ad-hoc signs it, and restarts
-CoreAudio. After CoreAudio reloads it, Nearfield configures the router output
-to forward to the underlying `Nearfield Target` aggregate and selects the
-router device named `Nearfield` as the system output.
+## Development
 
-## Behavior
+Build and run the Swift package tests with:
 
-- Starts as an icon-only menu bar app.
-- Automatically creates/selects the pair on launch when two Studio Display
-  speaker outputs are connected.
-- Opens a Settings panel for stereo/mono output, left/right monitor assignment,
-  audio routing, open-at-login, router driver setup/reinstall, and removing the
-  driver plus old aggregate devices.
-- Includes left/right test-tone buttons in Settings to identify the physical
-  channel assignment.
-- Includes a left/right balance slider for biasing output between displays.
-- Uses the router output when the driver is installed, so the macOS menu
-  bar and Control Center volume slider can adjust the pair.
-- Falls back to keyboard volume up/down/mute handling when only the aggregate
-  device is available.
-- Keeps the menu bar context menu to Settings and Quit.
-- Can register or unregister itself as a login item from Settings.
+```sh
+swift build
+swift test
+```
 
-## Audio Note
+Useful scripts:
 
-Nearfield uses macOS's built-in CoreAudio aggregate-device API for the physical
-Studio Display pair, then uses the vendored router HAL driver as a
-volume-controllable output in front of that aggregate.
+| Command | Purpose |
+| --- | --- |
+| `./script/build_and_run.sh` | Build and launch the development app |
+| `./script/build_and_run.sh --debug` | Build and run under LLDB |
+| `./script/build_router_driver.sh` | Build the vendored HAL driver |
+| `./script/build_app_bundle.sh` | Assemble an ad-hoc-signed app bundle |
 
-The active `Nearfield Target` aggregate must remain visible to CoreAudio while
-using the current router architecture, because the HAL driver forwards audio
-into that target. Apple's `kAudioAggregateDeviceIsPrivateKey` makes an
-aggregate private to the creating process, which would prevent the out-of-process
-HAL driver from reliably addressing it. Fully removing the target from the
-system speaker list requires the router driver to write directly to both Studio
-Displays instead of proxying through an aggregate.
+The Metal toolchain is optional. Without it, Wave Lab uses its SwiftUI
+fallback. Xcode can install it with:
 
-## App Routing
+```sh
+xcodebuild -downloadComponent MetalToolchain
+```
 
-Open Settings and enable `App Routing` to route selected apps through the router
-driver. The router output appears in macOS Sound settings only after the admin
-install completes and CoreAudio reloads the HAL plug-in.
+## Permissions and system changes
 
-Route rules are a semicolon-separated list:
+- The HAL driver is installed at
+  `/Library/Audio/Plug-Ins/HAL/NearfieldAudioDevice.driver`.
+- Installing, updating, or removing that driver requires administrator access
+  and restarts CoreAudio.
+- Screen Recording permission is requested only for features that inspect
+  windows or capture system output for visualization.
+- Nearfield can register itself as a macOS login item when you enable that
+  setting.
+
+## How it works
+
+The app discovers the physical Studio Display devices and sends their identifiers
+to a fork of
+[proxy-audio-device](https://github.com/briankendall/proxy-audio-device) under
+`Vendor/app-router-audio-device`. The HAL driver owns a private CoreAudio target
+for the display pair and exposes the user-facing `Nearfield` output. Legacy
+StudioPair identifiers remain only to find and remove older installations.
+
+App-routing rules use this format:
 
 ```text
 com.spotify.client=pair; app.zen-browser.zen=window
 ```
 
-Accepted destinations are `left`, `right`, `pair`, `muted`, and `window`.
-`window` is resolved by the Nearfield app into `pid:<processID>=left/right`
-rules based on visible windows for that bundle ID, plus a bundle fallback based
-on the largest visible window. The HAL driver applies PID rules before bundle
-rules. Apps with no matching rule play as `pair`, which preserves normal stereo
-across both displays.
+Accepted destinations are `left`, `right`, `pair`, `muted`, and `window`. PID
+rules take precedence over bundle rules; apps without a match play in stereo
+across the pair.
 
-True simultaneous per-window routing depends on macOS exposing separate audio
-client processes for the windows. If multiple windows share one audio process,
-Nearfield cannot split that one mixed stream by window; it routes that process
-using the largest visible window for the process. This is still a driver-level
-spike: the next validation step is runtime testing to confirm CoreAudio calls
-the driver's per-client mix operation for real-world apps.
+## Contributing
+
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the development workflow. Please report security issues as described in
+[SECURITY.md](SECURITY.md), not in a public issue.
+
+## License
+
+Nearfield is available under the [MIT License](LICENSE). The vendored
+proxy-audio-device code retains its own public-domain [license](Vendor/app-router-audio-device/LICENSE).
