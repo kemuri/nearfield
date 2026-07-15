@@ -113,10 +113,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if moveToApplicationsIfNeeded() {
             return
         }
-        finishLaunching()
+        finishLaunching(notification: notification)
     }
 
-    private func finishLaunching() {
+    private func finishLaunching(notification: Notification) {
         configureDynamicRoutingLifecycleNotifications()
         preparePairOnLaunch()
         mediaKeyVolumeController.start()
@@ -134,7 +134,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openOnboarding()
             return
         }
-        presentInitialOnboardingIfNeeded()
+        if presentInitialOnboardingIfNeeded() {
+            return
+        }
+        presentSettingsIfMenuBarAppIsHiddenAfterDefaultLaunch(notification)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !showMenuBarApp() else {
+            return true
+        }
+        openSettings()
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -319,9 +330,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func presentInitialOnboardingIfNeeded() {
-        guard !routerDriverManager.isInstalled else { return }
+    @discardableResult
+    private func presentInitialOnboardingIfNeeded() -> Bool {
+        guard !routerDriverManager.isInstalled else { return false }
         openOnboarding()
+        return true
+    }
+
+    private func presentSettingsIfMenuBarAppIsHiddenAfterDefaultLaunch(_ notification: Notification) {
+        guard !showMenuBarApp(),
+              notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool == true else {
+            return
+        }
+        openSettings()
     }
 
     private func refreshStatus() {

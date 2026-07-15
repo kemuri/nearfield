@@ -7,8 +7,6 @@ Apple Studio Displays into one volume-controllable stereo output.
 [![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-![Nearfield settings](screenshots/settings-pane-preview.svg)
-
 ## What it does
 
 - Detects two connected Studio Display speaker outputs.
@@ -65,7 +63,6 @@ Useful scripts:
 | `./script/build_and_run.sh` | Build and launch the development app |
 | `./script/build_and_run.sh --debug` | Build and run under LLDB |
 | `./script/build_router_driver.sh` | Build the vendored HAL driver |
-| `./script/build_app_bundle.sh` | Assemble an ad-hoc-signed app bundle |
 
 The Metal toolchain is optional. Without it, Wave Lab uses its SwiftUI
 fallback. Xcode can install it with:
@@ -84,25 +81,6 @@ xcodebuild -downloadComponent MetalToolchain
   windows or capture system output for visualization.
 - Nearfield can register itself as a macOS login item when you enable that
   setting.
-
-## How it works
-
-The app discovers the physical Studio Display devices and sends their identifiers
-to a fork of
-[proxy-audio-device](https://github.com/briankendall/proxy-audio-device) under
-`Vendor/app-router-audio-device`. The HAL driver owns a private CoreAudio target
-for the display pair and exposes the user-facing `Nearfield` output. Legacy
-StudioPair identifiers remain only to find and remove older installations.
-
-App-routing rules use this format:
-
-```text
-com.spotify.client=pair; app.zen-browser.zen=window
-```
-
-Accepted destinations are `left`, `right`, `pair`, `muted`, and `window`. PID
-rules take precedence over bundle rules; apps without a match play in stereo
-across the pair.
 
 ## Contributing
 

@@ -9,3 +9,13 @@ script = ""
 name = "Run"
 icon = "run"
 command = "./script/build_and_run.sh"
+
+[[actions]]
+name = "Build"
+icon = "run"
+command = 'APP_NAME="Nearfield Dev" APP_DISPLAY_NAME="Nearfield Dev" BUNDLE_ID="com.kemuri.Nearfield.debug" NEARFIELD_BUILD_CONFIGURATION=debug CODE_SIGN_IDENTITY=- ./script/build_app_bundle.sh'
+
+[[actions]]
+name = "Release Build"
+icon = "run"
+command = "./.local-release/package_dmg.sh"
