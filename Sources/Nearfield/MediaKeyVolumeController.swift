@@ -3,10 +3,12 @@ import IOKit
 
 final class MediaKeyVolumeController {
     private let audioManager: StudioDisplayAudioManager
+    private let routerDriverManager: RouterAudioDriverManager
     private var monitors: [Any] = []
 
-    init(audioManager: StudioDisplayAudioManager) {
+    init(audioManager: StudioDisplayAudioManager, routerDriverManager: RouterAudioDriverManager) {
         self.audioManager = audioManager
+        self.routerDriverManager = routerDriverManager
     }
 
     func start() {
@@ -42,13 +44,13 @@ final class MediaKeyVolumeController {
         do {
             switch keyType {
             case Int(NX_KEYTYPE_SOUND_UP):
-                try audioManager.adjustNearfieldVolume(by: 1.0 / 16.0)
+                try adjustVolume(by: 1.0 / 16.0)
                 return true
             case Int(NX_KEYTYPE_SOUND_DOWN):
-                try audioManager.adjustNearfieldVolume(by: -1.0 / 16.0)
+                try adjustVolume(by: -1.0 / 16.0)
                 return true
             case Int(NX_KEYTYPE_MUTE):
-                try audioManager.toggleNearfieldMute()
+                try toggleMute()
                 return true
             default:
                 return false
@@ -63,5 +65,21 @@ final class MediaKeyVolumeController {
         let flags = event.data1 & 0x0000FFFF
         let keyState = (flags & 0xFF00) >> 8
         return keyState == 0x0A
+    }
+
+    private func adjustVolume(by delta: Float32) throws {
+        if routerDriverManager.isRouterDefaultOutput() {
+            try routerDriverManager.adjustVolume(by: delta)
+        } else {
+            try audioManager.adjustNearfieldVolume(by: delta)
+        }
+    }
+
+    private func toggleMute() throws {
+        if routerDriverManager.isRouterDefaultOutput() {
+            try routerDriverManager.toggleMute()
+        } else {
+            try audioManager.toggleNearfieldMute()
+        }
     }
 }

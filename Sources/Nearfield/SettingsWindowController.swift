@@ -1,80 +1,9 @@
 import AppKit
 
-enum SpatialRoutingChannel: String, Equatable {
-    case left
-    case right
-    case pair
-    case muted
-
-    var symbolName: String {
-        switch self {
-        case .left: "l.circle.fill"
-        case .right: "r.circle.fill"
-        case .pair: "speaker.wave.2.circle.fill"
-        case .muted: "speaker.slash.circle.fill"
-        }
-    }
-
-    var accessibilityLabel: String {
-        switch self {
-        case .left: "Left channel"
-        case .right: "Right channel"
-        case .pair: "Both channels"
-        case .muted: "Muted"
-        }
-    }
-
-    init?(route: String) {
-        switch route.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "left", "left-display":
-            self = .left
-        case "right", "right-display":
-            self = .right
-        case "pair", "default":
-            self = .pair
-        case "muted", "mute", "silent":
-            self = .muted
-        default:
-            return nil
-        }
-    }
-}
-
-@MainActor
-protocol SettingsWindowControllerDelegate: AnyObject {
-    func settingsDevices() -> [AudioDevice]
-    func settingsMode() -> NearfieldOutputMode
-    func settingsLeftDeviceUID() -> String?
-    func settingsOpenAtLogin() -> Bool
-    func settingsSetOpenAtLogin(_ enabled: Bool)
-    func settingsShowMenuBarApp() -> Bool
-    func settingsSetShowMenuBarApp(_ enabled: Bool)
-    func settingsDriverInstalled() -> Bool
-    func settingsIsInstallingDriver() -> Bool
-    func settingsAppRoutingEnabled() -> Bool
-    func settingsSetAppRoutingEnabled(_ enabled: Bool)
-    func settingsAppRoutingAppBundleIDs() -> [String]?
-    func settingsSetAppRoutingAppBundleIDs(_ bundleIDs: [String])
-    func settingsSpatialRoutingChannel(
-        for bundleIdentifier: String,
-        routingBundleIdentifiers: [String]
-    ) -> SpatialRoutingChannel?
-    func settingsRoutingRules() -> String
-    func settingsSetRoutingRules(_ rules: String)
-    func settingsFooterStatus() -> String
-    func settingsBalance() -> Float
-    func settingsSetBalance(_ balance: Float)
-    func settingsSetMode(_ mode: NearfieldOutputMode)
-    func settingsSetLeftDeviceUID(_ uid: String)
-    func settingsApplyConfiguration()
-    func settingsInstallDriver()
-    func settingsRemoveEverything()
-    func settingsPlayTestTone(_ channel: TestToneChannel)
-}
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
-    weak var settingsDelegate: SettingsWindowControllerDelegate?
+    weak var settingsDelegate: SettingsDelegate?
 
     private enum Theme {
         static let background = NSColor(calibratedRed: 0.095, green: 0.098, blue: 0.102, alpha: 1)
@@ -105,7 +34,7 @@ final class SettingsWindowController: NSWindowController {
     private let routingRulesField = NSTextField(string: "")
     private let footerLabel = NSTextField(labelWithString: "")
 
-    init(delegate: SettingsWindowControllerDelegate) {
+    init(delegate: SettingsDelegate) {
         self.settingsDelegate = delegate
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
@@ -265,7 +194,7 @@ final class SettingsWindowController: NSWindowController {
             row(title: "Driver", detail: "Router HAL output named Nearfield for system volume control.", trailing: driverControls(status: driverStatusPill, action: setupButton)),
             row(title: "App Routing", detail: "Route matching bundle IDs through the router output.", trailing: appRoutingSwitch),
             row(title: "Routing Rules", detail: "Format: bundle.id=left/right/pair/window.", trailing: routingRulesField),
-            row(title: "Remove & Clean Up", detail: "Remove the HAL driver and old Nearfield aggregate devices.", trailing: removeButton)
+            row(title: "Uninstall Nearfield", detail: "Remove drivers, and optionally remove Nearfield.app from Applications.", trailing: removeButton)
         ])
 
         footerLabel.font = .systemFont(ofSize: 12)
@@ -421,7 +350,7 @@ final class SettingsWindowController: NSWindowController {
     }
 
     private func configureRoutingRulesField() {
-        routingRulesField.placeholderString = WindowAudioRouteResolver.defaultRoutingRules
+        routingRulesField.placeholderString = ""
         routingRulesField.controlSize = .large
         routingRulesField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         routingRulesField.widthAnchor.constraint(equalToConstant: 250).isActive = true

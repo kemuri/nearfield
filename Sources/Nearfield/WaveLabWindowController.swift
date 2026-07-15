@@ -94,6 +94,9 @@ struct WaveLabRootView: View {
     @State private var hoverDuration: Double = 0.35
     @State private var didCopy = false
     @State private var pasteStatus: WaveLabPasteStatus?
+    @State private var audioReactiveEnabled = false
+    @State private var audioInfluence = 0.65
+    @StateObject private var outputAudioMonitor = OutputAudioLevelMonitor()
 
     fileprivate init(visibility: WaveLabWindowVisibility) {
         self.visibility = visibility
@@ -111,6 +114,11 @@ struct WaveLabRootView: View {
     /// over the image, or the hover state is the one being edited.
     private var showingHover: Bool { isHovering || editingHover }
 
+    private var previewAudioLevel: Double {
+        guard audioReactiveEnabled, !visibility.isPreviewPaused else { return 0 }
+        return outputAudioMonitor.level * audioInfluence
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             previewColumn
@@ -119,6 +127,15 @@ struct WaveLabRootView: View {
         }
         .frame(minWidth: 720, minHeight: 560)
         .background(Color(white: 0.12))
+        .onChange(of: audioReactiveEnabled) { _, _ in
+            updateOutputAudioMonitor()
+        }
+        .onChange(of: visibility.isPreviewPaused) { _, _ in
+            updateOutputAudioMonitor()
+        }
+        .onDisappear {
+            outputAudioMonitor.setActive(false)
+        }
     }
 
     // MARK: Preview
@@ -132,7 +149,8 @@ struct WaveLabRootView: View {
                     progress: showingHover ? 1 : 0,
                     normal: normalConfig,
                     hover: hoverConfig,
-                    paused: visibility.isPreviewPaused
+                    paused: visibility.isPreviewPaused,
+                    audioLevel: previewAudioLevel
                 )
                 .frame(width: WaveLabLayout.previewOverscanWidth, height: WaveLabLayout.previewHeight)
                 .frame(width: WaveLabLayout.previewBaseWidth, alignment: .leading)
@@ -179,6 +197,7 @@ struct WaveLabRootView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     transitionSection
+                    audioResponseSection
                     canvasSection
                     waveSection
                     progressiveBlurSection
@@ -276,6 +295,32 @@ struct WaveLabRootView: View {
             Text("Every continuous setting tweens between the normal and hover states with this curve.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    private var audioResponseSection: some View {
+        Section(title: "Audio response") {
+            Toggle("Current output influences waves", isOn: $audioReactiveEnabled)
+                .toggleStyle(.switch)
+
+            SliderRow(title: "Influence", value: $audioInfluence, range: 0...1.5, decimals: 2)
+                .disabled(!audioReactiveEnabled)
+
+            AudioLevelMeter(level: outputAudioMonitor.level)
+                .opacity(audioReactiveEnabled ? 1 : 0.4)
+
+            Text(audioReactiveEnabled ? outputAudioMonitor.statusText : "Off")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if outputAudioMonitor.requiresScreenRecordingPermission {
+                Button {
+                    openScreenRecordingSettings()
+                } label: {
+                    Label("Open Settings", systemImage: "gearshape")
+                }
+                .controlSize(.small)
+            }
         }
     }
 
@@ -381,6 +426,17 @@ struct WaveLabRootView: View {
                 edited.wrappedValue.secondaryWave[keyPath: keyPath] = newValue
             }
         )
+    }
+
+    private func updateOutputAudioMonitor() {
+        outputAudioMonitor.setActive(audioReactiveEnabled && !visibility.isPreviewPaused)
+    }
+
+    private func openScreenRecordingSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: Clipboard
@@ -491,6 +547,31 @@ private struct IntSliderRow: View {
                 in: Double(range.lowerBound)...Double(range.upperBound)
             )
         }
+    }
+}
+
+private struct AudioLevelMeter: View {
+    let level: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.08))
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [.green, .yellow, .orange],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: proxy.size.width * min(max(level, 0), 1))
+            }
+        }
+        .frame(height: 6)
+        .accessibilityLabel("Output audio level")
+        .accessibilityValue("\(Int(min(max(level, 0), 1) * 100)) percent")
     }
 }
 

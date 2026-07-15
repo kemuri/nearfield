@@ -3,18 +3,22 @@ set -euo pipefail
 
 MODE="${1:-run}"
 PRODUCT_NAME="Nearfield"
-APP_NAME="Nearfield"
+APP_NAME="${NEARFIELD_DEBUG_APP_NAME:-Nearfield Dev}"
+APP_DISPLAY_NAME="${NEARFIELD_DEBUG_APP_DISPLAY_NAME:-Nearfield Dev}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-BUNDLE_ID="com.kemuri.Nearfield"
+BUNDLE_ID="${NEARFIELD_DEBUG_BUNDLE_ID:-com.kemuri.Nearfield.debug}"
 
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 pkill -x "$PRODUCT_NAME" >/dev/null 2>&1 || true
 
 NEARFIELD_BUILD_CONFIGURATION=debug \
+APP_NAME="$APP_NAME" \
+APP_DISPLAY_NAME="$APP_DISPLAY_NAME" \
+BUNDLE_ID="$BUNDLE_ID" \
 CODE_SIGN_IDENTITY=- \
 "$ROOT_DIR/script/build_app_bundle.sh"
 
