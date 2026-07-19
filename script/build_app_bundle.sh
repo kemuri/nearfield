@@ -15,6 +15,7 @@ DIST_DIR="${NEARFIELD_DIST_DIR:-$ROOT_DIR/dist}"
 APP_BUNDLE="${NEARFIELD_APP_BUNDLE:-$DIST_DIR/$APP_NAME.app}"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
+APP_FRAMEWORKS="$APP_CONTENTS/Frameworks"
 APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_DRIVERS="$APP_RESOURCES/Drivers"
 APP_BINARY="$APP_MACOS/$APP_NAME"
@@ -26,6 +27,8 @@ CODE_SIGN_OPTIONS="${CODE_SIGN_OPTIONS:-}"
 CODE_SIGN_TIMESTAMP="${CODE_SIGN_TIMESTAMP:-0}"
 SWIFT_MODULE_CACHE_DIR="${NEARFIELD_SWIFT_MODULE_CACHE_DIR:-/private/tmp/nearfield-swift-cache}"
 SWIFT_BUILD_DIR="${NEARFIELD_SWIFT_BUILD_DIR:-$ROOT_DIR/.build/nearfield-bundle}"
+SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-}"
+SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
 
 mkdir -p "$SWIFT_MODULE_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_MODULE_CACHE_DIR"
@@ -35,9 +38,16 @@ BUILD_BIN_DIR="$(swift build --disable-sandbox --scratch-path "$SWIFT_BUILD_DIR"
 BUILD_BINARY="$BUILD_BIN_DIR/$PRODUCT_NAME"
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$APP_MACOS" "$APP_RESOURCES" "$APP_DRIVERS"
+mkdir -p "$APP_MACOS" "$APP_FRAMEWORKS" "$APP_RESOURCES" "$APP_DRIVERS"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
+
+SPARKLE_FRAMEWORK_SOURCE="$BUILD_BIN_DIR/Sparkle.framework"
+if [[ ! -d "$SPARKLE_FRAMEWORK_SOURCE" ]]; then
+  echo "Sparkle.framework was not found in the Swift build: $SPARKLE_FRAMEWORK_SOURCE" >&2
+  exit 1
+fi
+ditto "$SPARKLE_FRAMEWORK_SOURCE" "$APP_FRAMEWORKS/Sparkle.framework"
 
 if [[ -d "$BUILD_BIN_DIR/${PRODUCT_NAME}_${PRODUCT_NAME}.bundle" ]]; then
   cp -R "$BUILD_BIN_DIR/${PRODUCT_NAME}_${PRODUCT_NAME}.bundle" "$APP_RESOURCES/"
@@ -109,6 +119,13 @@ cat >"$INFO_PLIST" <<PLIST
 </plist>
 PLIST
 
+if [[ -n "$SPARKLE_FEED_URL" ]]; then
+  /usr/libexec/PlistBuddy -c "Add :SUFeedURL string $SPARKLE_FEED_URL" "$INFO_PLIST"
+fi
+if [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+  /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$INFO_PLIST"
+fi
+
 sign_path() {
   local path="$1"
   local args=(--force --deep --sign "$CODE_SIGN_IDENTITY")
@@ -121,6 +138,7 @@ sign_path() {
   codesign "${args[@]}" "$path" >/dev/null
 }
 
+sign_path "$APP_FRAMEWORKS/Sparkle.framework"
 sign_path "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 sign_path "$APP_BUNDLE"
 

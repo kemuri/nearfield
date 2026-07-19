@@ -10,11 +10,15 @@ let package = Package(
     products: [
         .executable(name: "Nearfield", targets: ["Nearfield"])
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.4")
+    ],
     targets: [
         .executableTarget(
             name: "Nearfield",
-            dependencies: [],
+            dependencies: [
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
             exclude: [
                 // Compiled separately into default.metallib by build_and_run.sh;
                 // `swift build` does not handle .metal sources.
@@ -33,7 +37,8 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("ScreenCaptureKit"),
-                .linkedFramework("ServiceManagement")
+                .linkedFramework("ServiceManagement"),
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
         .testTarget(
