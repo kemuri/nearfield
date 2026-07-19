@@ -7,6 +7,9 @@ Apple Studio Displays into one volume-controllable stereo output.
 [![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+> [!TIP]
+> Prefer a ready-to-install version? [Buy Nearfield at trynearfield.com](https://trynearfield.com).
+
 ## What it does
 
 - Detects two connected Studio Display speaker outputs.

@@ -4,6 +4,12 @@ import XCTest
 @testable import Nearfield
 
 final class NearfieldRegressionTests: XCTestCase {
+    func testTestTonePlayerDoesNotPrepareCoreAudioDuringInitialization() {
+        let player = TestTonePlayer()
+
+        XCTAssertFalse(player.isAudioGraphPrepared)
+    }
+
     func testBalanceMathPreservesLouderSideAndReducesOppositeChannel() {
         let volumes = BalanceMath.channelVolumes(
             currentLeft: 0.4,

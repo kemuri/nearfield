@@ -505,35 +505,55 @@ private final class OnboardingModel: ObservableObject {
 
     private func recheckLiveInstallEnvironment(allowsMissingStudioDisplays: Bool) {
         cancelInstallTasks()
-        refreshFromDelegate()
         allowsMissingStudioDisplaysForLiveInstall = allowsMissingStudioDisplays
         installError = nil
         installProgressIndex = OnboardingInstallStep.environment.rawValue
 
-        guard allowsMissingStudioDisplays || liveInstallCanCompleteConfiguration() else {
-            failLiveInstall(with: studioDisplayRequirementError(step: .environment))
-            return
-        }
+        pendingLiveInstallStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let isCoreAudioReady = await self.delegate?.settingsRefreshAudioState() ?? false
+            guard !Task.isCancelled else { return }
+            self.pendingLiveInstallStartTask = nil
+            self.refreshFromDelegate()
+            guard isCoreAudioReady else {
+                self.failLiveInstall(with: self.coreAudioUnavailableError(step: .environment))
+                return
+            }
+            guard allowsMissingStudioDisplays || self.liveInstallCanCompleteConfiguration() else {
+                self.failLiveInstall(with: self.studioDisplayRequirementError(step: .environment))
+                return
+            }
 
-        withAnimation(.smooth(duration: 0.24)) {
-            installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
+            withAnimation(.smooth(duration: 0.24)) {
+                self.installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
+            }
         }
     }
 
     private func retryLiveRouterConfiguration() {
         cancelInstallTasks()
-        refreshFromDelegate()
         installError = nil
         installProgressIndex = OnboardingInstallStep.routingDriver.rawValue
 
-        guard liveInstallCanCompleteConfiguration() else {
-            failLiveInstall(with: studioDisplayRequirementError(step: .routingDriver))
-            return
-        }
+        pendingLiveInstallStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let isCoreAudioReady = await self.delegate?.settingsRefreshAudioState() ?? false
+            guard !Task.isCancelled else { return }
+            self.pendingLiveInstallStartTask = nil
+            self.refreshFromDelegate()
+            guard isCoreAudioReady else {
+                self.failLiveInstall(with: self.coreAudioUnavailableError(step: .routingDriver))
+                return
+            }
+            guard self.liveInstallCanCompleteConfiguration() else {
+                self.failLiveInstall(with: self.studioDisplayRequirementError(step: .routingDriver))
+                return
+            }
 
-        liveInstallRequestedAt = Date()
-        delegate?.settingsApplyConfiguration()
-        startLiveInstallSequence()
+            self.liveInstallRequestedAt = Date()
+            self.delegate?.settingsApplyConfiguration()
+            self.startLiveInstallSequence()
+        }
     }
 
     func cancelInstallSimulation() {
@@ -799,7 +819,14 @@ private final class OnboardingModel: ObservableObject {
             guard !Task.isCancelled, self.step == .install else { return }
             try? await Task.sleep(nanoseconds: Metrics.liveEnvironmentStepDelayNanoseconds)
             guard !Task.isCancelled, self.step == .install else { return }
+            let isCoreAudioReady = await self.delegate?.settingsRefreshAudioState() ?? false
+            guard !Task.isCancelled, self.step == .install else { return }
             self.pendingLiveInstallStartTask = nil
+            self.refreshFromDelegate()
+            guard isCoreAudioReady else {
+                self.failLiveInstall(with: self.coreAudioUnavailableError(step: .environment))
+                return
+            }
             self.runLiveInstallFlow()
         }
     }
@@ -896,16 +923,23 @@ private final class OnboardingModel: ObservableObject {
 
     private func liveInstallCanCompleteConfiguration() -> Bool {
         NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(
-            studioDisplayCount: delegate?.settingsDevices().count ?? 0
+            studioDisplayCount: studioDisplayCount
         )
     }
 
     private func studioDisplayRequirementError(step: OnboardingInstallStep) -> OnboardingInstallError {
-        let displayCount = delegate?.settingsDevices().count ?? 0
         return OnboardingInstallError(
             step: step,
             title: "Studio Displays Required",
-            message: NearfieldError.notEnoughStudioDisplays(displayCount).localizedDescription
+            message: NearfieldError.notEnoughStudioDisplays(studioDisplayCount).localizedDescription
+        )
+    }
+
+    private func coreAudioUnavailableError(step: OnboardingInstallStep) -> OnboardingInstallError {
+        OnboardingInstallError(
+            step: step,
+            title: "Core Audio Is Not Responding",
+            message: "Quit and reopen Nearfield after Core Audio has restarted, then try again."
         )
     }
 

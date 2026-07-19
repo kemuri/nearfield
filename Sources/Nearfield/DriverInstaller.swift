@@ -119,6 +119,12 @@ final class DriverInstaller {
             }
     }
 
+    static func isRouterDriverInstalledOnDisk() -> Bool {
+        routerDriverBundleNames.contains { bundleName in
+            FileManager.default.fileExists(atPath: "\(halDriverDirectory)/\(bundleName)")
+        }
+    }
+
     private func bundledRouterDriverPath() throws -> String? {
         let candidates = [
             Bundle.main.resourceURL?.appendingPathComponent("Drivers/\(Self.routerDriverBundleName)"),
