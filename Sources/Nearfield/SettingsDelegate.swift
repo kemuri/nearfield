@@ -49,6 +49,7 @@ protocol SettingsDelegate: AnyObject {
     func settingsSetOpenAtLogin(_ enabled: Bool)
     func settingsShowMenuBarApp() -> Bool
     func settingsSetShowMenuBarApp(_ enabled: Bool)
+    func settingsDidReachSettingsScreen()
     func settingsDriverInstalled() -> Bool
     func settingsIsInstallingDriver() -> Bool
     func settingsNearfieldDriverSelected() -> Bool
@@ -69,7 +70,11 @@ protocol SettingsDelegate: AnyObject {
     func settingsSetMode(_ mode: NearfieldOutputMode)
     func settingsSetLeftDeviceUID(_ uid: String)
     func settingsApplyConfiguration()
-    func settingsInstallDriver(requiresConfirmation: Bool, presentsErrors: Bool)
+    func settingsInstallDriver(
+        requiresConfirmation: Bool,
+        presentsErrors: Bool,
+        allowsMissingStudioDisplays: Bool
+    )
     func settingsRemoveEverything()
     func settingsPlayTestTone(_ channel: TestToneChannel)
 }
@@ -77,10 +82,26 @@ protocol SettingsDelegate: AnyObject {
 @MainActor
 extension SettingsDelegate {
     func settingsInstallDriver() {
-        settingsInstallDriver(requiresConfirmation: true, presentsErrors: true)
+        settingsInstallDriver(
+            requiresConfirmation: true,
+            presentsErrors: true,
+            allowsMissingStudioDisplays: false
+        )
     }
 
     func settingsInstallDriver(requiresConfirmation: Bool) {
-        settingsInstallDriver(requiresConfirmation: requiresConfirmation, presentsErrors: true)
+        settingsInstallDriver(
+            requiresConfirmation: requiresConfirmation,
+            presentsErrors: true,
+            allowsMissingStudioDisplays: false
+        )
+    }
+
+    func settingsInstallDriver(requiresConfirmation: Bool, presentsErrors: Bool) {
+        settingsInstallDriver(
+            requiresConfirmation: requiresConfirmation,
+            presentsErrors: presentsErrors,
+            allowsMissingStudioDisplays: false
+        )
     }
 }

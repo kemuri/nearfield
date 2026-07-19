@@ -63,8 +63,10 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
 
         window.delegate = self
-        window.shortcutHandler = { [weak self] event in
-            self?.handleStepShortcut(event) ?? false
+        if BuildConfiguration.debugToolsEnabled {
+            window.shortcutHandler = { [weak self] event in
+                self?.handleStepShortcut(event) ?? false
+            }
         }
 
         let hostingView = NSHostingView(rootView: OnboardingRootView(model: model))
@@ -191,6 +193,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func handleStepShortcut(_ event: NSEvent) -> Bool {
+        guard BuildConfiguration.debugToolsEnabled else { return false }
         let disallowedModifiers = event.modifierFlags.intersection([.command, .control, .option])
         guard disallowedModifiers.isEmpty else {
             return false
@@ -258,7 +261,7 @@ private enum OnboardingInstallStep: Int, CaseIterable {
         case .environment: "Check Environment"
         case .approveDriver: "Approve Driver Install"
         case .routingDriver: "Install Routing Driver"
-        case .appRouting: "Activate App Routing"
+        case .appRouting: "Activate App Audio Routing"
         }
     }
 
@@ -267,7 +270,7 @@ private enum OnboardingInstallStep: Int, CaseIterable {
         case .environment: "Environment Check Passed"
         case .approveDriver: "Driver Install Approved"
         case .routingDriver: "Routing Driver Installed"
-        case .appRouting: "App Routing Activated"
+        case .appRouting: "App Audio Routing Activated"
         }
     }
 
@@ -280,7 +283,7 @@ private enum OnboardingInstallStep: Int, CaseIterable {
         case .routingDriver:
             "Preparing the virtual output driver"
         case .appRouting:
-            "Enabling app routing controls"
+            "Enabling App Audio Routing controls"
         }
     }
 }
@@ -355,6 +358,7 @@ private final class OnboardingModel: ObservableObject {
     private var spatialRoutingActivityTask: Task<Void, Never>?
     private var isWindowVisible = false
     private var installScenario: OnboardingInstallScenario = .smooth
+    private var allowsMissingStudioDisplaysForLiveInstall = false
 
     init(delegate: SettingsDelegate) {
         self.delegate = delegate
@@ -373,11 +377,14 @@ private final class OnboardingModel: ObservableObject {
         openAtLogin = delegate.settingsOpenAtLogin()
         showMenubarApp = delegate.settingsShowMenuBarApp()
         balance = Double(delegate.settingsBalance())
-        driverInstalled = delegate.settingsDriverInstalled()
-        isInstallingDriver = delegate.settingsIsInstallingDriver()
-        nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
+        let installingDriver = delegate.settingsIsInstallingDriver()
+        isInstallingDriver = installingDriver
+        if !installingDriver {
+            driverInstalled = delegate.settingsDriverInstalled()
+            nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
+            studioDisplayCount = delegate.settingsDevices().count
+        }
         appVersionText = delegate.settingsAppVersionText()
-        studioDisplayCount = delegate.settingsDevices().count
         spatialRoutingEnabled = delegate.settingsAppRoutingEnabled()
         syncSpatialRoutingApps(
             bundleIDs: delegate.settingsAppRoutingAppBundleIDs(),
@@ -422,6 +429,9 @@ private final class OnboardingModel: ObservableObject {
         }
         let change = {
             self.step = nextStep
+            if nextStep == .settings {
+                self.delegate?.settingsDidReachSettingsScreen()
+            }
         }
         if animated {
             withAnimation(.smooth(duration: stepTransitionDuration)) {
@@ -434,12 +444,14 @@ private final class OnboardingModel: ObservableObject {
     }
 
     func toggleHeaderGraphic() {
+        guard BuildConfiguration.debugToolsEnabled else { return }
         withAnimation(.smooth(duration: 0.22)) {
             showHeaderGraphic.toggle()
         }
     }
 
     func toggleDebugColorSchemeOverride() {
+        guard BuildConfiguration.debugToolsEnabled else { return }
         withAnimation(.smooth(duration: 0.22)) {
             debugColorSchemeOverride = debugColorSchemeOverride == .light ? .dark : .light
         }
@@ -452,6 +464,7 @@ private final class OnboardingModel: ObservableObject {
 
     func startInstallFlow() {
         cancelInstallTasks()
+        allowsMissingStudioDisplaysForLiveInstall = false
         installError = nil
         installProgressIndex = driverInstalled ? OnboardingInstallStep.appRouting.rawValue : 0
         showStep(.install)
@@ -459,6 +472,7 @@ private final class OnboardingModel: ObservableObject {
     }
 
     func runInstallScenario(_ scenario: OnboardingInstallScenario) {
+        guard BuildConfiguration.debugToolsEnabled else { return }
         installScenario = scenario
         cancelInstallSimulation()
         installError = nil
@@ -467,16 +481,59 @@ private final class OnboardingModel: ObservableObject {
         startDummyInstallSequence()
     }
 
-    func retryCurrentInstallStep() {
+    func retryCurrentInstallStep(allowsMissingStudioDisplays: Bool) {
         guard let installError else { return }
         if installError.step == .approveDriver {
             requestDriverInstallApproval()
+            return
+        }
+        if installError.step == .environment {
+            recheckLiveInstallEnvironment(
+                allowsMissingStudioDisplays: allowsMissingStudioDisplays
+            )
+            return
+        }
+        if installError.step == .routingDriver, driverInstalled {
+            retryLiveRouterConfiguration()
             return
         }
         cancelInstallSimulation()
         self.installError = nil
         installProgressIndex = installError.step.rawValue
         startDummyInstallSequence()
+    }
+
+    private func recheckLiveInstallEnvironment(allowsMissingStudioDisplays: Bool) {
+        cancelInstallTasks()
+        refreshFromDelegate()
+        allowsMissingStudioDisplaysForLiveInstall = allowsMissingStudioDisplays
+        installError = nil
+        installProgressIndex = OnboardingInstallStep.environment.rawValue
+
+        guard allowsMissingStudioDisplays || liveInstallCanCompleteConfiguration() else {
+            failLiveInstall(with: studioDisplayRequirementError(step: .environment))
+            return
+        }
+
+        withAnimation(.smooth(duration: 0.24)) {
+            installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
+        }
+    }
+
+    private func retryLiveRouterConfiguration() {
+        cancelInstallTasks()
+        refreshFromDelegate()
+        installError = nil
+        installProgressIndex = OnboardingInstallStep.routingDriver.rawValue
+
+        guard liveInstallCanCompleteConfiguration() else {
+            failLiveInstall(with: studioDisplayRequirementError(step: .routingDriver))
+            return
+        }
+
+        liveInstallRequestedAt = Date()
+        delegate?.settingsApplyConfiguration()
+        startLiveInstallSequence()
     }
 
     func cancelInstallSimulation() {
@@ -724,7 +781,7 @@ private final class OnboardingModel: ObservableObject {
             return
         }
 
-        guard liveInstallCanCompleteConfiguration() else {
+        guard allowsMissingStudioDisplaysForLiveInstall || liveInstallCanCompleteConfiguration() else {
             failLiveInstall(with: studioDisplayRequirementError(step: .environment))
             return
         }
@@ -753,7 +810,7 @@ private final class OnboardingModel: ObservableObject {
         guard !isInstallingDriver, liveInstallTask == nil else { return }
 
         installError = nil
-        guard liveInstallCanCompleteConfiguration() else {
+        guard allowsMissingStudioDisplaysForLiveInstall || liveInstallCanCompleteConfiguration() else {
             failLiveInstall(with: studioDisplayRequirementError(step: .environment))
             return
         }
@@ -762,7 +819,11 @@ private final class OnboardingModel: ObservableObject {
             installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
         }
         liveInstallRequestedAt = Date()
-        delegate?.settingsInstallDriver(requiresConfirmation: false, presentsErrors: false)
+        delegate?.settingsInstallDriver(
+            requiresConfirmation: false,
+            presentsErrors: false,
+            allowsMissingStudioDisplays: allowsMissingStudioDisplaysForLiveInstall
+        )
         startLiveInstallSequence()
     }
 
@@ -785,7 +846,12 @@ private final class OnboardingModel: ObservableObject {
                     continue
                 }
 
-                if self.driverInstalled, self.nearfieldDriverSelected {
+                if NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+                    driverInstalled: self.driverInstalled,
+                    routerSelected: self.nearfieldDriverSelected,
+                    studioDisplayCount: self.studioDisplayCount,
+                    allowsMissingStudioDisplays: self.allowsMissingStudioDisplaysForLiveInstall
+                ) {
                     withAnimation(.smooth(duration: 0.24)) {
                         self.installProgressIndex = OnboardingInstallStep.allCases.count
                     }
@@ -798,6 +864,12 @@ private final class OnboardingModel: ObservableObject {
                 }
 
                 if self.driverInstalled {
+                    if !self.liveInstallCanCompleteConfiguration() {
+                        self.failLiveInstall(
+                            with: self.studioDisplayRequirementError(step: .routingDriver)
+                        )
+                        return
+                    }
                     self.failLiveInstall(
                         with: OnboardingInstallError(
                             step: .routingDriver,
@@ -1564,7 +1636,7 @@ private struct InstallStepRow: View {
     let state: OnboardingInstallStepState
     let pendingOpacity: Double
     let requestAccess: () -> Void
-    let retry: () -> Void
+    let retry: (Bool) -> Void
 
     var body: some View {
         Group {
@@ -1617,19 +1689,21 @@ private struct InstallStepRow: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
                         if step == .approveDriver {
-                            InstallPermissionButton(title: "Request Again", width: 123, action: retry)
+                            InstallPermissionButton(title: "Request Again", width: 123) {
+                                retry(false)
+                            }
                                 .padding(.top, 7)
                         }
                     }
                     Spacer()
                     if step != .approveDriver {
                         Button {
-                            retry()
+                            retry(commandModifierIsPressed)
                         } label: {
                             Image(systemName: "arrow.clockwise")
                         }
                         .buttonStyle(.borderless)
-                        .help("Retry current step")
+                        .help(retryHelpText)
                     }
                 }
                 .padding(.top, 10)
@@ -1647,6 +1721,18 @@ private struct InstallStepRow: View {
         .padding(.horizontal, 10)
         .frame(width: OnboardingLayout.contentWidth, alignment: .leading)
         .background(rowBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var commandModifierIsPressed: Bool {
+        NSApp.currentEvent?.modifierFlags.contains(.command) == true ||
+            NSEvent.modifierFlags.contains(.command)
+    }
+
+    private var retryHelpText: String {
+        if step == .environment {
+            return "Recheck Studio Displays. Hold Command to continue without them."
+        }
+        return "Retry current step"
     }
 
     private var rowBackground: Color {
@@ -2097,7 +2183,7 @@ private struct SpatialRoutingHeaderRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .center, spacing: 12) {
-                Text("Spatial Routing")
+                Text("App Audio Routing")
                     .settingsTitleStyle()
                 Spacer(minLength: 8)
                 CompactSettingsSwitch(isOn: $isOn)

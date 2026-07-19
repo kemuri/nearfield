@@ -1,3 +1,4 @@
+#if !NEARFIELD_DISTRIBUTION
 import AppKit
 import SwiftUI
 
@@ -1016,3 +1017,4 @@ enum WaveLabPresetImporter {
         return String(trimmed.split(separator: ".").last ?? Substring(trimmed))
     }
 }
+#endif

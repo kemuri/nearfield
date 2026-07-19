@@ -11,7 +11,33 @@ enum NearfieldActivationPolicy {
         studioDisplayCount >= 2
     }
 
+    static func shouldAttemptDriverInstall(
+        studioDisplayCount: Int,
+        allowsMissingStudioDisplays: Bool
+    ) -> Bool {
+        allowsMissingStudioDisplays || shouldConfigureRouterAfterDriverInstall(
+            studioDisplayCount: studioDisplayCount
+        )
+    }
+
+    static func shouldCompleteOnboardingAfterDriverInstall(
+        driverInstalled: Bool,
+        routerSelected: Bool,
+        studioDisplayCount: Int,
+        allowsMissingStudioDisplays: Bool
+    ) -> Bool {
+        guard driverInstalled else { return false }
+        return routerSelected || (
+            allowsMissingStudioDisplays &&
+                !shouldConfigureRouterAfterDriverInstall(studioDisplayCount: studioDisplayCount)
+        )
+    }
+
     static func shouldPublishRouter(studioDisplayCount: Int) -> Bool {
         studioDisplayCount >= 2
+    }
+
+    static func shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: Bool) -> Bool {
+        !isInitialOnboardingInProgress
     }
 }

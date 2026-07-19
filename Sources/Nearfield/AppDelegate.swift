@@ -24,7 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "ProxyAudioDevice_UID",
         "StudioPairRouterAudioDevice_UID",
         RouterAudioDriverManager.routerDeviceUID,
-        RouterAudioDriverManager.driverTargetAggregateUID
+        RouterAudioDriverManager.driverTargetAggregateUID,
+        "com.kemuri.Nearfield.TargetAggregate"
     ]
 
     private enum SimulatedStatus: String, CaseIterable {
@@ -64,7 +65,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let testTonePlayer = TestTonePlayer()
     private let logger = Logger(subsystem: "com.kemuri.Nearfield", category: "AudioState")
     private var onboardingWindowController: OnboardingWindowController?
+    #if !NEARFIELD_DISTRIBUTION
     private var waveLabWindowController: WaveLabWindowController?
+    #endif
     private lazy var mediaKeyVolumeController = MediaKeyVolumeController(
         audioManager: audioManager,
         routerDriverManager: routerDriverManager
@@ -92,6 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastRuntimeError: String?
     private var applicationRemovalMonitor: DispatchSourceFileSystemObject?
     private var didPromptForDriverUninstallAfterApplicationRemoval = false
+    private var isInitialOnboardingInProgress = false
 
     private enum UninstallScope {
         case driversOnly
@@ -109,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         proxyPreparedDisplayState = loadProxyPreparedDisplayState()
         hadSufficientStudioDisplays = audioManager.currentState().detectedDisplays.count >= 2
+        isInitialOnboardingInProgress = !routerDriverManager.isInstalled
         configureMenu()
         if moveToApplicationsIfNeeded() {
             return
@@ -126,6 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         startApplicationRemovalMonitorIfNeeded()
         handleAudioStateChange()
+        #if !NEARFIELD_DISTRIBUTION
         if ProcessInfo.processInfo.arguments.contains("--wave-lab") {
             openWaveLab()
             return
@@ -134,6 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openOnboarding()
             return
         }
+        #endif
         if presentInitialOnboardingIfNeeded() {
             return
         }
@@ -141,6 +148,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if isInitialOnboardingInProgress {
+            onboardingWindowController?.show()
+            return false
+        }
         guard !showMenuBarApp() else {
             return true
         }
@@ -163,8 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.title = ""
         menu.delegate = self
-        statusItem.menu = menu
-        applyMenuBarVisibility()
+        applyMenuBarState()
     }
 
     private func menuBarIcon() -> NSImage? {
@@ -300,7 +310,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Keep Drivers")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            removeDriversAndTargets()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = await self.removeDriversAndTargets()
+                NSApp.terminate(nil)
+            }
+            return
         }
         NSApp.terminate(nil)
     }
@@ -422,6 +437,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleAudioStateChange() {
         guard !isSynchronizingAudioState else {
+            refreshStatus()
+            return
+        }
+        guard !isInstallingDriver else {
             refreshStatus()
             return
         }
@@ -685,7 +704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 do {
                     try self.applyCurrentRouterRouteRulesIfNeeded()
                 } catch {
-                    self.recordRecoverableError(error, context: "App routing refresh failed")
+                    self.recordRecoverableError(error, context: "App Audio Routing refresh failed")
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
@@ -699,7 +718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try routerDriverManager.setRouteRules(fallbackRules)
             lastAppliedRouterRouteRules = fallbackRules
         } catch {
-            recordRecoverableError(error, context: "App routing cleanup failed")
+            recordRecoverableError(error, context: "App Audio Routing cleanup failed")
         }
     }
 
@@ -764,6 +783,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openSettings() {
+        guard !isInitialOnboardingInProgress else {
+            onboardingWindowController?.show()
+            return
+        }
         showOnboardingSettingsStage(showsPageIndicator: false)
     }
 
@@ -774,9 +797,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         onboardingWindowController?.showOnboardingSimulation()
     }
 
+    #if !NEARFIELD_DISTRIBUTION
     @objc private func openOnboardingSettingsStage() {
         showOnboardingSettingsStage(showsPageIndicator: true)
     }
+    #endif
 
     private func showOnboardingSettingsStage(showsPageIndicator: Bool) {
         if onboardingWindowController == nil {
@@ -785,12 +810,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         onboardingWindowController?.showSettingsStage(showsPageIndicator: showsPageIndicator)
     }
 
+    #if !NEARFIELD_DISTRIBUTION
     @objc private func openWaveLab() {
         if waveLabWindowController == nil {
             waveLabWindowController = WaveLabWindowController()
         }
         waveLabWindowController?.show()
     }
+    #endif
 
     private func setOpenAtLogin(_ enabled: Bool) {
         do {
@@ -806,9 +833,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func statusRowContent() -> (title: String, detail: String, symbolName: String, tintColor: NSColor) {
+        #if !NEARFIELD_DISTRIBUTION
         if let simulatedStatus = currentSimulatedStatus(), simulatedStatus != .off {
             return statusContent(for: simulatedStatus)
         }
+        #endif
 
         if isInstallingDriver {
             return ("Installing", "Configuring the Nearfield audio driver.", "arrow.triangle.2.circlepath.circle.fill", .systemBlue)
@@ -826,7 +855,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if routerDriverManager.isRouterDefaultOutput() {
             if appRoutingEnabled() {
-                return ("App Routing Active", "Router driver is selected with routing rules enabled.", "point.3.connected.trianglepath.dotted", .systemGreen)
+                return ("App Audio Routing Active", "Nearfield is selected with App Audio Routing enabled.", "point.3.connected.trianglepath.dotted", .systemGreen)
             }
             return ("Nearfield Ready", "Audio driver active. macOS volume controls are enabled.", "checkmark.circle.fill", .systemGreen)
         }
@@ -879,12 +908,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         menu.removeAllItems()
 
+        guard NearfieldActivationPolicy.shouldShowFullMenuBarMenu(
+            isInitialOnboardingInProgress: isInitialOnboardingInProgress
+        ) else {
+            addQuitMenuItem()
+            return
+        }
+
         let settingsItem = NSMenuItem(title: "Settings", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
 
         menu.addItem(.separator())
 
+        #if !NEARFIELD_DISTRIBUTION
         let onboardingItem = NSMenuItem(title: "Onboarding", action: #selector(openOnboarding), keyEquivalent: "")
         onboardingItem.target = self
         menu.addItem(onboardingItem)
@@ -896,7 +933,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let waveLabItem = NSMenuItem(title: "Wave Lab", action: #selector(openWaveLab), keyEquivalent: "")
         waveLabItem.target = self
         menu.addItem(waveLabItem)
+        #endif
 
+        addQuitMenuItem()
+    }
+
+    private func addQuitMenuItem() {
         let quitItem = NSMenuItem(title: "Quit", action: #selector(confirmQuitHelper), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -967,8 +1009,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func applyMenuBarVisibility() {
+    private func applyMenuBarState() {
         statusItem.isVisible = showMenuBarApp()
+        statusItem.button?.isEnabled = true
+        statusItem.menu = menu
+        rebuildMenu()
     }
 
     private func showMenuBarApp() -> Bool {
@@ -994,11 +1039,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func installAndActivateRouterDriver(
         disableAppRoutingOnCancelOrFailure: Bool = false,
         requiresConfirmation: Bool = true,
-        presentsErrors: Bool = true
+        presentsErrors: Bool = true,
+        allowsMissingStudioDisplays: Bool = false
     ) {
         guard !isInstallingDriver else { return }
         let studioDisplayCount = audioManager.currentState().detectedDisplays.count
-        guard NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: studioDisplayCount) else {
+        guard NearfieldActivationPolicy.shouldAttemptDriverInstall(
+            studioDisplayCount: studioDisplayCount,
+            allowsMissingStudioDisplays: allowsMissingStudioDisplays
+        ) else {
             finishDriverInstallAttempt(disableAppRouting: disableAppRoutingOnCancelOrFailure)
             handleDriverInstallError(
                 NearfieldError.notEnoughStudioDisplays(studioDisplayCount),
@@ -1029,10 +1078,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try await Task.detached(priority: .userInitiated) {
                     try DriverInstaller().installBuiltRouterDriver(at: driverPath)
                 }.value
-                guard await self.routerDriverManager.waitUntilInstalled() else {
+                guard await RouterAudioDriverManager.waitUntilInstalled() else {
                     throw RouterAudioDriverError.notInstalled
                 }
-                try await self.configureRouterDriverAfterInstall()
+                try await self.configureRouterDriverAfterInstall(
+                    allowsMissingStudioDisplays: allowsMissingStudioDisplays
+                )
             } catch {
                 self.finishDriverInstallAttempt(disableAppRouting: disableAppRoutingOnCancelOrFailure)
                 self.handleDriverInstallError(error, presentsErrors: presentsErrors)
@@ -1059,9 +1110,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatus()
     }
 
-    private func configureRouterDriverAfterInstall() async throws {
-        let studioDisplayCount = await waitForSufficientStudioDisplaysAfterCoreAudioRestart()
+    private func configureRouterDriverAfterInstall(
+        allowsMissingStudioDisplays: Bool
+    ) async throws {
+        let studioDisplayCount: Int
+        if allowsMissingStudioDisplays {
+            audioManager.invalidateCachedDevices()
+            studioDisplayCount = audioManager.currentState().detectedDisplays.count
+        } else {
+            studioDisplayCount = await waitForSufficientStudioDisplaysAfterCoreAudioRestart()
+        }
         guard NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: studioDisplayCount) else {
+            if allowsMissingStudioDisplays {
+                return
+            }
             throw NearfieldError.notEnoughStudioDisplays(studioDisplayCount)
         }
         try performSynchronizedAudioUpdate {
@@ -1159,8 +1221,14 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsSetShowMenuBarApp(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: DefaultsKey.showMenuBarApp)
-        applyMenuBarVisibility()
+        applyMenuBarState()
         refreshStatus()
+    }
+
+    func settingsDidReachSettingsScreen() {
+        guard isInitialOnboardingInProgress else { return }
+        isInitialOnboardingInProgress = false
+        applyMenuBarState()
     }
 
     func settingsDriverInstalled() -> Bool {
@@ -1258,7 +1326,7 @@ extension AppDelegate: SettingsDelegate {
         }
         if routerDriverManager.isRouterDefaultOutput() {
             return appRoutingEnabled()
-                ? "Current output: Nearfield - app routing enabled"
+                ? "Current output: Nearfield - App Audio Routing enabled"
                 : "Current output: Nearfield"
         }
         if routerDriverManager.isInstalled {
@@ -1318,41 +1386,59 @@ extension AppDelegate: SettingsDelegate {
         rebuildForConfigurationChange()
     }
 
-    func settingsInstallDriver(requiresConfirmation: Bool, presentsErrors: Bool) {
+    func settingsInstallDriver(
+        requiresConfirmation: Bool,
+        presentsErrors: Bool,
+        allowsMissingStudioDisplays: Bool
+    ) {
         guard !isInstallingDriver else { return }
         installAndActivateRouterDriver(
             requiresConfirmation: requiresConfirmation,
-            presentsErrors: presentsErrors
+            presentsErrors: presentsErrors,
+            allowsMissingStudioDisplays: allowsMissingStudioDisplays
         )
         refreshStatus()
     }
 
     func settingsRemoveEverything() {
         guard let scope = promptForUninstallScope() else { return }
-        guard removeDriversAndTargets() else { return }
-        if scope == .driversAndApp {
-            removeApplicationBundleFromApplications()
+        Task { @MainActor [weak self] in
+            guard let self, await self.removeDriversAndTargets() else { return }
+            if scope == .driversAndApp {
+                self.removeApplicationBundleFromApplications()
+            }
+            self.refreshStatus()
         }
-        refreshStatus()
     }
 
     @discardableResult
-    private func removeDriversAndTargets() -> Bool {
+    private func removeDriversAndTargets() async -> Bool {
         dynamicRoutingRulesTask?.cancel()
         dynamicRoutingRulesTask = nil
         lastAppliedRouterRouteRules = nil
         NearfieldPreferences.clearAppRoutingEnabled()
+        let shouldRestorePhysicalDefault = nearfieldVirtualOutputIsAnyDefault()
         do {
             try performSynchronizedAudioUpdate {
                 try restoreDisplaysAfterProxyDeactivation()
-                if nearfieldVirtualOutputIsAnyDefault() {
-                    try audioManager.selectFallbackOutputAsDefault()
+                if shouldRestorePhysicalDefault {
+                    _ = try audioManager.selectFallbackOutputAsDefault()
                 }
+            }
+            try await Task.detached(priority: .userInitiated) {
                 try DriverInstaller().removeAllInstalledDriversAndRestartCoreAudio()
+            }.value
+            if shouldRestorePhysicalDefault {
+                try await restorePhysicalDefaultOutputAfterCoreAudioRestart()
+            }
+            try performSynchronizedAudioUpdate {
                 try audioManager.cleanupAllNearfieldAggregates()
                 markAggregateSchemaCurrent()
                 proxyPreparedDisplayState = nil
                 saveProxyPreparedDisplayState(nil)
+            }
+            if shouldRestorePhysicalDefault {
+                try await restorePhysicalDefaultOutputAfterCoreAudioRestart()
             }
             clearRecoverableError()
             refreshStatus()
@@ -1362,6 +1448,33 @@ extension AppDelegate: SettingsDelegate {
             refreshStatus()
             return false
         }
+    }
+
+    private func restorePhysicalDefaultOutputAfterCoreAudioRestart(
+        timeout: TimeInterval = 5,
+        interval: TimeInterval = 0.2
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        var lastSelectionError: Error?
+
+        repeat {
+            audioManager.invalidateCachedDevices()
+            do {
+                if try audioManager.selectFallbackOutputAsDefault() {
+                    return
+                }
+            } catch {
+                lastSelectionError = error
+            }
+
+            guard Date() < deadline else { break }
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        } while !Task.isCancelled
+
+        if let lastSelectionError {
+            throw lastSelectionError
+        }
+        throw NearfieldError.noPhysicalOutputAvailable
     }
 
     private func removeApplicationBundleFromApplications() {

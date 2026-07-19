@@ -54,16 +54,16 @@ final class RouterAudioDriverManager {
         routerDeviceID() != nil
     }
 
-    @MainActor
-    func waitUntilInstalled(timeout: TimeInterval = 30, interval: TimeInterval = 0.25) async -> Bool {
+    static func waitUntilInstalled(timeout: TimeInterval = 30, interval: TimeInterval = 0.25) async -> Bool {
+        let manager = RouterAudioDriverManager()
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if isInstalled {
+            if manager.isInstalled {
                 return true
             }
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
-        return isInstalled
+        return manager.isInstalled
     }
 
     func configureRouterOutput(

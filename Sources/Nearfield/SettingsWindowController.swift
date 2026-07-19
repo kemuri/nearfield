@@ -192,8 +192,8 @@ final class SettingsWindowController: NSWindowController {
 
         let driverCard = card([
             row(title: "Driver", detail: "Router HAL output named Nearfield for system volume control.", trailing: driverControls(status: driverStatusPill, action: setupButton)),
-            row(title: "App Routing", detail: "Route matching bundle IDs through the router output.", trailing: appRoutingSwitch),
-            row(title: "Routing Rules", detail: "Format: bundle.id=left/right/pair/window.", trailing: routingRulesField),
+            row(title: "App Audio Routing", detail: "Route matching bundle IDs through the router output.", trailing: appRoutingSwitch),
+            row(title: "App Audio Routing Rules", detail: "Format: bundle.id=left/right/pair/window.", trailing: routingRulesField),
             row(title: "Uninstall Nearfield", detail: "Remove drivers, and optionally remove Nearfield.app from Applications.", trailing: removeButton)
         ])
 

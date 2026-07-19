@@ -36,4 +36,4 @@ sudo xattr -cr "$DRIVER_DEST" || true
 sudo killall coreaudiod || true
 
 echo "Installed $DRIVER_DEST"
-echo "CoreAudio restarted. Relaunch Nearfield, then enable app routing if needed."
+echo "CoreAudio restarted. Relaunch Nearfield, then enable App Audio Routing if needed."

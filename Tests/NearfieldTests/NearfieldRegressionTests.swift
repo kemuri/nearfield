@@ -74,10 +74,73 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertTrue(NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 2))
     }
 
+    func testDriverInstallAttemptRequiresDisplaysWithoutExplicitOverride() {
+        XCTAssertFalse(
+            NearfieldActivationPolicy.shouldAttemptDriverInstall(
+                studioDisplayCount: 0,
+                allowsMissingStudioDisplays: false
+            )
+        )
+        XCTAssertFalse(
+            NearfieldActivationPolicy.shouldAttemptDriverInstall(
+                studioDisplayCount: 1,
+                allowsMissingStudioDisplays: false
+            )
+        )
+    }
+
+    func testDriverInstallAttemptAllowsExplicitMissingDisplayOverride() {
+        XCTAssertTrue(
+            NearfieldActivationPolicy.shouldAttemptDriverInstall(
+                studioDisplayCount: 0,
+                allowsMissingStudioDisplays: true
+            )
+        )
+    }
+
+    func testOnboardingCompletesForInstalledDriverWhenMissingDisplaysWereExplicitlyAllowed() {
+        XCTAssertTrue(
+            NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+                driverInstalled: true,
+                routerSelected: false,
+                studioDisplayCount: 0,
+                allowsMissingStudioDisplays: true
+            )
+        )
+    }
+
+    func testOnboardingStillRequiresConfiguredRouterWithoutExplicitOverride() {
+        XCTAssertFalse(
+            NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+                driverInstalled: true,
+                routerSelected: false,
+                studioDisplayCount: 0,
+                allowsMissingStudioDisplays: false
+            )
+        )
+        XCTAssertFalse(
+            NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+                driverInstalled: true,
+                routerSelected: false,
+                studioDisplayCount: 2,
+                allowsMissingStudioDisplays: true
+            )
+        )
+    }
+
     func testRouterPublicationRequiresTwoStudioDisplays() {
         XCTAssertFalse(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 0))
         XCTAssertFalse(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 1))
         XCTAssertTrue(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 2))
+    }
+
+    func testFullMenuBarMenuRemainsHiddenUntilInitialOnboardingReachesSettings() {
+        XCTAssertFalse(
+            NearfieldActivationPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: true)
+        )
+        XCTAssertTrue(
+            NearfieldActivationPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: false)
+        )
     }
 
     func testStudioDisplayConnectionStatusDescribesAvailability() {

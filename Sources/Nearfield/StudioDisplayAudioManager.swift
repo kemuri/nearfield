@@ -99,6 +99,7 @@ enum NearfieldError: LocalizedError {
     case coreAudio(operation: String, status: OSStatus)
     case aggregateMissing
     case studioPairNotActive
+    case noPhysicalOutputAvailable
 
     var errorDescription: String? {
         switch self {
@@ -110,6 +111,8 @@ enum NearfieldError: LocalizedError {
             return "The Nearfield target device does not exist yet."
         case .studioPairNotActive:
             return "Nearfield is not the current output."
+        case .noPhysicalOutputAvailable:
+            return "macOS did not make a physical audio output available after restarting Core Audio."
         }
     }
 }
@@ -193,12 +196,15 @@ final class StudioDisplayAudioManager {
         device(matchingUID: uid)?.id == defaultSystemOutputDeviceID()
     }
 
-    func selectFallbackOutputAsDefault() throws {
+    @discardableResult
+    func selectFallbackOutputAsDefault() throws -> Bool {
         let devices = allDevices()
         guard let fallback = fallbackOutputDevice(from: devices) else {
-            return
+            return false
         }
         try setDefaultOutputDevice(fallback.id)
+        return defaultOutputDeviceID() == fallback.id &&
+            defaultSystemOutputDeviceID() == fallback.id
     }
 
     func moveDefaultOutputAwayFromNearfield() throws {

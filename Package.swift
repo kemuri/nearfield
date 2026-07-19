@@ -23,6 +23,9 @@ let package = Package(
             resources: [
                 .process("Resources")
             ],
+            swiftSettings: [
+                .define("NEARFIELD_DISTRIBUTION", .when(configuration: .release))
+            ],
             linkerSettings: [
                 .linkedFramework("AVFAudio"),
                 .linkedFramework("AppKit"),
