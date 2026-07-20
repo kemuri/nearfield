@@ -2,6 +2,9 @@ import AppKit
 import Darwin
 import os
 import ServiceManagement
+#if NEARFIELD_DISTRIBUTION
+import Sparkle
+#endif
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -80,6 +83,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
+    #if NEARFIELD_DISTRIBUTION
+    private var updaterController: SPUStandardUpdaterController?
+    #endif
     private lazy var balanceMenuView = MenuBalanceRowView(
         value: settingsBalance(),
         isEnabled: false,
@@ -134,9 +140,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         proxyPreparedDisplayState = loadProxyPreparedDisplayState()
         cachedRouterDriverInstalled = DriverInstaller.isRouterDriverInstalledOnDisk()
         isInitialOnboardingInProgress = !cachedRouterDriverInstalled
+        #if NEARFIELD_DISTRIBUTION
+        startUpdaterIfEligible(checkImmediately: !isInitialOnboardingInProgress)
+        #endif
         configureMenu()
         finishLaunching(notification: notification)
     }
+
+    #if NEARFIELD_DISTRIBUTION
+    private func startUpdaterIfEligible(checkImmediately: Bool) {
+        guard updaterController == nil else { return }
+
+        let bundleURL = Bundle.main.bundleURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard isInApplicationsDirectory(bundleURL) else { return }
+
+        let controller = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+        updaterController = controller
+
+        guard checkImmediately, controller.updater.automaticallyChecksForUpdates else { return }
+        controller.updater.checkForUpdatesInBackground()
+    }
+    #endif
 
     private func finishLaunching(notification: Notification) {
         configureDynamicRoutingLifecycleNotifications()
@@ -1000,6 +1028,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
+        #if NEARFIELD_DISTRIBUTION
+        if let updaterController {
+            let updatesItem = NSMenuItem(
+                title: "Check for Updates...",
+                action: #selector(checkForUpdates),
+                keyEquivalent: ""
+            )
+            updatesItem.target = self
+            updatesItem.isEnabled = updaterController.updater.canCheckForUpdates
+            menu.addItem(updatesItem)
+        }
+        #endif
+
         menu.addItem(.separator())
 
         #if !NEARFIELD_DISTRIBUTION
@@ -1018,6 +1059,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         addQuitMenuItem()
     }
+
+    #if NEARFIELD_DISTRIBUTION
+    @objc private func checkForUpdates() {
+        updaterController?.checkForUpdates(nil)
+    }
+    #endif
 
     private func addQuitMenuItem() {
         let quitItem = NSMenuItem(title: "Quit", action: #selector(confirmQuitHelper), keyEquivalent: "q")
@@ -1335,6 +1382,9 @@ extension AppDelegate: SettingsDelegate {
     func settingsDidReachSettingsScreen() {
         guard isInitialOnboardingInProgress else { return }
         isInitialOnboardingInProgress = false
+        #if NEARFIELD_DISTRIBUTION
+        startUpdaterIfEligible(checkImmediately: true)
+        #endif
         applyMenuBarState()
     }
 
