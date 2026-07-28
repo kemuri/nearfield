@@ -3,11 +3,6 @@ import CoreGraphics
 
 @MainActor
 final class WindowAudioRouteResolver {
-    private struct Rule {
-        let bundleID: String
-        let destination: String
-    }
-
     private struct DisplayTarget {
         let route: String
         let bounds: CGRect
@@ -20,11 +15,11 @@ final class WindowAudioRouteResolver {
     }
 
     func resolvedRules(from rawRules: String) -> String {
-        let rules = parseRules(rawRules)
+        let rules = AppRoutingRules.parse(rawRules)
 
         var resolvedRules: [String] = []
         for rule in rules {
-            if isWindowScopedDestination(rule.destination) {
+            if AppRoutingRules.isWindowScopedDestination(rule.destination) {
                 let expandedRule = windowScopedRules(for: windowScopedSourceBundleID(for: rule))
                 resolvedRules.append(contentsOf: expandedRule.processRules)
                 resolvedRules.append("\(rule.bundleID)=\(expandedRule.fallbackRoute)")
@@ -37,9 +32,9 @@ final class WindowAudioRouteResolver {
     }
 
     func fallbackRulesWithoutProcessOverrides(from rawRules: String) -> String {
-        parseRules(rawRules)
+        AppRoutingRules.parse(rawRules)
             .map { rule in
-                let destination = isWindowScopedDestination(rule.destination)
+                let destination = AppRoutingRules.isWindowScopedDestination(rule.destination)
                     ? "pair"
                     : normalizedDestination(rule.destination)
                 return "\(rule.bundleID)=\(destination)"
@@ -48,7 +43,9 @@ final class WindowAudioRouteResolver {
     }
 
     func hasWindowScopedRoute(in rawRules: String) -> Bool {
-        parseRules(rawRules).contains { isWindowScopedDestination($0.destination) }
+        AppRoutingRules.parse(rawRules).contains {
+            AppRoutingRules.isWindowScopedDestination($0.destination)
+        }
     }
 
     func hasRunningWindowScopedRoute(in rawRules: String) -> Bool {
@@ -67,45 +64,22 @@ final class WindowAudioRouteResolver {
             return nil
         }
 
-        let rules = parseRules(rawRules).filter { bundleIDs.contains($0.bundleID) }
+        let rules = AppRoutingRules.parse(rawRules).filter { bundleIDs.contains($0.bundleID) }
         guard let rule = rules.first(where: { $0.bundleID == primaryBundleID }) ?? rules.first else {
             return nil
         }
 
-        if isWindowScopedDestination(rule.destination) {
+        if AppRoutingRules.isWindowScopedDestination(rule.destination) {
             return currentWindowScopedRoute(for: windowScopedSourceBundleID(for: rule))
         }
         return normalizedDestination(rule.destination)
-    }
-
-    private func parseRules(_ rules: String) -> [Rule] {
-        rules
-            .split { $0 == ";" || $0 == "\n" }
-            .compactMap { rawRule in
-                let parts = rawRule.split(separator: "=", maxSplits: 1)
-                guard parts.count == 2 else { return nil }
-                let bundleID = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let destination = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !bundleID.isEmpty, !destination.isEmpty else { return nil }
-                return Rule(bundleID: bundleID, destination: destination)
-            }
     }
 
     private func normalizedDestination(_ destination: String) -> String {
         destination.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private func isWindowScopedDestination(_ destination: String) -> Bool {
-        let normalized = normalizedDestination(destination)
-        return normalized == "window" ||
-            normalized == "screen" ||
-            normalized == "display" ||
-            normalized.hasPrefix("window:") ||
-            normalized.hasPrefix("screen:") ||
-            normalized.hasPrefix("display:")
-    }
-
-    private func windowScopedSourceBundleID(for rule: Rule) -> String {
+    private func windowScopedSourceBundleID(for rule: AppRoutingRule) -> String {
         let destination = rule.destination.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let separatorIndex = destination.firstIndex(of: ":") else {
             return rule.bundleID
@@ -116,8 +90,8 @@ final class WindowAudioRouteResolver {
     }
 
     private func windowScopedSourceBundleIDs(in rawRules: String) -> [String] {
-        parseRules(rawRules)
-            .filter { isWindowScopedDestination($0.destination) }
+        AppRoutingRules.parse(rawRules)
+            .filter { AppRoutingRules.isWindowScopedDestination($0.destination) }
             .map { windowScopedSourceBundleID(for: $0) }
             .uniquePreservingOrder()
     }

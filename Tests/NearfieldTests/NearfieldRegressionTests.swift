@@ -41,9 +41,9 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testActivationPolicyDoesNotReactivateForReconnectAlone() {
+    func testRouterPolicyDoesNotReactivateForReconnectAlone() {
         XCTAssertFalse(
-            NearfieldActivationPolicy.shouldActivateRouter(
+            NearfieldRouterPolicy.shouldActivateRouter(
                 defaultOutputIsNearfield: false,
                 displaysJustReconnected: true,
                 shouldReactivateAfterReconnect: false
@@ -51,9 +51,9 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testActivationPolicyReactivatesWhenNearfieldWasDefaultBeforeReconnect() {
+    func testRouterPolicyReactivatesWhenNearfieldWasDefaultBeforeReconnect() {
         XCTAssertTrue(
-            NearfieldActivationPolicy.shouldActivateRouter(
+            NearfieldRouterPolicy.shouldActivateRouter(
                 defaultOutputIsNearfield: false,
                 displaysJustReconnected: true,
                 shouldReactivateAfterReconnect: true
@@ -61,9 +61,9 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testActivationPolicyKeepsNearfieldActiveWhenAlreadyDefaultOutput() {
+    func testRouterPolicyKeepsNearfieldActiveWhenAlreadyDefaultOutput() {
         XCTAssertTrue(
-            NearfieldActivationPolicy.shouldActivateRouter(
+            NearfieldRouterPolicy.shouldActivateRouter(
                 defaultOutputIsNearfield: true,
                 displaysJustReconnected: false,
                 shouldReactivateAfterReconnect: false
@@ -72,23 +72,23 @@ final class NearfieldRegressionTests: XCTestCase {
     }
 
     func testDriverInstallPolicySkipsConfigurationWithoutTwoStudioDisplays() {
-        XCTAssertFalse(NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 0))
-        XCTAssertFalse(NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 1))
+        XCTAssertFalse(NearfieldRouterPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 0))
+        XCTAssertFalse(NearfieldRouterPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 1))
     }
 
     func testDriverInstallPolicyConfiguresWhenTwoStudioDisplaysAreAvailable() {
-        XCTAssertTrue(NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 2))
+        XCTAssertTrue(NearfieldRouterPolicy.shouldConfigureRouterAfterDriverInstall(studioDisplayCount: 2))
     }
 
     func testDriverInstallAttemptRequiresDisplaysWithoutExplicitOverride() {
         XCTAssertFalse(
-            NearfieldActivationPolicy.shouldAttemptDriverInstall(
+            NearfieldRouterPolicy.shouldAttemptDriverInstall(
                 studioDisplayCount: 0,
                 allowsMissingStudioDisplays: false
             )
         )
         XCTAssertFalse(
-            NearfieldActivationPolicy.shouldAttemptDriverInstall(
+            NearfieldRouterPolicy.shouldAttemptDriverInstall(
                 studioDisplayCount: 1,
                 allowsMissingStudioDisplays: false
             )
@@ -97,16 +97,31 @@ final class NearfieldRegressionTests: XCTestCase {
 
     func testDriverInstallAttemptAllowsExplicitMissingDisplayOverride() {
         XCTAssertTrue(
-            NearfieldActivationPolicy.shouldAttemptDriverInstall(
+            NearfieldRouterPolicy.shouldAttemptDriverInstall(
                 studioDisplayCount: 0,
                 allowsMissingStudioDisplays: true
             )
         )
     }
 
+    func testDriverInstallRequestsEncodeOnlySupportedContexts() {
+        XCTAssertTrue(DriverInstallRequest.userInitiated.requiresConfirmation)
+        XCTAssertTrue(DriverInstallRequest.userInitiated.presentsErrors)
+        XCTAssertFalse(DriverInstallRequest.userInitiated.disablesAppRoutingOnFailure)
+        XCTAssertFalse(DriverInstallRequest.userInitiated.allowsMissingStudioDisplays)
+
+        XCTAssertTrue(DriverInstallRequest.enablingAppRouting.disablesAppRoutingOnFailure)
+
+        let onboardingRequest = DriverInstallRequest.onboarding(allowsMissingStudioDisplays: true)
+        XCTAssertFalse(onboardingRequest.requiresConfirmation)
+        XCTAssertFalse(onboardingRequest.presentsErrors)
+        XCTAssertFalse(onboardingRequest.disablesAppRoutingOnFailure)
+        XCTAssertTrue(onboardingRequest.allowsMissingStudioDisplays)
+    }
+
     func testOnboardingCompletesForInstalledDriverWhenMissingDisplaysWereExplicitlyAllowed() {
         XCTAssertTrue(
-            NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+            NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                 driverInstalled: true,
                 routerSelected: false,
                 studioDisplayCount: 0,
@@ -117,7 +132,7 @@ final class NearfieldRegressionTests: XCTestCase {
 
     func testOnboardingStillRequiresConfiguredRouterWithoutExplicitOverride() {
         XCTAssertFalse(
-            NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+            NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                 driverInstalled: true,
                 routerSelected: false,
                 studioDisplayCount: 0,
@@ -125,7 +140,7 @@ final class NearfieldRegressionTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+            NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                 driverInstalled: true,
                 routerSelected: false,
                 studioDisplayCount: 2,
@@ -135,17 +150,35 @@ final class NearfieldRegressionTests: XCTestCase {
     }
 
     func testRouterPublicationRequiresTwoStudioDisplays() {
-        XCTAssertFalse(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 0))
-        XCTAssertFalse(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 1))
-        XCTAssertTrue(NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: 2))
+        XCTAssertFalse(NearfieldRouterPolicy.shouldPublishRouter(studioDisplayCount: 0))
+        XCTAssertFalse(NearfieldRouterPolicy.shouldPublishRouter(studioDisplayCount: 1))
+        XCTAssertTrue(NearfieldRouterPolicy.shouldPublishRouter(studioDisplayCount: 2))
+    }
+
+    func testRouterDriverAvailabilityDistinguishesDiskAndCoreAudioState() {
+        XCTAssertEqual(
+            RouterDriverAvailability(installedOnDisk: false, loadedByCoreAudio: false),
+            .missing
+        )
+        XCTAssertEqual(
+            RouterDriverAvailability(installedOnDisk: true, loadedByCoreAudio: false),
+            .installedOnDisk
+        )
+        XCTAssertEqual(
+            RouterDriverAvailability(installedOnDisk: true, loadedByCoreAudio: true),
+            .loaded
+        )
+        XCTAssertTrue(RouterDriverAvailability.loaded.isInstalled)
+        XCTAssertTrue(RouterDriverAvailability.loaded.isLoaded)
+        XCTAssertFalse(RouterDriverAvailability.installedOnDisk.isLoaded)
     }
 
     func testFullMenuBarMenuRemainsHiddenUntilInitialOnboardingReachesSettings() {
         XCTAssertFalse(
-            NearfieldActivationPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: true)
+            NearfieldRouterPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: true)
         )
         XCTAssertTrue(
-            NearfieldActivationPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: false)
+            NearfieldRouterPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: false)
         )
     }
 
@@ -238,9 +271,14 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testDebugBuildConfigurationEnablesDebugTools() {
+    func testBuildConfigurationMatchesSwiftPMConfiguration() {
+        #if NEARFIELD_DISTRIBUTION
+        XCTAssertTrue(BuildConfiguration.isDistribution)
+        XCTAssertFalse(BuildConfiguration.debugToolsEnabled)
+        #else
         XCTAssertFalse(BuildConfiguration.isDistribution)
         XCTAssertTrue(BuildConfiguration.debugToolsEnabled)
+        #endif
     }
 
     func testAppRoutingRulesUpsertAndPreserveOtherRules() {
@@ -391,6 +429,93 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertFalse(NearfieldPreferences.appRoutingEnabled(in: defaults))
     }
 
+    func testPreferencesProvideDefaultsAndRoundTripConfiguration() {
+        let suiteName = "NearfieldTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated defaults suite")
+            return
+        }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        XCTAssertEqual(NearfieldPreferences.outputMode(in: defaults), .stereo)
+        XCTAssertTrue(NearfieldPreferences.showMenuBarApp(in: defaults))
+        XCTAssertNil(NearfieldPreferences.leftDeviceUID(in: defaults))
+
+        NearfieldPreferences.setOutputMode(.mono, in: defaults)
+        NearfieldPreferences.setShowMenuBarApp(false, in: defaults)
+        NearfieldPreferences.setLeftDeviceUID("display-left", in: defaults)
+        NearfieldPreferences.setBalance(-0.25, in: defaults)
+        NearfieldPreferences.setAppRoutingAppBundleIDs(["com.example.App"], in: defaults)
+
+        XCTAssertEqual(NearfieldPreferences.outputMode(in: defaults), .mono)
+        XCTAssertFalse(NearfieldPreferences.showMenuBarApp(in: defaults))
+        XCTAssertEqual(NearfieldPreferences.leftDeviceUID(in: defaults), "display-left")
+        XCTAssertEqual(NearfieldPreferences.balance(in: defaults), -0.25, accuracy: 0.0001)
+        XCTAssertEqual(
+            NearfieldPreferences.appRoutingAppBundleIDs(in: defaults),
+            ["com.example.App"]
+        )
+    }
+
+    func testApplicationMoverReplacesExistingBundleAfterStagingCopy() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldTests-\(UUID().uuidString)", isDirectory: true)
+        let sourceURL = rootURL.appendingPathComponent("Downloaded.app", isDirectory: true)
+        let destinationURL = rootURL.appendingPathComponent("Nearfield.app", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+
+        try fileManager.createDirectory(at: sourceURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+        try Data("new".utf8).write(to: sourceURL.appendingPathComponent("version"))
+        try Data("old".utf8).write(to: destinationURL.appendingPathComponent("version"))
+
+        try ApplicationMover.installBundle(
+            from: sourceURL,
+            to: destinationURL,
+            fileManager: fileManager
+        )
+
+        XCTAssertEqual(
+            try String(contentsOf: destinationURL.appendingPathComponent("version"), encoding: .utf8),
+            "new"
+        )
+        XCTAssertTrue(fileManager.fileExists(atPath: sourceURL.path))
+        XCTAssertFalse(
+            try fileManager.contentsOfDirectory(atPath: rootURL.path)
+                .contains { $0.contains("nearfield-installing") || $0.contains("nearfield-backup") }
+        )
+    }
+
+    func testApplicationMoverPreservesExistingBundleWhenStagingFails() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldTests-\(UUID().uuidString)", isDirectory: true)
+        let missingSourceURL = rootURL.appendingPathComponent("Missing.app", isDirectory: true)
+        let destinationURL = rootURL.appendingPathComponent("Nearfield.app", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+
+        try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+        let versionURL = destinationURL.appendingPathComponent("version")
+        try Data("old".utf8).write(to: versionURL)
+
+        XCTAssertThrowsError(
+            try ApplicationMover.installBundle(
+                from: missingSourceURL,
+                to: destinationURL,
+                fileManager: fileManager
+            )
+        )
+        XCTAssertEqual(try String(contentsOf: versionURL, encoding: .utf8), "old")
+    }
+
+    #if !NEARFIELD_DISTRIBUTION
     @MainActor
     func testWaveLabExporterEmitsConfiguration() {
         let source = WaveLabExporter.swiftSource(for: .onboarding)
@@ -497,4 +622,5 @@ final class NearfieldRegressionTests: XCTestCase {
 
         XCTAssertEqual(WaveLabExporter.swiftSource(for: imported), exported)
     }
+    #endif
 }

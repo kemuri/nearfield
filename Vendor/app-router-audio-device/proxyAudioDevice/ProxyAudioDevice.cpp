@@ -2318,7 +2318,7 @@ OSStatus ProxyAudioDevice::SetBoxPropertyData(AudioServerPlugInDriverRef inDrive
                     *outNumberPropertiesChanged = 1;
                     outChangedAddresses[0].mSelector = kAudioObjectPropertyName;
                     outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
-                    outChangedAddresses[0].mElement = kAudioObjectPropertyElementMaster;
+                    outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
                 }
 
             }
@@ -2394,16 +2394,16 @@ OSStatus ProxyAudioDevice::SetBoxPropertyData(AudioServerPlugInDriverRef inDrive
                         *outNumberPropertiesChanged = 2;
                         outChangedAddresses[0].mSelector = kAudioBoxPropertyAcquired;
                         outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
-                        outChangedAddresses[0].mElement = kAudioObjectPropertyElementMaster;
+                        outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
                         outChangedAddresses[1].mSelector = kAudioBoxPropertyDeviceList;
                         outChangedAddresses[1].mScope = kAudioObjectPropertyScopeGlobal;
-                        outChangedAddresses[1].mElement = kAudioObjectPropertyElementMaster;
+                        outChangedAddresses[1].mElement = kAudioObjectPropertyElementMain;
 
                         //    but it also means that the device list has changed for the plug-in too
                         ExecuteInAudioOutputThread(^() {
                             AudioObjectPropertyAddress theAddress = {kAudioPlugInPropertyDeviceList,
                                                                      kAudioObjectPropertyScopeGlobal,
-                                                                     kAudioObjectPropertyElementMaster};
+                                                                     kAudioObjectPropertyElementMain};
                             gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_PlugIn, 1, &theAddress);
                         });
                     }
@@ -3774,7 +3774,7 @@ OSStatus ProxyAudioDevice::SetStreamPropertyData(AudioServerPlugInDriverRef inDr
                     *outNumberPropertiesChanged = 1;
                     outChangedAddresses[0].mSelector = kAudioStreamPropertyIsActive;
                     outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
-                    outChangedAddresses[0].mElement = kAudioObjectPropertyElementMaster;
+                    outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
                 }
             }
             break;
@@ -4439,7 +4439,7 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                                    Done,
                                    "GetControlPropertyData: not enough space for the return value of "
                                    "kAudioControlPropertyElement for the mute control");
-                    *((AudioObjectPropertyElement *)outData) = kAudioObjectPropertyElementMaster;
+                    *((AudioObjectPropertyElement *)outData) = kAudioObjectPropertyElementMain;
                     *outDataSize = sizeof(AudioObjectPropertyElement);
                     break;
 
@@ -4523,7 +4523,7 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                                    Done,
                                    "GetControlPropertyData: not enough space for the return value of "
                                    "kAudioControlPropertyElement for the data source control");
-                    *((AudioObjectPropertyElement *)outData) = kAudioObjectPropertyElementMaster;
+                    *((AudioObjectPropertyElement *)outData) = kAudioObjectPropertyElementMain;
                     *outDataSize = sizeof(AudioObjectPropertyElement);
                     break;
 
@@ -4686,7 +4686,7 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
                             *outNumberPropertiesChanged = 1;
                             outChangedAddresses[0].mSelector = kAudioBooleanControlPropertyValue;
                             outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
-                            outChangedAddresses[0].mElement = kAudioObjectPropertyElementMaster;
+                            outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
                         }
                     }
                     break;
@@ -4738,7 +4738,7 @@ AudioDevice ProxyAudioDevice::findTargetOutputAudioDevice() {
     std::vector<AudioObjectID> devices = AudioDevice::allAudioDevices();
     for (AudioObjectID device : devices) {
         AudioObjectPropertyAddress propertyAddress = {
-            kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMaster};
+            kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain};
 
         CFStringSmartRef uid;
         UInt32 size = sizeof(CFStringRef);
@@ -4780,7 +4780,7 @@ int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
         CAMutex::Locker locker(outputDeviceMutex);
         UInt32 alive = 0;
         OSStatus err = outputDevice.getIntegerPropertyData(
-            alive, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster);
+            alive, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain);
 
         if (err == noErr && alive == 1) {
             return noErr;
@@ -4895,7 +4895,7 @@ void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
     OSStatus err = outputDevice.getDoublePropertyData(outputDevice.sampleRate,
                                                       kAudioDevicePropertyNominalSampleRate,
                                                       kAudioObjectPropertyScopeGlobal,
-                                                      kAudioObjectPropertyElementMaster);
+                                                      kAudioObjectPropertyElementMain);
 
     if (err != noErr) {
         syslog(LOG_WARNING, "ProxyAudio error: couldn't get new sample rate of output device");
@@ -4970,12 +4970,12 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
         outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
         outputDevice.addPropertyListener(kAudioDevicePropertyDeviceIsAlive,
                                          kAudioObjectPropertyScopeGlobal,
-                                         kAudioObjectPropertyElementMaster,
+                                         kAudioObjectPropertyElementMain,
                                          outputDeviceAliveListenerStatic,
                                          this);
         outputDevice.addPropertyListener(kAudioDevicePropertyNominalSampleRate,
                                          kAudioObjectPropertyScopeGlobal,
-                                         kAudioObjectPropertyElementMaster,
+                                         kAudioObjectPropertyElementMain,
                                          outputDeviceSampleRateListenerStatic,
                                          this);
         DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
@@ -5011,12 +5011,12 @@ void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
         outputDeviceReady = false;
         outputDevice.removePropertyListener(kAudioDevicePropertyDeviceIsAlive,
                                             kAudioObjectPropertyScopeGlobal,
-                                            kAudioObjectPropertyElementMaster,
+                                            kAudioObjectPropertyElementMain,
                                             outputDeviceAliveListenerStatic,
                                             this);
         outputDevice.removePropertyListener(kAudioDevicePropertyNominalSampleRate,
                                             kAudioObjectPropertyScopeGlobal,
-                                            kAudioObjectPropertyElementMaster,
+                                            kAudioObjectPropertyElementMain,
                                             outputDeviceSampleRateListenerStatic,
                                             this);
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock removing IO proc");
@@ -5038,7 +5038,7 @@ void ProxyAudioDevice::deinitializeOutputDevice()
 void ProxyAudioDevice::setupAudioDevicesListener() {
     DebugMsg("ProxyAudio: setupAudioDevicesListener");
     AudioObjectPropertyAddress listenerPropertyAddress = {
-        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     
     OSStatus err = AudioObjectAddPropertyListener(
                                                   kAudioObjectSystemObject, &listenerPropertyAddress, &devicesListenerProcStatic, this);
@@ -5260,6 +5260,7 @@ OSStatus ProxyAudioDevice::WillDoIOOperation(AudioServerPlugInDriverRef inDriver
                                              Boolean *outWillDoInPlace) {
     //    This method returns whether or not the device will do a given IO operation. For this device,
     //    we only support reading input data and writing output data.
+    (void)inClientID;
 
     //    declare the local variables
     OSStatus theAnswer = 0;
@@ -5979,7 +5980,7 @@ void ProxyAudioDevice::setDeviceName(CFStringRef newName) {
         gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("deviceName"), deviceName);
         
         AudioObjectPropertyAddress theAddress = {
-            kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+            kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
         gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &theAddress);
     });
 }
@@ -6262,27 +6263,28 @@ void ProxyAudioDevice::setTargetAggregateDevices(CFStringRef deviceUIDs) {
         return;
     }
 
-    Boolean shouldRebuild = false;
+    Boolean devicesChanged = false;
     {
         CAMutex::Locker locker(&stateMutex);
-        const bool devicesChanged = !targetAggregateDevicesString ||
+        devicesChanged = !targetAggregateDevicesString ||
             CFStringCompare(targetAggregateDevicesString, deviceUIDs, 0) != kCFCompareEqualTo;
-        if (devicesChanged && targetAggregateDevicesString) {
-            CFRelease(targetAggregateDevicesString);
-        }
         if (devicesChanged) {
+            if (targetAggregateDevicesString) {
+                CFRelease(targetAggregateDevicesString);
+            }
             targetAggregateDevicesString = CFStringCreateCopy(NULL, deviceUIDs);
             gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateDevices"), targetAggregateDevicesString);
         }
-        shouldRebuild = true;
     }
 
-    if (!shouldRebuild) {
-        return;
-    }
-
+    // Only force a teardown when the target devices actually changed. The
+    // configurator re-sends the same UIDs on every audio state change, and
+    // destroying a live aggregate each time churns the CoreAudio device list,
+    // which in turn triggers another state change. Passing false lets
+    // rebuildDriverOwnedTargetAggregate adopt the existing aggregate, or build
+    // one if it is missing.
     ExecuteInAudioOutputThread(^{
-        rebuildDriverOwnedTargetAggregate(true);
+        rebuildDriverOwnedTargetAggregate(devicesChanged);
         setupTargetOutputDevice();
     });
 }
