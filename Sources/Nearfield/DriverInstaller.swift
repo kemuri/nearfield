@@ -29,6 +29,8 @@ enum DriverInstallerError: LocalizedError {
 final class DriverInstaller {
     private static let halDriverDirectory = "/Library/Audio/Plug-Ins/HAL"
     private static let routerDriverBundleName = "NearfieldAudioDevice.driver"
+    // Set by script/build_router_driver.sh via PRODUCT_BUNDLE_IDENTIFIER.
+    private static let routerDriverBundleIdentifier = "com.kemuri.Nearfield.AudioDevice"
     private static let legacyRouterDriverBundleName = "StudioPairRouterAudioDevice.driver"
     private static let legacyProxyDriverBundleName = "ProxyAudioDevice.driver"
     private static let driverServiceHelperName = "com.apple.audio.Core-Audio-Driver-Service.helper"
@@ -41,12 +43,20 @@ final class DriverInstaller {
         ]
     }
 
-    func installOrReinstallRouterDriver() throws {
-        let driverPath = try buildRouterDriver()
-        try installBuiltRouterDriver(at: driverPath)
-    }
-
     func buildRouterDriver() throws -> String {
+        // Distribution builds install only the driver shipped inside the app
+        // bundle. Building from a discovered source tree would let anything
+        // that controls the working directory (or a parent of it) hand us a
+        // bundle that we then ad-hoc sign and load as root.
+        if BuildConfiguration.isDistribution {
+            guard let bundledDriverPath = try bundledRouterDriverPath() else {
+                throw DriverInstallerError.driverBundleMissing(
+                    "Drivers/\(Self.routerDriverBundleName) inside Nearfield.app"
+                )
+            }
+            return bundledDriverPath
+        }
+
         if sourceBuildScriptPathIfAvailable() != nil {
             return try buildRouterDriverFromSource()
         }
@@ -61,7 +71,7 @@ final class DriverInstaller {
         let sourcePath = try validatedDriverBundlePath(driverPath)
         let destinationPath = "\(Self.halDriverDirectory)/\(Self.routerDriverBundleName)"
         let temporaryPath = "\(destinationPath).nearfield-installing"
-        let cleanupPaths = installCleanupPaths(destinationPath: destinationPath, temporaryPath: temporaryPath)
+        let cleanupPaths = installCleanupPaths(temporaryPath: temporaryPath)
         let command = [
             "set -e",
             "/bin/mkdir -p \(shellQuoted(Self.halDriverDirectory))",
@@ -78,14 +88,6 @@ final class DriverInstaller {
             coreAudioRestartCommand()
         ].joined(separator: "\n")
         try runPrivilegedShell(command)
-    }
-
-    func removeDriverAndRestartCoreAudio() throws {
-        try removeAllInstalledDriversAndRestartCoreAudio()
-    }
-
-    func removeRouterDriverAndRestartCoreAudio() throws {
-        try removeAllInstalledDriversAndRestartCoreAudio()
     }
 
     func removeAllInstalledDriversAndRestartCoreAudio() throws {
@@ -185,13 +187,6 @@ final class DriverInstaller {
         Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
     }
 
-    private func executableScriptPath(_ path: String) throws -> String {
-        guard FileManager.default.isExecutableFile(atPath: path) else {
-            throw DriverInstallerError.scriptNotFound(path)
-        }
-        return path
-    }
-
     private func runBuildScript(_ scriptPath: String, expectedSuffix: String) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: scriptPath)
@@ -243,6 +238,13 @@ final class DriverInstaller {
               isDirectory.boolValue else {
             throw DriverInstallerError.driverBundleMissing(url.path)
         }
+
+        // The install step ad-hoc signs whatever it is handed and loads it into
+        // coreaudiod as root, so confirm this really is our plug-in and not
+        // just a directory that happens to carry the right name.
+        guard Bundle(url: url)?.bundleIdentifier == Self.routerDriverBundleIdentifier else {
+            throw DriverInstallerError.invalidDriverBundle(url.path)
+        }
         return url.path
     }
 
@@ -261,9 +263,9 @@ final class DriverInstaller {
         ]
     }
 
-    private func installCleanupPaths(destinationPath: String, temporaryPath: String) -> [String] {
+    private func installCleanupPaths(temporaryPath: String) -> [String] {
         let legacyTemporaryPaths = installedRouterDriverPaths().flatMap(temporaryDriverPaths(for:))
-        return Array(Set(legacyTemporaryPaths + [temporaryPath]))
+        return (legacyTemporaryPaths + [temporaryPath]).uniquePreservingOrder()
     }
 
     private func removeCommand(paths: [String]) -> String {

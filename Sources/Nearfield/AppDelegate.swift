@@ -28,8 +28,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         static let outputMode = "outputMode"
         static let leftDeviceUID = "leftDeviceUID"
         static let balance = "balance"
-        static let simulatedStatus = "simulatedStatus"
-        static let advancedExpanded = "advancedExpanded"
         static let showMenuBarApp = "showMenuBarApp"
         static let aggregateSchemaVersion = "aggregateSchemaVersion"
         static let proxyPreparedDisplayState = "proxyPreparedDisplayState"
@@ -46,37 +44,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RouterAudioDriverManager.driverTargetAggregateUID,
         "com.kemuri.Nearfield.TargetAggregate"
     ]
-
-    private enum SimulatedStatus: String, CaseIterable {
-        case off
-        case ready
-        case missingDisplays
-        case driverMissing
-        case installing
-        case notSelected
-
-        var title: String {
-            switch self {
-            case .off: "Use Live State"
-            case .ready: "Ready"
-            case .missingDisplays: "Displays Missing"
-            case .driverMissing: "Driver Missing"
-            case .installing: "Installing"
-            case .notSelected: "Not Selected"
-            }
-        }
-
-        var symbolName: String {
-            switch self {
-            case .off: "dot.radiowaves.left.and.right"
-            case .ready: "checkmark.circle.fill"
-            case .missingDisplays: "display.trianglebadge.exclamationmark"
-            case .driverMissing: "xmark.circle.fill"
-            case .installing: "arrow.triangle.2.circlepath.circle.fill"
-            case .notSelected: "exclamationmark.circle.fill"
-            }
-        }
-    }
 
     private let audioManager = StudioDisplayAudioManager()
     private let routerDriverManager = RouterAudioDriverManager()
@@ -97,14 +64,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var updaterController: SPUStandardUpdaterController?
     private var pendingUpdateInstallation: (() -> Void)?
     #endif
-    private lazy var balanceMenuView = MenuBalanceRowView(
-        value: settingsBalance(),
-        isEnabled: false,
-        onChange: { [weak self] balance in
-            self?.settingsSetBalance(balance)
-        }
-    )
-
     private var isInstallingDriver = false
     private var audioStateSynchronizationDepth = 0
     private var proxyPreparedDisplayState: [DisplayOutputState]?
@@ -134,10 +93,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum UninstallScope {
         case driversOnly
         case driversAndApp
-    }
-
-    override init() {
-        super.init()
     }
 
     private var isSynchronizingAudioState: Bool {
@@ -200,7 +155,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
     }
 
-    private func presentUpdateNotification(version: String) {
+    /// What to do when a notification cannot be posted. The install-on-quit
+    /// path can offer to install immediately; a scheduled reminder has nothing
+    /// staged yet, so it defers to Sparkle's own update window.
+    private enum UpdateNotificationFallback {
+        case offerPendingInstall
+        case sparkleUpdateWindow
+    }
+
+    private func presentUpdateNotification(version: String, fallback: UpdateNotificationFallback) {
         Task {
             let center = UNUserNotificationCenter.current()
             let settings = await center.notificationSettings()
@@ -217,7 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             guard canNotify else {
-                presentUpdateAlert(version: version)
+                applyUpdateNotificationFallback(fallback, version: version)
                 return
             }
 
@@ -234,8 +197,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await center.add(request)
             } catch {
-                presentUpdateAlert(version: version)
+                applyUpdateNotificationFallback(fallback, version: version)
             }
+        }
+    }
+
+    private func applyUpdateNotificationFallback(_ fallback: UpdateNotificationFallback, version: String) {
+        switch fallback {
+        case .offerPendingInstall:
+            presentUpdateAlert(version: version)
+        case .sparkleUpdateWindow:
+            NSApp.activate(ignoringOtherApps: true)
+            updaterController?.checkForUpdates(nil)
         }
     }
 
@@ -300,7 +273,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         #endif
+        // First-run onboarding defers Core Audio startup until the user reaches
+        // the settings screen; see settingsDidReachSettingsScreen().
         if presentInitialOnboardingIfNeeded() {
+            return
+        }
+
+        startCoreAudioServices { [weak self] in
+            self?.presentSettingsIfMenuBarAppIsHiddenAfterDefaultLaunch(notification)
+        }
+    }
+
+    /// Waits for Core Audio, then brings observation, media keys, and dynamic
+    /// routing online. Safe to call from either the normal launch path or the
+    /// end of first-run onboarding; repeat calls are ignored.
+    private func startCoreAudioServices(completion: (() -> Void)? = nil) {
+        guard !didStartAudioServices, coreAudioStartupTask == nil else {
+            completion?()
             return
         }
 
@@ -317,7 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
             self.refreshStatus()
-            self.presentSettingsIfMenuBarAppIsHiddenAfterDefaultLaunch(notification)
+            completion?()
             self.coreAudioStartupTask = nil
         }
     }
@@ -609,22 +598,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             recordRecoverableError(error, context: "Launch audio setup failed")
         }
-    }
-
-    @objc private func cleanupAggregates() {
-        do {
-            try performSynchronizedAudioUpdate {
-                let shouldActivateVirtualOutput = nearfieldVirtualOutputIsDefaultOutput()
-                try audioManager.cleanupPublicAggregates()
-                if routerDriverManager.isInstalled {
-                    markAggregateSchemaCurrent()
-                    try configureRouterDriver(activate: shouldActivateVirtualOutput)
-                }
-            }
-        } catch {
-            showError(error)
-        }
-        refreshStatus()
     }
 
     private func configureRouterDriver(activate: Bool = true) throws {
@@ -1062,79 +1035,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatus()
     }
 
-    private func statusRowContent() -> (title: String, detail: String, symbolName: String, tintColor: NSColor) {
-        #if !NEARFIELD_DISTRIBUTION
-        if let simulatedStatus = currentSimulatedStatus(), simulatedStatus != .off {
-            return statusContent(for: simulatedStatus)
-        }
-        #endif
-
-        if isInstallingDriver {
-            return ("Installing", "Configuring the Nearfield audio driver.", "arrow.triangle.2.circlepath.circle.fill", .systemBlue)
-        }
-
-        let state = cachedAudioState
-        if state.detectedDisplays.count < 2 {
-            return ("Displays Missing", "Connect two Studio Displays to create Nearfield.", "exclamationmark.triangle.fill", .systemYellow)
-        }
-        if let lastRuntimeError {
-            return ("Needs Attention", lastRuntimeError, "exclamationmark.triangle.fill", .systemOrange)
-        }
-        guard cachedRouterDriverInstalled else {
-            return ("Driver Not Installed", "Install the audio driver to enable Nearfield.", "xmark.circle.fill", .systemRed)
-        }
-        if cachedRouterDefaultOutput {
-            if appRoutingEnabled() {
-                return ("App Audio Routing Active", "Nearfield is selected with App Audio Routing enabled.", "point.3.connected.trianglepath.dotted", .systemGreen)
-            }
-            return ("Nearfield Ready", "Audio driver active. macOS volume controls are enabled.", "checkmark.circle.fill", .systemGreen)
-        }
-        return ("Not Selected", "Select Nearfield or reinstall the audio driver.", "exclamationmark.circle.fill", .systemYellow)
-    }
-
-    private func currentSimulatedStatus() -> SimulatedStatus? {
-        guard let rawValue = UserDefaults.standard.string(forKey: DefaultsKey.simulatedStatus) else {
-            return nil
-        }
-        return SimulatedStatus(rawValue: rawValue)
-    }
-
-    private func setSimulatedStatus(_ status: SimulatedStatus) {
-        if status == .off {
-            UserDefaults.standard.removeObject(forKey: DefaultsKey.simulatedStatus)
-        } else {
-            UserDefaults.standard.set(status.rawValue, forKey: DefaultsKey.simulatedStatus)
-        }
-        refreshStatus()
-        rebuildMenu()
-    }
-
-    private func statusContent(for status: SimulatedStatus) -> (title: String, detail: String, symbolName: String, tintColor: NSColor) {
-        switch status {
-        case .off:
-            return statusRowContent()
-        case .ready:
-            return ("Nearfield Ready", "Simulated: audio driver active with volume controls enabled.", status.symbolName, .systemGreen)
-        case .missingDisplays:
-            return ("Displays Missing", "Simulated: connect two Studio Displays to create Nearfield.", status.symbolName, .systemYellow)
-        case .driverMissing:
-            return ("Driver Not Installed", "Simulated: reinstall drivers to restore volume control.", status.symbolName, .systemRed)
-        case .installing:
-            return ("Installing", "Simulated: configuring the Nearfield audio driver.", status.symbolName, .systemBlue)
-        case .notSelected:
-            return ("Not Selected", "Simulated: select Nearfield or reinstall the audio driver.", status.symbolName, .systemYellow)
-        }
-    }
-
-    private func isAdvancedExpanded() -> Bool {
-        UserDefaults.standard.bool(forKey: DefaultsKey.advancedExpanded)
-    }
-
-    private func toggleAdvanced() {
-        UserDefaults.standard.set(!isAdvancedExpanded(), forKey: DefaultsKey.advancedExpanded)
-        rebuildMenu()
-    }
-
     private func rebuildMenu() {
         menu.removeAllItems()
 
@@ -1220,57 +1120,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    private func viewMenuItem(_ view: NSView) -> NSMenuItem {
-        let item = NSMenuItem()
-        item.view = view
-        return item
-    }
-
-    private func advancedPanelView() -> NSView {
-        let selectedSimulation = currentSimulatedStatus() ?? .off
-        return MenuAdvancedPanelView(
-            actions: [
-                .init(
-                    title: "Swap Assignment",
-                    symbolName: "arrow.left.arrow.right",
-                    isEnabled: cachedAudioState.detectedDisplays.count >= 2 && !isInstallingDriver,
-                    handler: { [weak self] in
-                        self?.menu.cancelTracking()
-                        self?.swapAssignmentFromMenu()
-                    }
-                ),
-                .init(
-                    title: cachedRouterDriverInstalled ? "Reinstall Driver" : "Install Driver",
-                    symbolName: "point.3.connected.trianglepath.dotted",
-                    isEnabled: !isInstallingDriver,
-                    handler: { [weak self] in
-                        self?.menu.cancelTracking()
-                        self?.settingsInstallDriver()
-                    }
-                ),
-                .init(
-                    title: "Uninstall",
-                    symbolName: "trash",
-                    isEnabled: !isInstallingDriver,
-                    handler: { [weak self] in
-                        self?.menu.cancelTracking()
-                        self?.removeEverythingFromMenu()
-                    }
-                )
-            ],
-            simulatedStateOptions: SimulatedStatus.allCases.map { status in
-                .init(
-                    title: status.title,
-                    symbolName: status.symbolName,
-                    isSelected: selectedSimulation == status,
-                    handler: { [weak self] in
-                        self?.setSimulatedStatus(status)
-                    }
-                )
-            }
-        )
-    }
-
     private func applyMenuBarState() {
         statusItem.isVisible = showMenuBarApp()
         statusItem.button?.isEnabled = true
@@ -1283,19 +1132,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
         return UserDefaults.standard.bool(forKey: DefaultsKey.showMenuBarApp)
-    }
-
-    @objc private func swapAssignmentFromMenu() {
-        let devices = Array(audioManager.studioDisplayDevices().prefix(2))
-        guard devices.count >= 2 else { return }
-        let currentLeftUID = UserDefaults.standard.string(forKey: DefaultsKey.leftDeviceUID) ?? devices[0].uid
-        let nextLeftUID = devices.first(where: { $0.uid != currentLeftUID })?.uid ?? devices[1].uid
-        UserDefaults.standard.set(nextLeftUID, forKey: DefaultsKey.leftDeviceUID)
-        rebuildForConfigurationChange()
-    }
-
-    @objc private func removeEverythingFromMenu() {
-        settingsRemoveEverything()
     }
 
     private func installAndActivateRouterDriver(
@@ -1479,7 +1315,7 @@ extension AppDelegate: SPUUpdaterDelegate {
     ) -> Bool {
         pendingUpdateInstallation = immediateInstallHandler
         rebuildMenu()
-        presentUpdateNotification(version: item.displayVersionString)
+        presentUpdateNotification(version: item.displayVersionString, fallback: .offerPendingInstall)
         return true
     }
 }
@@ -1493,7 +1329,11 @@ extension AppDelegate: @preconcurrency SPUStandardUserDriverDelegate {
         _ update: SUAppcastItem,
         andInImmediateFocus immediateFocus: Bool
     ) -> Bool {
-        true
+        // Let Sparkle present the update itself only when it already proposes
+        // immediate focus. Otherwise we take over and post a gentle reminder
+        // rather than pulling a menu bar app in front of the user's work.
+        // Must stay side-effect free per SPUStandardUserDriverDelegate.
+        immediateFocus
     }
 
     func standardUserDriverWillHandleShowingUpdate(
@@ -1501,8 +1341,18 @@ extension AppDelegate: @preconcurrency SPUStandardUserDriverDelegate {
         forUpdate update: SUAppcastItem,
         state: SPUUserUpdateState
     ) {
-        guard handleShowingUpdate else { return }
+        guard handleShowingUpdate else {
+            // We declined above, so this scheduled reminder is ours to show.
+            presentUpdateNotification(
+                version: update.displayVersionString,
+                fallback: .sparkleUpdateWindow
+            )
+            return
+        }
         dismissUpdateNotification()
+        // Only take focus for a check the user actually asked for. Sparkle
+        // guarantees handleShowingUpdate is true whenever userInitiated is.
+        guard state.userInitiated else { return }
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -1586,6 +1436,9 @@ extension AppDelegate: SettingsDelegate {
         startUpdaterIfEligible(checkImmediately: true)
         #endif
         applyMenuBarState()
+        // Launch skipped Core Audio startup to show onboarding, so start it
+        // here instead of leaving media keys and routing dead until relaunch.
+        startCoreAudioServices()
     }
 
     func settingsDriverInstalled() -> Bool {
@@ -1740,6 +1593,15 @@ extension AppDelegate: SettingsDelegate {
     func settingsSetLeftDeviceUID(_ uid: String) {
         UserDefaults.standard.set(uid, forKey: DefaultsKey.leftDeviceUID)
         refreshStatus()
+    }
+
+    func settingsSwapAssignment() {
+        let devices = Array(audioManager.studioDisplayDevices().prefix(2))
+        guard devices.count >= 2 else { return }
+        let currentLeftUID = UserDefaults.standard.string(forKey: DefaultsKey.leftDeviceUID) ?? devices[0].uid
+        let nextLeftUID = devices.first(where: { $0.uid != currentLeftUID })?.uid ?? devices[1].uid
+        UserDefaults.standard.set(nextLeftUID, forKey: DefaultsKey.leftDeviceUID)
+        rebuildForConfigurationChange()
     }
 
     func settingsApplyConfiguration() {

@@ -621,6 +621,11 @@ private final class OnboardingModel: ObservableObject {
         delegate?.settingsPlayTestTone(.stereo)
     }
 
+    func swapChannels() {
+        delegate?.settingsSwapAssignment()
+        refreshFromDelegate()
+    }
+
     func installDriver() {
         delegate?.settingsInstallDriver()
         refreshFromDelegate()
@@ -1870,7 +1875,9 @@ private struct SettingsOnboardingView: View {
                                         model.playTestSound()
                                     }
                                     SettingsDivider()
-                                    ActionSettingRow(title: "Arrangement", buttonTitle: "Swap Channels") {}
+                                    ActionSettingRow(title: "Arrangement", buttonTitle: "Swap Channels") {
+                                        model.swapChannels()
+                                    }
                                 }
                             }
 
