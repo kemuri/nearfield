@@ -41,7 +41,7 @@ OSStatus AudioDevice::updateStreamInfo() {
     OSStatus err = getIntegerPropertyData(safetyOffset,
                                           kAudioDevicePropertySafetyOffset,
                                           isOutput ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput,
-                                          kAudioObjectPropertyElementMaster);
+                                          kAudioObjectPropertyElementMain);
 
     if (err != noErr) {
         syslog(LOG_WARNING, "ProxyAudio: error: failed to get safety offset of device %u", id);
@@ -51,7 +51,7 @@ OSStatus AudioDevice::updateStreamInfo() {
     err = getIntegerPropertyData(bufferFrameSize,
                                  kAudioDevicePropertyBufferFrameSize,
                                  isOutput ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput,
-                                 kAudioObjectPropertyElementMaster);
+                                 kAudioObjectPropertyElementMain);
 
     if (err != noErr) {
         syslog(LOG_WARNING, "ProxyAudio: error: failed to get buffer frame size of device %u", id);
@@ -61,7 +61,7 @@ OSStatus AudioDevice::updateStreamInfo() {
     err = getDoublePropertyData(sampleRate,
                                 kAudioDevicePropertyNominalSampleRate,
                                 kAudioObjectPropertyScopeGlobal,
-                                kAudioObjectPropertyElementMaster);
+                                kAudioObjectPropertyElementMain);
 
     if (err != noErr) {
         syslog(LOG_WARNING, "ProxyAudio: error: failed to get sample rate of device %u", id);
@@ -185,7 +185,7 @@ void AudioDevice::setBufferFrameSize(UInt32 newBufferFrameSize) {
     AudioObjectPropertyAddress propertyAddress = {kAudioDevicePropertyBufferFrameSize,
                                                   isOutput ? kAudioObjectPropertyScopeOutput
                                                            : kAudioObjectPropertyScopeInput,
-                                                  kAudioObjectPropertyElementMaster};
+                                                  kAudioObjectPropertyElementMain};
 
     OSStatus err =
         AudioObjectSetPropertyData(id, &propertyAddress, 0, NULL, sizeof(bufferFrameSize), &newBufferFrameSize);
@@ -263,7 +263,7 @@ void AudioDevice::stop() {
 
 std::vector<AudioObjectID> AudioDevice::allAudioDevices() {
     AudioObjectPropertyAddress propertyAddress = {
-        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
 
     UInt32 devicesSize = 0;
     AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &devicesSize);
@@ -292,7 +292,7 @@ std::vector<AudioObjectID> AudioDevice::devicesWithOutputCapabilitiesThatAreNotP
         UInt32 values[2];
         AudioObjectPropertyAddress propertyAddress = {kAudioDevicePropertyPreferredChannelsForStereo,
                                                       kAudioObjectPropertyScopeOutput,
-                                                      kAudioObjectPropertyElementMaster};
+                                                      kAudioObjectPropertyElementMain};
         UInt32 size = sizeof(values);
         OSStatus error = AudioObjectGetPropertyData(device, &propertyAddress, 0, NULL, &size, values);
 
@@ -316,7 +316,7 @@ AudioObjectID AudioDevice::defaultOutputDevice() {
     AudioObjectID result;
     UInt32 size = sizeof(result);
     AudioObjectPropertyAddress propertyAddress = {
-        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     OSStatus error = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &size, &result);
 
     return (error == noErr) ? result : kAudioObjectUnknown;
@@ -328,7 +328,7 @@ CFStringRef AudioDevice::copyDeviceUID(AudioObjectID device) {
     }
 
     AudioObjectPropertyAddress uidAddr = {
-        kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     CFStringRef uid = NULL;
     UInt32 size = sizeof(uid);
     OSStatus error = AudioObjectGetPropertyData(device, &uidAddr, 0, NULL, &size, &uid);
@@ -342,7 +342,7 @@ CFStringRef AudioDevice::copyObjectName(AudioObjectID device) {
     }
 
     AudioObjectPropertyAddress nameAddr = {
-        kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     CFStringRef name = NULL;
     UInt32 size = sizeof(name);
     OSStatus error = AudioObjectGetPropertyData(device, &nameAddr, 0, NULL, &size, &name);
@@ -352,13 +352,13 @@ CFStringRef AudioDevice::copyObjectName(AudioObjectID device) {
 
 void AudioDevice::setObjectName(AudioObjectID object, CFStringRef newName) {
     AudioObjectPropertyAddress setNameAddr = {
-        kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     AudioObjectSetPropertyData(object, &setNameAddr, 0, NULL, sizeof(newName), &newName);
 }
 
 AudioDeviceID AudioDevice::audioDeviceIDForUID(CFStringRef uid, AudioObjectPropertySelector selector) {
     AudioObjectPropertyAddress propertyAddress = {
-        selector, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        selector, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
 
     AudioObjectID result;
     UInt32 resultSize = sizeof(result);
@@ -380,7 +380,7 @@ AudioDeviceID AudioDevice::audioDeviceIDForDeviceUID(CFStringRef uid) {
     }
 
     AudioObjectPropertyAddress propertyAddress = {
-        kAudioHardwarePropertyDeviceForUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioHardwarePropertyDeviceForUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     CFStringRef inputUID = uid;
     AudioObjectID outputDeviceID = kAudioObjectUnknown;
     AudioValueTranslation translation = {
@@ -405,7 +405,7 @@ AudioDeviceID AudioDevice::audioDeviceIDForBoxUID(CFStringRef uid) {
 
 bool AudioDevice::setIdentifyValue(AudioDeviceID device, SInt32 value) {
     AudioObjectPropertyAddress setIdentifyAddr = {
-        kAudioObjectPropertyIdentify, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioObjectPropertyIdentify, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
 
     return AudioObjectSetPropertyData(device, &setIdentifyAddr, 0, NULL, sizeof(value), &value) == noErr;
 }

@@ -10,7 +10,7 @@ CFTimeInterval getUserIdleTimeInterval() {
     
     mach_port_t port;
     io_iterator_t iter;
-    IOMasterPort(MACH_PORT_NULL, &port);
+    IOMainPort(MACH_PORT_NULL, &port);
     IOServiceGetMatchingServices(port, IOServiceMatching(kIOHIDSystemClass), &iter);
     
     if (!iter) {
