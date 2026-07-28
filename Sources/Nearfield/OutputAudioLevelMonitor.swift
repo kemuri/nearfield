@@ -1,3 +1,5 @@
+// Only used by Wave Lab, which is excluded from distribution builds.
+#if !NEARFIELD_DISTRIBUTION
 import AudioToolbox
 import CoreMedia
 import Foundation
@@ -250,3 +252,4 @@ private struct AudioLevelSample {
         count += 1
     }
 }
+#endif

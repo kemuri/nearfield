@@ -50,22 +50,6 @@ final class RouterAudioDriverManager {
         routerBoxID() != nil
     }
 
-    var isPublished: Bool {
-        routerDeviceID() != nil
-    }
-
-    static func waitUntilInstalled(timeout: TimeInterval = 30, interval: TimeInterval = 0.25) async -> Bool {
-        let manager = RouterAudioDriverManager()
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if manager.isInstalled {
-                return true
-            }
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-        }
-        return manager.isInstalled
-    }
-
     func configureRouterOutput(
         targetDeviceUIDs: [String],
         mode: NearfieldOutputMode,
@@ -88,13 +72,6 @@ final class RouterAudioDriverManager {
         try setConfiguration("outputDeviceActiveCondition", value: "\(ActiveCondition.proxiedDeviceActive.rawValue)", boxID: boxID)
         try setConfiguration("routingEnabled", value: routingEnabled ? "1" : "0", boxID: boxID)
         try setConfiguration("routeRules", value: routeRules, boxID: boxID)
-    }
-
-    func supportsDriverOwnedTargetAggregate() -> Bool {
-        guard let boxID = routerBoxID() else {
-            return false
-        }
-        return supportsDriverOwnedTargetAggregate(boxID: boxID)
     }
 
     func setRoutingEnabled(_ enabled: Bool) throws {
