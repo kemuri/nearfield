@@ -1,4 +1,4 @@
-enum NearfieldActivationPolicy {
+enum NearfieldRouterPolicy {
     static func shouldActivateRouter(
         defaultOutputIsNearfield: Bool,
         displaysJustReconnected: Bool,

@@ -293,6 +293,9 @@ final class DriverInstaller {
     }
 
     private func runPrivilegedShell(_ command: String) throws {
+        // Callers build this command only from fixed executable names and
+        // newline/NUL-free paths that were individually shell-quoted. The
+        // second escaping pass below is solely for the AppleScript string.
         let compactCommand = command
             .split(whereSeparator: \.isNewline)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }

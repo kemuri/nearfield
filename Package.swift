@@ -43,7 +43,12 @@ let package = Package(
         ),
         .testTarget(
             name: "NearfieldTests",
-            dependencies: ["Nearfield"]
+            dependencies: ["Nearfield"],
+            swiftSettings: [
+                // Keep the test module in the same feature configuration as
+                // the executable it imports.
+                .define("NEARFIELD_DISTRIBUTION", .when(configuration: .release))
+            ]
         )
     ]
 )

@@ -11,7 +11,7 @@ struct StudioDisplayConnectionStatus: Equatable {
     let connectedCount: Int
 
     var isConnected: Bool {
-        NearfieldActivationPolicy.shouldPublishRouter(studioDisplayCount: connectedCount)
+        NearfieldRouterPolicy.shouldPublishRouter(studioDisplayCount: connectedCount)
     }
 
     var title: String {
@@ -98,8 +98,8 @@ enum NearfieldError: LocalizedError {
 }
 
 final class StudioDisplayAudioManager {
-    let aggregateUID = "com.kemuri.Nearfield.TargetAggregate"
-    let aggregateName = "Nearfield Target"
+    let aggregateUID = NearfieldAudioIdentifiers.appTargetAggregateUID
+    let aggregateName = NearfieldAudioIdentifiers.appTargetAggregateName
     private var observerBlocks: [(address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)] = []
     private var observerCallback: (() -> Void)?
     private var devicesCache: [AudioDevice]?
@@ -260,8 +260,18 @@ final class StudioDisplayAudioManager {
         try setMute(false, for: displays)
         try setVolume(1, for: displays)
         if let aggregate = device(matchingUID: aggregateUID) {
-            try setMuteIfSupported(false, for: [aggregate])
-            try setVolumeIfSupported(1, for: [aggregate])
+            _ = try setDevicePropertyIfSupported(
+                UInt32(0),
+                selector: kAudioDevicePropertyMute,
+                label: "mute",
+                for: aggregate
+            )
+            _ = try setDevicePropertyIfSupported(
+                Float32(1),
+                selector: kAudioDevicePropertyVolumeScalar,
+                label: "volume",
+                for: aggregate
+            )
         }
     }
 
@@ -381,7 +391,7 @@ final class StudioDisplayAudioManager {
 
     private func managedNearfieldAggregates() -> [AudioDevice] {
         var devices = allDevices().filter { isNearfieldAggregate($0) }
-        for uid in managedAggregateUIDs {
+        for uid in NearfieldAudioIdentifiers.managedAggregateUIDs {
             if let hiddenAggregate = device(matchingUID: uid),
                isNearfieldAggregate(hiddenAggregate),
                !devices.contains(where: { $0.id == hiddenAggregate.id }) {
@@ -482,14 +492,9 @@ final class StudioDisplayAudioManager {
     }
 
     private func fallbackOutputDevice(from devices: [AudioDevice]) -> AudioDevice? {
-        let virtualOutputUIDs: Set<String> = [
-            "ProxyAudioDevice_UID",
-            "StudioPairRouterAudioDevice_UID",
-            "NearfieldAudioDevice_UID"
-        ]
         let eligibleDevices = devices.filter {
             $0.outputChannelCount > 0 &&
-                !virtualOutputUIDs.contains($0.uid) &&
+                !NearfieldAudioIdentifiers.virtualOutputUIDs.contains($0.uid) &&
                 !isNearfieldAggregate($0)
         }
         return eligibleDevices.first(where: isBuiltInSpeaker) ??
@@ -507,25 +512,8 @@ final class StudioDisplayAudioManager {
         guard classID(for: device.id) == kAudioAggregateDeviceClassID else {
             return false
         }
-        return managedAggregateUIDs.contains(device.uid) || managedAggregateNames.contains(device.name)
-    }
-
-    private var managedAggregateUIDs: Set<String> {
-        [
-            aggregateUID,
-            RouterAudioDriverManager.driverTargetAggregateUID,
-            "com.kemuri.StudioPair.Aggregate"
-        ]
-    }
-
-    private var managedAggregateNames: Set<String> {
-        [
-            aggregateName,
-            "Nearfield Driver Target",
-            "Studio Pair Target",
-            "Studio Pair",
-            "Nearfield Target"
-        ]
+        return NearfieldAudioIdentifiers.managedAggregateUIDs.contains(device.uid) ||
+            NearfieldAudioIdentifiers.managedAggregateNames.contains(device.name)
     }
 
     private func isAggregateDefaultOutput() -> Bool {
@@ -541,27 +529,19 @@ final class StudioDisplayAudioManager {
     }
 
     private func defaultDeviceID(selector: AudioObjectPropertySelector) -> AudioObjectID? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+        let id: AudioObjectID? = CoreAudioProperty.read(
+            from: AudioObjectID(kAudioObjectSystemObject),
+            selector: selector
         )
-        var id = AudioObjectID(0)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id)
-        return status == noErr && id != 0 ? id : nil
+        return id.flatMap { $0 == 0 ? nil : $0 }
     }
 
     private func classID(for objectID: AudioObjectID) -> AudioClassID? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyClass,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+        CoreAudioProperty.read(
+            from: objectID,
+            selector: kAudioObjectPropertyClass,
+            as: AudioClassID.self
         )
-        var value = AudioClassID(0)
-        var size = UInt32(MemoryLayout<AudioClassID>.size)
-        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
-        return status == noErr ? value : nil
     }
 
     static func orderedDisplays(from displays: [AudioDevice], leftDeviceUID: String?) -> [AudioDevice] {
@@ -591,19 +571,10 @@ final class StudioDisplayAudioManager {
     }
 
     private func setDefaultDevice(_ deviceID: AudioObjectID, selector: AudioObjectPropertySelector) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var mutableID = deviceID
-        let status = AudioObjectSetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<AudioObjectID>.size),
-            &mutableID
+        let status = CoreAudioProperty.write(
+            deviceID,
+            to: AudioObjectID(kAudioObjectSystemObject),
+            selector: selector
         )
         guard status == noErr else {
             throw NearfieldError.coreAudio(operation: "Selecting default output", status: status)
@@ -617,8 +588,8 @@ final class StudioDisplayAudioManager {
     }
 
     private func volume(for device: AudioDevice) -> Float32? {
-        if let master = getFloatProperty(
-            device.id,
+        if let master: Float32 = CoreAudioProperty.read(
+            from: device.id,
             selector: kAudioDevicePropertyVolumeScalar,
             scope: kAudioDevicePropertyScopeOutput,
             element: kAudioObjectPropertyElementMain
@@ -627,11 +598,12 @@ final class StudioDisplayAudioManager {
         }
 
         let channelValues = (1...max(1, device.outputChannelCount)).compactMap { channel -> Float32? in
-            getFloatProperty(
-                device.id,
+            CoreAudioProperty.read(
+                from: device.id,
                 selector: kAudioDevicePropertyVolumeScalar,
                 scope: kAudioDevicePropertyScopeOutput,
-                element: channel
+                element: channel,
+                as: Float32.self
             )
         }
         guard !channelValues.isEmpty else { return nil }
@@ -640,7 +612,12 @@ final class StudioDisplayAudioManager {
 
     private func setVolume(_ volume: Float32, for devices: [AudioDevice]) throws {
         for device in devices {
-            let didSetVolume = try setVolumeIfSupported(volume, for: [device])
+            let didSetVolume = try setDevicePropertyIfSupported(
+                volume,
+                selector: kAudioDevicePropertyVolumeScalar,
+                label: "volume",
+                for: device
+            )
             if !didSetVolume {
                 throw NearfieldError.coreAudio(
                     operation: "Setting \(device.name) volume",
@@ -650,51 +627,6 @@ final class StudioDisplayAudioManager {
         }
     }
 
-    @discardableResult
-    private func setVolumeIfSupported(_ volume: Float32, for devices: [AudioDevice]) throws -> Bool {
-        var didSetAnyVolume = false
-        for device in devices {
-            if canSetAudioProperty(
-                device.id,
-                selector: kAudioDevicePropertyVolumeScalar,
-                scope: kAudioDevicePropertyScopeOutput,
-                element: kAudioObjectPropertyElementMain
-            ) {
-                try setFloatProperty(
-                    device.id,
-                    selector: kAudioDevicePropertyVolumeScalar,
-                    scope: kAudioDevicePropertyScopeOutput,
-                    element: kAudioObjectPropertyElementMain,
-                    value: volume,
-                    operation: "Setting \(device.name) volume"
-                )
-                didSetAnyVolume = true
-                continue
-            }
-
-            for channel in 1...max(1, device.outputChannelCount) {
-                guard canSetAudioProperty(
-                    device.id,
-                    selector: kAudioDevicePropertyVolumeScalar,
-                    scope: kAudioDevicePropertyScopeOutput,
-                    element: channel
-                ) else {
-                    continue
-                }
-                try setFloatProperty(
-                    device.id,
-                    selector: kAudioDevicePropertyVolumeScalar,
-                    scope: kAudioDevicePropertyScopeOutput,
-                    element: channel,
-                    value: volume,
-                    operation: "Setting \(device.name) channel \(channel) volume"
-                )
-                didSetAnyVolume = true
-            }
-        }
-        return didSetAnyVolume
-    }
-
     private func areAllMuted(_ devices: [AudioDevice]) -> Bool? {
         let values = devices.compactMap { isMuted($0) }
         guard !values.isEmpty else { return nil }
@@ -702,8 +634,8 @@ final class StudioDisplayAudioManager {
     }
 
     private func isMuted(_ device: AudioDevice) -> Bool? {
-        if let master = getUInt32Property(
-            device.id,
+        if let master: UInt32 = CoreAudioProperty.read(
+            from: device.id,
             selector: kAudioDevicePropertyMute,
             scope: kAudioDevicePropertyScopeOutput,
             element: kAudioObjectPropertyElementMain
@@ -712,11 +644,12 @@ final class StudioDisplayAudioManager {
         }
 
         let channelValues = (1...max(1, device.outputChannelCount)).compactMap { channel -> UInt32? in
-            getUInt32Property(
-                device.id,
+            CoreAudioProperty.read(
+                from: device.id,
                 selector: kAudioDevicePropertyMute,
                 scope: kAudioDevicePropertyScopeOutput,
-                element: channel
+                element: channel,
+                as: UInt32.self
             )
         }
         guard !channelValues.isEmpty else { return nil }
@@ -725,7 +658,12 @@ final class StudioDisplayAudioManager {
 
     private func setMute(_ muted: Bool, for devices: [AudioDevice]) throws {
         for device in devices {
-            let didSetMute = try setMuteIfSupported(muted, for: [device])
+            let didSetMute = try setDevicePropertyIfSupported(
+                UInt32(muted ? 1 : 0),
+                selector: kAudioDevicePropertyMute,
+                label: "mute",
+                for: device
+            )
             if !didSetMute {
                 throw NearfieldError.coreAudio(
                     operation: "Setting \(device.name) mute",
@@ -736,135 +674,62 @@ final class StudioDisplayAudioManager {
     }
 
     @discardableResult
-    private func setMuteIfSupported(_ muted: Bool, for devices: [AudioDevice]) throws -> Bool {
-        let value = UInt32(muted ? 1 : 0)
-        var didSetAnyMute = false
-        for device in devices {
-            if canSetAudioProperty(
-                device.id,
-                selector: kAudioDevicePropertyMute,
-                scope: kAudioDevicePropertyScopeOutput,
-                element: kAudioObjectPropertyElementMain
-            ) {
-                try setUInt32Property(
-                    device.id,
-                    selector: kAudioDevicePropertyMute,
-                    scope: kAudioDevicePropertyScopeOutput,
-                    element: kAudioObjectPropertyElementMain,
-                    value: value,
-                    operation: "Setting \(device.name) mute"
+    private func setDevicePropertyIfSupported<Value: BitwiseCopyable>(
+        _ value: Value,
+        selector: AudioObjectPropertySelector,
+        label: String,
+        for device: AudioDevice
+    ) throws -> Bool {
+        let scope = kAudioDevicePropertyScopeOutput
+        let mainElement = kAudioObjectPropertyElementMain
+        if CoreAudioProperty.isSettable(
+            on: device.id,
+            selector: selector,
+            scope: scope,
+            element: mainElement
+        ) {
+            let status = CoreAudioProperty.write(
+                value,
+                to: device.id,
+                selector: selector,
+                scope: scope,
+                element: mainElement
+            )
+            guard status == noErr else {
+                throw NearfieldError.coreAudio(
+                    operation: "Setting \(device.name) \(label)",
+                    status: status
                 )
-                didSetAnyMute = true
+            }
+            return true
+        }
+
+        var didSetAnyChannel = false
+        for channel in 1...max(1, device.outputChannelCount) {
+            guard CoreAudioProperty.isSettable(
+                on: device.id,
+                selector: selector,
+                scope: scope,
+                element: channel
+            ) else {
                 continue
             }
-
-            for channel in 1...max(1, device.outputChannelCount) {
-                guard canSetAudioProperty(
-                    device.id,
-                    selector: kAudioDevicePropertyMute,
-                    scope: kAudioDevicePropertyScopeOutput,
-                    element: channel
-                ) else {
-                    continue
-                }
-                try setUInt32Property(
-                    device.id,
-                    selector: kAudioDevicePropertyMute,
-                    scope: kAudioDevicePropertyScopeOutput,
-                    element: channel,
-                    value: value,
-                    operation: "Setting \(device.name) channel \(channel) mute"
+            let status = CoreAudioProperty.write(
+                value,
+                to: device.id,
+                selector: selector,
+                scope: scope,
+                element: channel
+            )
+            guard status == noErr else {
+                throw NearfieldError.coreAudio(
+                    operation: "Setting \(device.name) channel \(channel) \(label)",
+                    status: status
                 )
-                didSetAnyMute = true
             }
+            didSetAnyChannel = true
         }
-        return didSetAnyMute
-    }
-
-    private func canSetAudioProperty(
-        _ objectID: AudioObjectID,
-        selector: AudioObjectPropertySelector,
-        scope: AudioObjectPropertyScope,
-        element: AudioObjectPropertyElement
-    ) -> Bool {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
-        guard AudioObjectHasProperty(objectID, &address) else {
-            return false
-        }
-        var isSettable = DarwinBoolean(false)
-        return AudioObjectIsPropertySettable(objectID, &address, &isSettable) == noErr && isSettable.boolValue
-    }
-
-    private func getFloatProperty(
-        _ objectID: AudioObjectID,
-        selector: AudioObjectPropertySelector,
-        scope: AudioObjectPropertyScope,
-        element: AudioObjectPropertyElement
-    ) -> Float32? {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
-        var value = Float32(0)
-        var size = UInt32(MemoryLayout<Float32>.size)
-        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
-        return status == noErr ? value : nil
-    }
-
-    private func getUInt32Property(
-        _ objectID: AudioObjectID,
-        selector: AudioObjectPropertySelector,
-        scope: AudioObjectPropertyScope,
-        element: AudioObjectPropertyElement
-    ) -> UInt32? {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
-        var value = UInt32(0)
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
-        return status == noErr ? value : nil
-    }
-
-    private func setFloatProperty(
-        _ objectID: AudioObjectID,
-        selector: AudioObjectPropertySelector,
-        scope: AudioObjectPropertyScope,
-        element: AudioObjectPropertyElement,
-        value: Float32,
-        operation: String
-    ) throws {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
-        var mutableValue = value
-        let status = AudioObjectSetPropertyData(
-            objectID,
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<Float32>.size),
-            &mutableValue
-        )
-        guard status == noErr else {
-            throw NearfieldError.coreAudio(operation: operation, status: status)
-        }
-    }
-
-    private func setUInt32Property(
-        _ objectID: AudioObjectID,
-        selector: AudioObjectPropertySelector,
-        scope: AudioObjectPropertyScope,
-        element: AudioObjectPropertyElement,
-        value: UInt32,
-        operation: String
-    ) throws {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
-        var mutableValue = value
-        let status = AudioObjectSetPropertyData(
-            objectID,
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<UInt32>.size),
-            &mutableValue
-        )
-        guard status == noErr else {
-            throw NearfieldError.coreAudio(operation: operation, status: status)
-        }
+        return didSetAnyChannel
     }
 
     private func getObjectProperty<T>(_ objectID: AudioObjectID, selector: AudioObjectPropertySelector) -> T? {

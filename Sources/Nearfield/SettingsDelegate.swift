@@ -41,19 +41,72 @@ enum SpatialRoutingChannel: String, Equatable {
 }
 
 @MainActor
-protocol SettingsDelegate: AnyObject {
+protocol SettingsAudioStateProviding: AnyObject {
     func settingsDevices() -> [AudioDevice]
     func settingsRefreshAudioState() async -> Bool
     func settingsMode() -> NearfieldOutputMode
     func settingsLeftDeviceUID() -> String?
+    func settingsNearfieldDriverSelected() -> Bool
+    func settingsFooterStatus() -> String
+    func settingsApplyConfiguration()
+    func settingsPlayTestTone(_ channel: TestToneChannel)
+}
+
+@MainActor
+protocol SettingsPreferencesControlling: AnyObject {
     func settingsOpenAtLogin() -> Bool
     func settingsSetOpenAtLogin(_ enabled: Bool)
     func settingsShowMenuBarApp() -> Bool
     func settingsSetShowMenuBarApp(_ enabled: Bool)
     func settingsDidReachSettingsScreen()
+    func settingsAppVersionText() -> String
+    func settingsBalance() -> Float
+    func settingsSetBalance(_ balance: Float)
+    func settingsSetMode(_ mode: NearfieldOutputMode)
+    func settingsSetLeftDeviceUID(_ uid: String)
+    func settingsSwapAssignment()
+}
+
+struct DriverInstallRequest {
+    let disablesAppRoutingOnFailure: Bool
+    let requiresConfirmation: Bool
+    let presentsErrors: Bool
+    let allowsMissingStudioDisplays: Bool
+
+    static let userInitiated = DriverInstallRequest(
+        disablesAppRoutingOnFailure: false,
+        requiresConfirmation: true,
+        presentsErrors: true,
+        allowsMissingStudioDisplays: false
+    )
+
+    static let enablingAppRouting = DriverInstallRequest(
+        disablesAppRoutingOnFailure: true,
+        requiresConfirmation: true,
+        presentsErrors: true,
+        allowsMissingStudioDisplays: false
+    )
+
+    static func onboarding(allowsMissingStudioDisplays: Bool) -> DriverInstallRequest {
+        DriverInstallRequest(
+            disablesAppRoutingOnFailure: false,
+            requiresConfirmation: false,
+            presentsErrors: false,
+            allowsMissingStudioDisplays: allowsMissingStudioDisplays
+        )
+    }
+}
+
+@MainActor
+protocol SettingsDriverControlling: AnyObject {
     func settingsDriverInstalled() -> Bool
     func settingsIsInstallingDriver() -> Bool
-    func settingsNearfieldDriverSelected() -> Bool
+    func settingsInstallDriver(_ request: DriverInstallRequest)
+    func settingsRemoveEverything()
+}
+
+@MainActor
+protocol SettingsRoutingControlling: AnyObject {
     func settingsAppRoutingEnabled() -> Bool
     func settingsSetAppRoutingEnabled(_ enabled: Bool)
     func settingsAppRoutingAppBundleIDs() -> [String]?
@@ -64,31 +117,18 @@ protocol SettingsDelegate: AnyObject {
     ) -> SpatialRoutingChannel?
     func settingsRoutingRules() -> String
     func settingsSetRoutingRules(_ rules: String)
-    func settingsFooterStatus() -> String
-    func settingsAppVersionText() -> String
-    func settingsBalance() -> Float
-    func settingsSetBalance(_ balance: Float)
-    func settingsSetMode(_ mode: NearfieldOutputMode)
-    func settingsSetLeftDeviceUID(_ uid: String)
-    func settingsSwapAssignment()
-    func settingsApplyConfiguration()
-    func settingsInstallDriver(
-        requiresConfirmation: Bool,
-        presentsErrors: Bool,
-        allowsMissingStudioDisplays: Bool
-    )
-    func settingsRemoveEverything()
-    func settingsPlayTestTone(_ channel: TestToneChannel)
 }
 
 @MainActor
-extension SettingsDelegate {
-    func settingsInstallDriver() {
-        settingsInstallDriver(
-            requiresConfirmation: true,
-            presentsErrors: true,
-            allowsMissingStudioDisplays: false
-        )
-    }
+protocol SettingsDelegate:
+    SettingsAudioStateProviding,
+    SettingsPreferencesControlling,
+    SettingsDriverControlling,
+    SettingsRoutingControlling {}
 
+@MainActor
+extension SettingsDriverControlling {
+    func settingsInstallDriver() {
+        settingsInstallDriver(.userInitiated)
+    }
 }
