@@ -104,6 +104,21 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
+    func testDriverInstallRequestsEncodeOnlySupportedContexts() {
+        XCTAssertTrue(DriverInstallRequest.userInitiated.requiresConfirmation)
+        XCTAssertTrue(DriverInstallRequest.userInitiated.presentsErrors)
+        XCTAssertFalse(DriverInstallRequest.userInitiated.disablesAppRoutingOnFailure)
+        XCTAssertFalse(DriverInstallRequest.userInitiated.allowsMissingStudioDisplays)
+
+        XCTAssertTrue(DriverInstallRequest.enablingAppRouting.disablesAppRoutingOnFailure)
+
+        let onboardingRequest = DriverInstallRequest.onboarding(allowsMissingStudioDisplays: true)
+        XCTAssertFalse(onboardingRequest.requiresConfirmation)
+        XCTAssertFalse(onboardingRequest.presentsErrors)
+        XCTAssertFalse(onboardingRequest.disablesAppRoutingOnFailure)
+        XCTAssertTrue(onboardingRequest.allowsMissingStudioDisplays)
+    }
+
     func testOnboardingCompletesForInstalledDriverWhenMissingDisplaysWereExplicitlyAllowed() {
         XCTAssertTrue(
             NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
