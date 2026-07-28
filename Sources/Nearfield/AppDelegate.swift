@@ -4,10 +4,20 @@ import os
 import ServiceManagement
 #if NEARFIELD_DISTRIBUTION
 import Sparkle
+import UserNotifications
 #endif
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    #if NEARFIELD_DISTRIBUTION
+    private enum UpdateNotification {
+        static let requestIdentifier = "nearfield-update-ready"
+        static let categoryIdentifier = "nearfield-update"
+        static let installActionIdentifier = "nearfield-install-and-relaunch"
+        static let laterActionIdentifier = "nearfield-update-later"
+    }
+    #endif
+
     private enum CoreAudioAvailability: Equatable {
         case checking
         case available
@@ -85,6 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menu = NSMenu()
     #if NEARFIELD_DISTRIBUTION
     private var updaterController: SPUStandardUpdaterController?
+    private var pendingUpdateInstallation: (() -> Void)?
     #endif
     private lazy var balanceMenuView = MenuBalanceRowView(
         value: settingsBalance(),
@@ -154,15 +165,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let bundleURL = Bundle.main.bundleURL.standardizedFileURL.resolvingSymlinksInPath()
         guard isInApplicationsDirectory(bundleURL) else { return }
 
+        configureUpdateNotifications()
         let controller = SPUStandardUpdaterController(
             startingUpdater: true,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
+            updaterDelegate: self,
+            userDriverDelegate: self
         )
         updaterController = controller
 
         guard checkImmediately, controller.updater.automaticallyChecksForUpdates else { return }
         controller.updater.checkForUpdatesInBackground()
+    }
+
+    private func configureUpdateNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        let installAction = UNNotificationAction(
+            identifier: UpdateNotification.installActionIdentifier,
+            title: "Install and Relaunch",
+            options: [.foreground]
+        )
+        let laterAction = UNNotificationAction(
+            identifier: UpdateNotification.laterActionIdentifier,
+            title: "Later",
+            options: []
+        )
+        center.setNotificationCategories([
+            UNNotificationCategory(
+                identifier: UpdateNotification.categoryIdentifier,
+                actions: [installAction, laterAction],
+                intentIdentifiers: [],
+                options: []
+            )
+        ])
+    }
+
+    private func presentUpdateNotification(version: String) {
+        Task {
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            let canNotify: Bool
+            switch settings.authorizationStatus {
+            case .notDetermined:
+                canNotify = (try? await center.requestAuthorization(options: [.alert, .sound])) == true
+            case .authorized, .provisional, .ephemeral:
+                canNotify = settings.alertSetting == .enabled
+            case .denied:
+                canNotify = false
+            @unknown default:
+                canNotify = false
+            }
+
+            guard canNotify else {
+                presentUpdateAlert(version: version)
+                return
+            }
+
+            let content = UNMutableNotificationContent()
+            content.title = "Nearfield \(version) is ready"
+            content.body = "Install the update now and relaunch Nearfield."
+            content.categoryIdentifier = UpdateNotification.categoryIdentifier
+            content.sound = .default
+            let request = UNNotificationRequest(
+                identifier: UpdateNotification.requestIdentifier,
+                content: content,
+                trigger: nil
+            )
+            do {
+                try await center.add(request)
+            } catch {
+                presentUpdateAlert(version: version)
+            }
+        }
+    }
+
+    private func presentUpdateAlert(version: String) {
+        guard pendingUpdateInstallation != nil else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Nearfield \(version) is ready"
+        alert.informativeText = "Install the update now and relaunch Nearfield?"
+        alert.addButton(withTitle: "Install and Relaunch")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            installPendingUpdate()
+        }
+    }
+
+    private func installPendingUpdate() {
+        guard let install = pendingUpdateInstallation else {
+            updaterController?.checkForUpdates(nil)
+            return
+        }
+        dismissUpdateNotification()
+        install()
+    }
+
+    private func handleUpdateNotificationAction(_ actionIdentifier: String) {
+        switch actionIdentifier {
+        case UpdateNotification.installActionIdentifier:
+            installPendingUpdate()
+        case UNNotificationDefaultActionIdentifier:
+            dismissUpdateNotification()
+            NSApp.activate(ignoringOtherApps: true)
+            updaterController?.checkForUpdates(nil)
+        default:
+            break
+        }
+    }
+
+    private func dismissUpdateNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [UpdateNotification.requestIdentifier])
+        center.removeDeliveredNotifications(withIdentifiers: [UpdateNotification.requestIdentifier])
+    }
+
+    private func clearPendingUpdate() {
+        pendingUpdateInstallation = nil
+        dismissUpdateNotification()
+        rebuildMenu()
     }
     #endif
 
@@ -1039,6 +1160,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updatesItem.isEnabled = updaterController.updater.canCheckForUpdates
             menu.addItem(updatesItem)
         }
+        if pendingUpdateInstallation != nil {
+            let installUpdateItem = NSMenuItem(
+                title: "Install Update and Relaunch",
+                action: #selector(installPendingUpdateFromMenu),
+                keyEquivalent: ""
+            )
+            installUpdateItem.target = self
+            menu.addItem(installUpdateItem)
+        }
         #endif
 
         menu.addItem(.separator())
@@ -1063,6 +1193,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     #if NEARFIELD_DISTRIBUTION
     @objc private func checkForUpdates() {
         updaterController?.checkForUpdates(nil)
+    }
+
+    @objc private func installPendingUpdateFromMenu() {
+        installPendingUpdate()
     }
     #endif
 
@@ -1335,6 +1469,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastRuntimeError = nil
     }
 }
+
+#if NEARFIELD_DISTRIBUTION
+extension AppDelegate: SPUUpdaterDelegate {
+    func updater(
+        _ updater: SPUUpdater,
+        willInstallUpdateOnQuit item: SUAppcastItem,
+        immediateInstallationBlock immediateInstallHandler: @escaping () -> Void
+    ) -> Bool {
+        pendingUpdateInstallation = immediateInstallHandler
+        rebuildMenu()
+        presentUpdateNotification(version: item.displayVersionString)
+        return true
+    }
+}
+
+extension AppDelegate: @preconcurrency SPUStandardUserDriverDelegate {
+    var supportsGentleScheduledUpdateReminders: Bool {
+        true
+    }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem,
+        andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        true
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        guard handleShowingUpdate else { return }
+        dismissUpdateNotification()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
+        dismissUpdateNotification()
+    }
+
+    func standardUserDriverWillFinishUpdateSession() {
+        clearPendingUpdate()
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        guard response.notification.request.content.categoryIdentifier == UpdateNotification.categoryIdentifier else {
+            return
+        }
+        let actionIdentifier = response.actionIdentifier
+        await handleUpdateNotificationAction(actionIdentifier)
+    }
+}
+#endif
 
 extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
