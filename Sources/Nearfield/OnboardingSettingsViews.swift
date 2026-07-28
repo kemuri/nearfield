@@ -54,7 +54,11 @@ struct SettingsOnboardingView: View {
                                         model.playTestSound()
                                     }
                                     SettingsDivider()
-                                    ActionSettingRow(title: "Arrangement", buttonTitle: "Swap Channels") {
+                                    ActionSettingRow(
+                                        title: "Arrangement",
+                                        buttonTitle: "Swap Channels",
+                                        enabled: model.canSwapChannels
+                                    ) {
                                         model.swapChannels()
                                     }
                                 }
@@ -236,6 +240,7 @@ private struct ActionSettingRow: View {
     var detail: String?
     let buttonTitle: String
     var destructive = false
+    var enabled = true
     var height: CGFloat = 42
     let action: () -> Void
 
@@ -248,6 +253,7 @@ private struct ActionSettingRow: View {
                 Button(buttonTitle, action: action)
                     .controlSize(.small)
                     .foregroundStyle(destructive ? .red : .primary)
+                    .disabled(!enabled)
             }
 
             if let detail {
