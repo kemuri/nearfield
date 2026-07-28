@@ -504,36 +504,34 @@ private final class OnboardingModel: ObservableObject {
     }
 
     private func recheckLiveInstallEnvironment(allowsMissingStudioDisplays: Bool) {
-        cancelInstallTasks()
-        allowsMissingStudioDisplaysForLiveInstall = allowsMissingStudioDisplays
-        installError = nil
-        installProgressIndex = OnboardingInstallStep.environment.rawValue
+        retryLiveInstall(.environment(allowsMissingStudioDisplays: allowsMissingStudioDisplays))
+    }
 
-        pendingLiveInstallStartTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let isCoreAudioReady = await self.delegate?.settingsRefreshAudioState() ?? false
-            guard !Task.isCancelled else { return }
-            self.pendingLiveInstallStartTask = nil
-            self.refreshFromDelegate()
-            guard isCoreAudioReady else {
-                self.failLiveInstall(with: self.coreAudioUnavailableError(step: .environment))
-                return
-            }
-            guard allowsMissingStudioDisplays || self.liveInstallCanCompleteConfiguration() else {
-                self.failLiveInstall(with: self.studioDisplayRequirementError(step: .environment))
-                return
-            }
+    private func retryLiveRouterConfiguration() {
+        retryLiveInstall(.routerConfiguration)
+    }
 
-            withAnimation(.smooth(duration: 0.24)) {
-                self.installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
+    private enum LiveInstallRetry {
+        case environment(allowsMissingStudioDisplays: Bool)
+        case routerConfiguration
+
+        var step: OnboardingInstallStep {
+            switch self {
+            case .environment:
+                return .environment
+            case .routerConfiguration:
+                return .routingDriver
             }
         }
     }
 
-    private func retryLiveRouterConfiguration() {
+    private func retryLiveInstall(_ retry: LiveInstallRetry) {
         cancelInstallTasks()
+        if case .environment(let allowsMissingStudioDisplays) = retry {
+            allowsMissingStudioDisplaysForLiveInstall = allowsMissingStudioDisplays
+        }
         installError = nil
-        installProgressIndex = OnboardingInstallStep.routingDriver.rawValue
+        installProgressIndex = retry.step.rawValue
 
         pendingLiveInstallStartTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -542,17 +540,28 @@ private final class OnboardingModel: ObservableObject {
             self.pendingLiveInstallStartTask = nil
             self.refreshFromDelegate()
             guard isCoreAudioReady else {
-                self.failLiveInstall(with: self.coreAudioUnavailableError(step: .routingDriver))
-                return
-            }
-            guard self.liveInstallCanCompleteConfiguration() else {
-                self.failLiveInstall(with: self.studioDisplayRequirementError(step: .routingDriver))
+                self.failLiveInstall(with: self.coreAudioUnavailableError(step: retry.step))
                 return
             }
 
-            self.liveInstallRequestedAt = Date()
-            self.delegate?.settingsApplyConfiguration()
-            self.startLiveInstallSequence()
+            switch retry {
+            case .environment(let allowsMissingStudioDisplays):
+                guard allowsMissingStudioDisplays || self.liveInstallCanCompleteConfiguration() else {
+                    self.failLiveInstall(with: self.studioDisplayRequirementError(step: retry.step))
+                    return
+                }
+                withAnimation(.smooth(duration: 0.24)) {
+                    self.installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
+                }
+            case .routerConfiguration:
+                guard self.liveInstallCanCompleteConfiguration() else {
+                    self.failLiveInstall(with: self.studioDisplayRequirementError(step: retry.step))
+                    return
+                }
+                self.liveInstallRequestedAt = Date()
+                self.delegate?.settingsApplyConfiguration()
+                self.startLiveInstallSequence()
+            }
         }
     }
 
@@ -852,9 +861,9 @@ private final class OnboardingModel: ObservableObject {
         }
         liveInstallRequestedAt = Date()
         delegate?.settingsInstallDriver(
-            requiresConfirmation: false,
-            presentsErrors: false,
-            allowsMissingStudioDisplays: allowsMissingStudioDisplaysForLiveInstall
+            .onboarding(
+                allowsMissingStudioDisplays: allowsMissingStudioDisplaysForLiveInstall
+            )
         )
         startLiveInstallSequence()
     }
@@ -878,7 +887,7 @@ private final class OnboardingModel: ObservableObject {
                     continue
                 }
 
-                if NearfieldActivationPolicy.shouldCompleteOnboardingAfterDriverInstall(
+                if NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                     driverInstalled: self.driverInstalled,
                     routerSelected: self.nearfieldDriverSelected,
                     studioDisplayCount: self.studioDisplayCount,
@@ -927,7 +936,7 @@ private final class OnboardingModel: ObservableObject {
     }
 
     private func liveInstallCanCompleteConfiguration() -> Bool {
-        NearfieldActivationPolicy.shouldConfigureRouterAfterDriverInstall(
+        NearfieldRouterPolicy.shouldConfigureRouterAfterDriverInstall(
             studioDisplayCount: studioDisplayCount
         )
     }

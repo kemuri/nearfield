@@ -5260,6 +5260,7 @@ OSStatus ProxyAudioDevice::WillDoIOOperation(AudioServerPlugInDriverRef inDriver
                                              Boolean *outWillDoInPlace) {
     //    This method returns whether or not the device will do a given IO operation. For this device,
     //    we only support reading input data and writing output data.
+    (void)inClientID;
 
     //    declare the local variables
     OSStatus theAnswer = 0;
