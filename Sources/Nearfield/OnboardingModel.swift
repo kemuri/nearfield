@@ -388,6 +388,10 @@ final class OnboardingModel: ObservableObject {
         delegate?.settingsPlayTestTone(.stereo)
     }
 
+    var canSwapChannels: Bool {
+        studioDisplayCount >= 2 && !isInstallingDriver
+    }
+
     func swapChannels() {
         delegate?.settingsSwapAssignment()
         refreshFromDelegate()
