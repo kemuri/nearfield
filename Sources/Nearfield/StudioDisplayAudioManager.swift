@@ -5,26 +5,6 @@ struct NearfieldState {
     let detectedDisplays: [AudioDevice]
     let aggregateDeviceID: AudioObjectID?
     let isAggregateDefaultOutput: Bool
-
-    var headline: String {
-        if detectedDisplays.count < 2 {
-            return "Connect two Studio Displays"
-        }
-        if isAggregateDefaultOutput {
-            return "Nearfield is active"
-        }
-        if aggregateDeviceID != nil {
-            return "Nearfield is ready"
-        }
-        return "Two Studio Displays found"
-    }
-
-    var details: String {
-        if detectedDisplays.isEmpty {
-            return "No Studio Display speakers found"
-        }
-        return detectedDisplays.map(\.name).joined(separator: " + ")
-    }
 }
 
 struct StudioDisplayConnectionStatus: Equatable {
@@ -179,13 +159,6 @@ final class StudioDisplayAudioManager {
 
     func hasManagedNearfieldAggregates() -> Bool {
         !managedNearfieldAggregates().isEmpty
-    }
-
-    func selectDeviceAsDefaultOutput(uid: String) throws {
-        guard let device = device(matchingUID: uid) else {
-            throw NearfieldError.aggregateMissing
-        }
-        try setDefaultOutputDevice(device.id)
     }
 
     func isDefaultOutputDevice(uid: String) -> Bool {
