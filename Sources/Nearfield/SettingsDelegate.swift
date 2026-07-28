@@ -70,6 +70,7 @@ protocol SettingsDelegate: AnyObject {
     func settingsSetBalance(_ balance: Float)
     func settingsSetMode(_ mode: NearfieldOutputMode)
     func settingsSetLeftDeviceUID(_ uid: String)
+    func settingsSwapAssignment()
     func settingsApplyConfiguration()
     func settingsInstallDriver(
         requiresConfirmation: Bool,
@@ -90,19 +91,4 @@ extension SettingsDelegate {
         )
     }
 
-    func settingsInstallDriver(requiresConfirmation: Bool) {
-        settingsInstallDriver(
-            requiresConfirmation: requiresConfirmation,
-            presentsErrors: true,
-            allowsMissingStudioDisplays: false
-        )
-    }
-
-    func settingsInstallDriver(requiresConfirmation: Bool, presentsErrors: Bool) {
-        settingsInstallDriver(
-            requiresConfirmation: requiresConfirmation,
-            presentsErrors: presentsErrors,
-            allowsMissingStudioDisplays: false
-        )
-    }
 }
