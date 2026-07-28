@@ -6262,27 +6262,28 @@ void ProxyAudioDevice::setTargetAggregateDevices(CFStringRef deviceUIDs) {
         return;
     }
 
-    Boolean shouldRebuild = false;
+    Boolean devicesChanged = false;
     {
         CAMutex::Locker locker(&stateMutex);
-        const bool devicesChanged = !targetAggregateDevicesString ||
+        devicesChanged = !targetAggregateDevicesString ||
             CFStringCompare(targetAggregateDevicesString, deviceUIDs, 0) != kCFCompareEqualTo;
-        if (devicesChanged && targetAggregateDevicesString) {
-            CFRelease(targetAggregateDevicesString);
-        }
         if (devicesChanged) {
+            if (targetAggregateDevicesString) {
+                CFRelease(targetAggregateDevicesString);
+            }
             targetAggregateDevicesString = CFStringCreateCopy(NULL, deviceUIDs);
             gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateDevices"), targetAggregateDevicesString);
         }
-        shouldRebuild = true;
     }
 
-    if (!shouldRebuild) {
-        return;
-    }
-
+    // Only force a teardown when the target devices actually changed. The
+    // configurator re-sends the same UIDs on every audio state change, and
+    // destroying a live aggregate each time churns the CoreAudio device list,
+    // which in turn triggers another state change. Passing false lets
+    // rebuildDriverOwnedTargetAggregate adopt the existing aggregate, or build
+    // one if it is missing.
     ExecuteInAudioOutputThread(^{
-        rebuildDriverOwnedTargetAggregate(true);
+        rebuildDriverOwnedTargetAggregate(devicesChanged);
         setupTargetOutputDevice();
     });
 }
