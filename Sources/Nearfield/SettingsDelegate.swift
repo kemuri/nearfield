@@ -67,33 +67,38 @@ protocol SettingsPreferencesControlling: AnyObject {
     func settingsSwapAssignment()
 }
 
-struct DriverInstallRequest {
-    let disablesAppRoutingOnFailure: Bool
-    let requiresConfirmation: Bool
-    let presentsErrors: Bool
-    let allowsMissingStudioDisplays: Bool
+enum DriverInstallRequest: Equatable {
+    case userInitiated
+    case enablingAppRouting
+    case onboarding(allowsMissingStudioDisplays: Bool)
 
-    static let userInitiated = DriverInstallRequest(
-        disablesAppRoutingOnFailure: false,
-        requiresConfirmation: true,
-        presentsErrors: true,
-        allowsMissingStudioDisplays: false
-    )
+    var disablesAppRoutingOnFailure: Bool {
+        self == .enablingAppRouting
+    }
 
-    static let enablingAppRouting = DriverInstallRequest(
-        disablesAppRoutingOnFailure: true,
-        requiresConfirmation: true,
-        presentsErrors: true,
-        allowsMissingStudioDisplays: false
-    )
+    var requiresConfirmation: Bool {
+        switch self {
+        case .userInitiated, .enablingAppRouting:
+            true
+        case .onboarding:
+            false
+        }
+    }
 
-    static func onboarding(allowsMissingStudioDisplays: Bool) -> DriverInstallRequest {
-        DriverInstallRequest(
-            disablesAppRoutingOnFailure: false,
-            requiresConfirmation: false,
-            presentsErrors: false,
-            allowsMissingStudioDisplays: allowsMissingStudioDisplays
-        )
+    var presentsErrors: Bool {
+        switch self {
+        case .userInitiated, .enablingAppRouting:
+            true
+        case .onboarding:
+            false
+        }
+    }
+
+    var allowsMissingStudioDisplays: Bool {
+        guard case .onboarding(let allowsMissingStudioDisplays) = self else {
+            return false
+        }
+        return allowsMissingStudioDisplays
     }
 }
 
