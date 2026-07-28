@@ -33,6 +33,41 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertEqual(volumes.right, 0.005, accuracy: 0.0001)
     }
 
+    func testRouterVolumeContinuityPreservesVirtualVolumeAcrossTransientDeviceSwitch() {
+        var continuity = RouterVolumeContinuity()
+        continuity.observe(0.6)
+
+        let activationVolume = continuity.activationVolume(
+            currentRouterVolume: nil,
+            capturedDisplayVolume: 1
+        )
+
+        XCTAssertEqual(activationVolume, 0.6)
+    }
+
+    func testRouterVolumeContinuityUsesDisplayVolumeForFirstActivation() {
+        let continuity = RouterVolumeContinuity()
+
+        let activationVolume = continuity.activationVolume(
+            currentRouterVolume: nil,
+            capturedDisplayVolume: 0.4
+        )
+
+        XCTAssertEqual(activationVolume, 0.4)
+    }
+
+    func testRouterVolumeContinuityPrefersCurrentVirtualVolume() {
+        var continuity = RouterVolumeContinuity()
+        continuity.observe(0.6)
+
+        let activationVolume = continuity.activationVolume(
+            currentRouterVolume: 0.35,
+            capturedDisplayVolume: 1
+        )
+
+        XCTAssertEqual(activationVolume, 0.35)
+    }
+
     func testSettingsHeaderAnimationRunsAtOneThirdOnboardingSpeed() {
         XCTAssertEqual(
             NearfieldHeaderAnimationConfiguration.settings.animationSpeed,

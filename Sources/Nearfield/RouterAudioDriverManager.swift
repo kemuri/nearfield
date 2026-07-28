@@ -117,6 +117,15 @@ final class RouterAudioDriverManager {
         routerDeviceID() == defaultOutputDeviceID()
     }
 
+    func currentBaseVolume() -> Float32? {
+        guard let controls = volumeControlIDs(),
+              let left = volumeControlValue(controls.left),
+              let right = volumeControlValue(controls.right) else {
+            return nil
+        }
+        return max(left, right)
+    }
+
     func setBalance(_ balance: Float32) throws {
         guard let controls = volumeControlIDs() else {
             throw RouterAudioDriverError.notInstalled

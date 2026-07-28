@@ -26,6 +26,7 @@ extension AppDelegate {
     }
 
     func configureRouterDriver(activate: Bool = true) throws {
+        let currentRouterVolume = currentRouterVolumeForContinuity()
         try cleanupNearfieldTargetsIfNeeded(scope: .appOwned)
 
         let routingState = currentRouterRoutingState()
@@ -41,8 +42,13 @@ extension AppDelegate {
         lastAppliedRouterRouteRules = routingState.rules
         if activate {
             let capturedDisplayState = try prepareDisplaysForVirtualOutputActivation()
-            if let activationVolume = averageCapturedDisplayVolume(capturedDisplayState) {
+            let capturedDisplayVolume = averageCapturedDisplayVolume(capturedDisplayState)
+            if let activationVolume = routerVolumeContinuity.activationVolume(
+                currentRouterVolume: currentRouterVolume,
+                capturedDisplayVolume: capturedDisplayVolume
+            ) {
                 try routerDriverManager.setBalancedVolume(activationVolume, balance: currentBalance())
+                routerVolumeContinuity.observe(activationVolume)
             } else {
                 try routerDriverManager.setBalance(currentBalance())
             }
@@ -52,6 +58,18 @@ extension AppDelegate {
             try restoreDisplaysAfterProxyDeactivation()
         }
         updateDynamicRoutingRulesLifecycle()
+    }
+
+    func currentRouterVolumeForContinuity() -> Float32? {
+        let isContinuingExistingSession =
+            proxyPreparedDisplayState != nil ||
+            routerDriverManager.isRouterDefaultOutput() ||
+            routerVolumeContinuity.lastKnownVolume != nil
+        guard isContinuingExistingSession else { return nil }
+
+        let currentVolume = routerDriverManager.currentBaseVolume()
+        routerVolumeContinuity.observe(currentVolume)
+        return currentVolume
     }
 
     func performSynchronizedAudioUpdate(_ work: () throws -> Void) rethrows {
@@ -114,6 +132,7 @@ extension AppDelegate {
         dynamicRoutingRulesTask?.cancel()
         dynamicRoutingRulesTask = nil
         lastAppliedRouterRouteRules = nil
+        _ = currentRouterVolumeForContinuity()
 
         if nearfieldVirtualOutputIsDefaultOutput(state: state) {
             shouldReactivateVirtualOutputAfterDisplayReconnect = true

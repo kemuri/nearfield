@@ -43,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var isInstallingDriver = false
     var audioStateSynchronizationDepth = 0
     var proxyPreparedDisplayState: [DisplayOutputState]?
+    var routerVolumeContinuity = RouterVolumeContinuity()
     var pendingAudioStateChangeTask: Task<Void, Never>?
     var dynamicRoutingRulesTask: Task<Void, Never>?
     var dynamicRoutingNotificationObservers: [NSObjectProtocol] = []
