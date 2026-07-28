@@ -25,9 +25,9 @@ enum RouterAudioDriverError: LocalizedError {
 }
 
 final class RouterAudioDriverManager {
-    static let routerDeviceUID = "NearfieldAudioDevice_UID"
-    static let driverTargetAggregateUID = "com.kemuri.Nearfield.DriverTargetAggregate"
-    private static let routerBoxUID = "NearfieldAudioBox_UID"
+    static let routerDeviceUID = NearfieldAudioIdentifiers.routerDeviceUID
+    static let driverTargetAggregateUID = NearfieldAudioIdentifiers.driverTargetAggregateUID
+    private static let routerBoxUID = NearfieldAudioIdentifiers.routerBoxUID
 
     private enum ConfigType: Int32 {
         case outputDevice = 1
@@ -94,19 +94,10 @@ final class RouterAudioDriverManager {
         guard let boxID = routerBoxID() else {
             throw RouterAudioDriverError.notInstalled
         }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioBoxPropertyAcquired,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var value = UInt32(published ? 1 : 0)
-        let status = AudioObjectSetPropertyData(
-            boxID,
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<UInt32>.size),
-            &value
+        let status = CoreAudioProperty.write(
+            UInt32(published ? 1 : 0),
+            to: boxID,
+            selector: kAudioBoxPropertyAcquired
         )
         guard status == noErr else {
             throw RouterAudioDriverError.configurationFailed("devicePublished", status)
@@ -246,19 +237,10 @@ final class RouterAudioDriverManager {
     }
 
     private func setIdentifyValue(_ value: Int32, boxID: AudioObjectID, setting: String) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyIdentify,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var mutableValue = value
-        let status = AudioObjectSetPropertyData(
-            boxID,
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<Int32>.size),
-            &mutableValue
+        let status = CoreAudioProperty.write(
+            value,
+            to: boxID,
+            selector: kAudioObjectPropertyIdentify
         )
         guard status == noErr else {
             throw RouterAudioDriverError.configurationFailed(setting, status)
@@ -266,19 +248,10 @@ final class RouterAudioDriverManager {
     }
 
     private func setDefaultDevice(_ deviceID: AudioObjectID, selector: AudioObjectPropertySelector) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var mutableID = deviceID
-        let status = AudioObjectSetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<AudioObjectID>.size),
-            &mutableID
+        let status = CoreAudioProperty.write(
+            deviceID,
+            to: AudioObjectID(kAudioObjectSystemObject),
+            selector: selector
         )
         guard status == noErr else {
             throw RouterAudioDriverError.defaultOutputFailed(status)
@@ -294,19 +267,10 @@ final class RouterAudioDriverManager {
     }
 
     private func setVolumeControl(_ controlID: AudioObjectID, value: Float32, channel: String) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioLevelControlPropertyScalarValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var mutableValue = value
-        let status = AudioObjectSetPropertyData(
-            controlID,
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<Float32>.size),
-            &mutableValue
+        let status = CoreAudioProperty.write(
+            value,
+            to: controlID,
+            selector: kAudioLevelControlPropertyScalarValue
         )
         guard status == noErr else {
             throw RouterAudioDriverError.balanceFailed(channel, status)
@@ -314,34 +278,21 @@ final class RouterAudioDriverManager {
     }
 
     private func volumeControlValue(_ controlID: AudioObjectID) -> Float32? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioLevelControlPropertyScalarValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+        CoreAudioProperty.read(
+            from: controlID,
+            selector: kAudioLevelControlPropertyScalarValue,
+            as: Float32.self
         )
-        var value = Float32(0)
-        var dataSize = UInt32(MemoryLayout<Float32>.size)
-        let status = AudioObjectGetPropertyData(controlID, &address, 0, nil, &dataSize, &value)
-        return status == noErr ? value : nil
     }
 
     private func setMuted(_ muted: Bool) throws {
         guard let controlID = muteControlID() else {
             throw RouterAudioDriverError.notInstalled
         }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioBooleanControlPropertyValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var value = UInt32(muted ? 1 : 0)
-        let status = AudioObjectSetPropertyData(
-            controlID,
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<UInt32>.size),
-            &value
+        let status = CoreAudioProperty.write(
+            UInt32(muted ? 1 : 0),
+            to: controlID,
+            selector: kAudioBooleanControlPropertyValue
         )
         guard status == noErr else {
             throw RouterAudioDriverError.balanceFailed("mute", status)
@@ -350,15 +301,11 @@ final class RouterAudioDriverManager {
 
     private func isMuted() -> Bool {
         guard let controlID = muteControlID() else { return false }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioBooleanControlPropertyValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+        let value: UInt32? = CoreAudioProperty.read(
+            from: controlID,
+            selector: kAudioBooleanControlPropertyValue
         )
-        var value = UInt32(0)
-        var dataSize = UInt32(MemoryLayout<UInt32>.size)
-        let status = AudioObjectGetPropertyData(controlID, &address, 0, nil, &dataSize, &value)
-        return status == noErr && value != 0
+        return value.map { $0 != 0 } ?? false
     }
 
     private func volumeControlIDs() -> (left: AudioObjectID, right: AudioObjectID)? {
@@ -413,15 +360,11 @@ final class RouterAudioDriverManager {
     }
 
     private func getUInt32Property(_ objectID: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+        CoreAudioProperty.read(
+            from: objectID,
+            selector: selector,
+            as: UInt32.self
         )
-        var value = UInt32(0)
-        var dataSize = UInt32(MemoryLayout<UInt32>.size)
-        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &dataSize, &value)
-        return status == noErr ? value : nil
     }
 
     private func defaultOutputDeviceID() -> AudioObjectID? {
@@ -429,15 +372,11 @@ final class RouterAudioDriverManager {
     }
 
     private func defaultDeviceID(selector: AudioObjectPropertySelector) -> AudioObjectID? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+        let id: AudioObjectID? = CoreAudioProperty.read(
+            from: AudioObjectID(kAudioObjectSystemObject),
+            selector: selector
         )
-        var id = AudioObjectID(0)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id)
-        return status == noErr && id != 0 ? id : nil
+        return id.flatMap { $0 == 0 ? nil : $0 }
     }
 
     private func audioObjectID(forUID uid: String, selector: AudioObjectPropertySelector) -> AudioObjectID? {
