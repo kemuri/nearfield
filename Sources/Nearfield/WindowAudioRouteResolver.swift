@@ -3,10 +3,7 @@ import CoreGraphics
 
 @MainActor
 final class WindowAudioRouteResolver {
-    private struct Rule {
-        let bundleID: String
-        let destination: String
-    }
+    private typealias Rule = AppRoutingRule
 
     private struct DisplayTarget {
         let route: String
@@ -79,16 +76,7 @@ final class WindowAudioRouteResolver {
     }
 
     private func parseRules(_ rules: String) -> [Rule] {
-        rules
-            .split { $0 == ";" || $0 == "\n" }
-            .compactMap { rawRule in
-                let parts = rawRule.split(separator: "=", maxSplits: 1)
-                guard parts.count == 2 else { return nil }
-                let bundleID = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let destination = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !bundleID.isEmpty, !destination.isEmpty else { return nil }
-                return Rule(bundleID: bundleID, destination: destination)
-            }
+        AppRoutingRules.parse(rules)
     }
 
     private func normalizedDestination(_ destination: String) -> String {
@@ -96,13 +84,7 @@ final class WindowAudioRouteResolver {
     }
 
     private func isWindowScopedDestination(_ destination: String) -> Bool {
-        let normalized = normalizedDestination(destination)
-        return normalized == "window" ||
-            normalized == "screen" ||
-            normalized == "display" ||
-            normalized.hasPrefix("window:") ||
-            normalized.hasPrefix("screen:") ||
-            normalized.hasPrefix("display:")
+        AppRoutingRules.isWindowScopedDestination(destination)
     }
 
     private func windowScopedSourceBundleID(for rule: Rule) -> String {
