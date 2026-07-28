@@ -122,7 +122,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
 
 - (bool)setupListenerForCurrentAudioDevices {
     AudioObjectPropertyAddress listenerPropertyAddress = {
-        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster};
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     OSStatus err =
         AudioObjectAddPropertyListener(kAudioObjectSystemObject, &listenerPropertyAddress, &onDevicesChanged, (__bridge_retained void *)self);
 
