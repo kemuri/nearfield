@@ -48,6 +48,7 @@ struct InstallOnboardingView: View {
                         step: step,
                         state: model.installStepState(for: step),
                         pendingOpacity: model.pendingInstallStepOpacity(for: step),
+                        isInstallingDriver: model.isInstallingDriver,
                         requestAccess: model.requestDriverInstallApproval,
                         retry: model.retryCurrentInstallStep
                     )
@@ -68,6 +69,7 @@ private struct InstallStepRow: View {
     let step: OnboardingInstallStep
     let state: OnboardingInstallStepState
     let pendingOpacity: Double
+    let isInstallingDriver: Bool
     let requestAccess: () -> Void
     let retry: (Bool) -> Void
 
@@ -98,7 +100,7 @@ private struct InstallStepRow: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
-                        if step == .approveDriver {
+                        if step == .approveDriver, !isInstallingDriver {
                             InstallPermissionButton(title: "Request Access", action: requestAccess)
                                 .padding(.top, 7)
                         }
@@ -181,7 +183,7 @@ private struct InstallStepRow: View {
 
     private var activeRowHeight: CGFloat {
         if step == .approveDriver {
-            return 124
+            return isInstallingDriver ? 65 : 124
         }
         return step.activeDetail.contains("\n") ? 65 : 54
     }

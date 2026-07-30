@@ -9,10 +9,11 @@ extension AppDelegate {
             studioDisplayCount: studioDisplayCount,
             allowsMissingStudioDisplays: request.allowsMissingStudioDisplays
         ) else {
-            finishDriverInstallAttempt(disableAppRouting: request.disablesAppRoutingOnFailure)
-            handleDriverInstallError(
-                NearfieldError.notEnoughStudioDisplays(studioDisplayCount),
-                presentsErrors: request.presentsErrors
+            let error = NearfieldError.notEnoughStudioDisplays(studioDisplayCount)
+            failDriverInstallAttempt(
+                error,
+                stage: .preparation,
+                request: request
             )
             return
         }
@@ -23,38 +24,103 @@ extension AppDelegate {
                 title: isReinstall ? "Reinstall Nearfield Driver?" : "Install Nearfield Driver?",
                 message: "Nearfield will install NearfieldAudioDevice.driver into /Library/Audio/Plug-Ins/HAL. macOS should ask for an administrator password before installing it."
             ) else {
-                finishDriverInstallAttempt(disableAppRouting: request.disablesAppRoutingOnFailure)
+                finishDriverInstallAttempt(
+                    disableAppRouting: request.disablesAppRoutingOnFailure,
+                    state: .idle
+                )
                 return
             }
         }
         isInstallingDriver = true
+        driverInstallState = .installing(.preparation)
+        clearRecoverableError()
         refreshStatus()
 
         Task { [weak self] in
             guard let self else { return }
+
+            let driverPath: String
             do {
-                let driverPath = try await Task.detached(priority: .userInitiated) {
+                driverPath = try await Task.detached(priority: .userInitiated) {
                     try DriverInstaller().buildRouterDriver()
                 }.value
+            } catch {
+                self.failDriverInstallAttempt(error, stage: .preparation, request: request)
+                return
+            }
+
+            self.driverInstallState = .installing(.authorizationAndInstallation)
+            self.refreshStatus()
+            do {
                 try await Task.detached(priority: .userInitiated) {
                     try DriverInstaller().installBuiltRouterDriver(at: driverPath)
                 }.value
-                self.invalidateCoreAudioReadiness()
-                guard await self.waitForRouterDriverAfterCoreAudioRestart() else {
-                    throw RouterAudioDriverError.notInstalled
+            } catch {
+                self.restorePrimaryWindowFocusAfterPrivilegedInstall()
+                let stage: DriverInstallFailureStage
+                if let installerError = error as? DriverInstallerError,
+                   case .authorizationCancelled = installerError {
+                    stage = .authorization
+                } else {
+                    stage = .installation
                 }
+                self.failDriverInstallAttempt(error, stage: stage, request: request)
+                return
+            }
+            self.restorePrimaryWindowFocusAfterPrivilegedInstall()
+
+            let currentDriverIsInstalledOnDisk =
+                await DriverInstaller.waitForCurrentRouterDriverOnDisk()
+            guard currentDriverIsInstalledOnDisk else {
+                self.failDriverInstallAttempt(
+                    RouterAudioDriverError.notInstalled,
+                    stage: .installation,
+                    request: request
+                )
+                return
+            }
+
+            self.driverInstallState = .installing(.activation)
+            self.refreshStatus()
+            self.invalidateCoreAudioReadiness()
+            self.audioManager.invalidateCachedDevices()
+            if NearfieldRouterPolicy.shouldCompleteDriverInstallWithoutActivation(
+                currentDriverIsInstalledOnDisk: currentDriverIsInstalledOnDisk,
+                allowsMissingStudioDisplays: request.allowsMissingStudioDisplays
+            ) {
+                self.clearRecoverableError()
+                self.finishDriverInstallAttempt(
+                    disableAppRouting: false,
+                    state: .succeeded
+                )
+                return
+            }
+
+            guard await self.waitForRouterDriverAfterCoreAudioRestart() else {
+                self.failDriverInstallAttempt(
+                    RouterAudioDriverError.notInstalled,
+                    stage: .activation,
+                    request: request
+                )
+                return
+            }
+
+            self.driverInstallState = .installing(.configuration)
+            self.refreshStatus()
+            do {
                 try await self.configureRouterDriverAfterInstall(
                     allowsMissingStudioDisplays: request.allowsMissingStudioDisplays
                 )
                 _ = await self.refreshCachedAudioState()
             } catch {
-                self.finishDriverInstallAttempt(
-                    disableAppRouting: request.disablesAppRoutingOnFailure
-                )
-                self.handleDriverInstallError(error, presentsErrors: request.presentsErrors)
+                self.failDriverInstallAttempt(error, stage: .configuration, request: request)
                 return
             }
-            self.finishDriverInstallAttempt(disableAppRouting: false)
+            self.clearRecoverableError()
+            self.finishDriverInstallAttempt(
+                disableAppRouting: false,
+                state: .succeeded
+            )
         }
     }
 
@@ -66,13 +132,38 @@ extension AppDelegate {
         }
     }
 
-    func finishDriverInstallAttempt(disableAppRouting: Bool) {
+    func failDriverInstallAttempt(
+        _ error: Error,
+        stage: DriverInstallFailureStage,
+        request: DriverInstallRequest
+    ) {
+        finishDriverInstallAttempt(
+            disableAppRouting: request.disablesAppRoutingOnFailure,
+            state: .failed(
+                DriverInstallFailure(
+                    stage: stage,
+                    message: error.localizedDescription
+                )
+            )
+        )
+        handleDriverInstallError(error, presentsErrors: request.presentsErrors)
+    }
+
+    func finishDriverInstallAttempt(
+        disableAppRouting: Bool,
+        state: DriverInstallState
+    ) {
         if disableAppRouting {
             NearfieldPreferences.setAppRoutingEnabled(false)
         }
+        driverInstallState = state
         isInstallingDriver = false
         updateDynamicRoutingRulesLifecycle()
         refreshStatus()
+    }
+
+    func restorePrimaryWindowFocusAfterPrivilegedInstall() {
+        onboardingWindowController?.show()
     }
 
     func configureRouterDriverAfterInstall(

@@ -20,17 +20,21 @@ enum NearfieldRouterPolicy {
         )
     }
 
+    static func shouldCompleteDriverInstallWithoutActivation(
+        currentDriverIsInstalledOnDisk: Bool,
+        allowsMissingStudioDisplays: Bool
+    ) -> Bool {
+        currentDriverIsInstalledOnDisk &&
+            allowsMissingStudioDisplays
+    }
+
     static func shouldCompleteOnboardingAfterDriverInstall(
         driverInstalled: Bool,
         routerSelected: Bool,
-        studioDisplayCount: Int,
         allowsMissingStudioDisplays: Bool
     ) -> Bool {
         guard driverInstalled else { return false }
-        return routerSelected || (
-            allowsMissingStudioDisplays &&
-                !shouldConfigureRouterAfterDriverInstall(studioDisplayCount: studioDisplayCount)
-        )
+        return routerSelected || allowsMissingStudioDisplays
     }
 
     static func shouldPublishRouter(studioDisplayCount: Int) -> Bool {

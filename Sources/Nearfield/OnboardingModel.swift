@@ -39,17 +39,65 @@ enum OnboardingInstallStep: Int, CaseIterable {
         case .approveDriver:
             "Nearfield requires admin privileges to install HAL\nDrivers"
         case .routingDriver:
-            "Preparing the virtual output driver"
+            "Preparing the virtual output driver\nThis step can take a while."
         case .appRouting:
             "Enabling App Audio Routing controls"
         }
     }
 }
 
-struct OnboardingInstallError {
+struct OnboardingInstallError: Equatable {
     let step: OnboardingInstallStep
     let title: String
     let message: String
+}
+
+extension DriverInstallFailure {
+    var onboardingError: OnboardingInstallError {
+        switch stage {
+        case .authorization:
+            OnboardingInstallError(
+                step: .approveDriver,
+                title: "Permissions Not Granted",
+                message: message
+            )
+        case .preparation:
+            OnboardingInstallError(
+                step: .approveDriver,
+                title: "Could Not Prepare Driver",
+                message: message
+            )
+        case .installation:
+            OnboardingInstallError(
+                step: .routingDriver,
+                title: "Could Not Install Driver",
+                message: message
+            )
+        case .activation:
+            OnboardingInstallError(
+                step: .routingDriver,
+                title: "Driver Did Not Become Available",
+                message: message
+            )
+        case .configuration:
+            OnboardingInstallError(
+                step: .routingDriver,
+                title: "Could Not Configure Nearfield",
+                message: message
+            )
+        }
+    }
+}
+
+extension DriverInstallPhase {
+    var onboardingStep: OnboardingInstallStep {
+        switch self {
+        case .preparation, .authorizationAndInstallation:
+            .approveDriver
+        case .activation, .configuration:
+            .routingDriver
+        }
+    }
 }
 
 enum OnboardingInstallScenario {
@@ -97,6 +145,7 @@ final class OnboardingModel: ObservableObject {
     @Published var balance: Double = 0
     @Published var driverInstalled = false
     @Published var isInstallingDriver = false
+    @Published var driverInstallState: DriverInstallState = .idle
     @Published var nearfieldDriverSelected = false
     @Published var appVersionText = "Version 0.1.0"
     @Published var studioDisplayCount = 0
@@ -137,6 +186,7 @@ final class OnboardingModel: ObservableObject {
         balance = Double(delegate.settingsBalance())
         let installingDriver = delegate.settingsIsInstallingDriver()
         isInstallingDriver = installingDriver
+        driverInstallState = delegate.settingsDriverInstallState()
         if !installingDriver {
             driverInstalled = delegate.settingsDriverInstalled()
             nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
@@ -297,8 +347,18 @@ final class OnboardingModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self.pendingLiveInstallStartTask = nil
             self.refreshFromDelegate()
-            guard isCoreAudioReady else {
+            let canFinishForcedInstallWithoutCoreAudio =
+                NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
+                    driverInstalled: self.driverInstalled,
+                    routerSelected: self.nearfieldDriverSelected,
+                    allowsMissingStudioDisplays: self.allowsMissingStudioDisplaysForLiveInstall
+                )
+            guard isCoreAudioReady || canFinishForcedInstallWithoutCoreAudio else {
                 self.failLiveInstall(with: self.coreAudioUnavailableError(step: retry.step))
+                return
+            }
+            if canFinishForcedInstallWithoutCoreAudio {
+                self.runLiveInstallFlow()
                 return
             }
 
@@ -308,15 +368,14 @@ final class OnboardingModel: ObservableObject {
                     self.failLiveInstall(with: self.studioDisplayRequirementError(step: retry.step))
                     return
                 }
-                withAnimation(.smooth(duration: 0.24)) {
-                    self.installProgressIndex = OnboardingInstallStep.approveDriver.rawValue
-                }
+                self.runLiveInstallFlow()
             case .routerConfiguration:
                 guard self.liveInstallCanCompleteConfiguration() else {
                     self.failLiveInstall(with: self.studioDisplayRequirementError(step: retry.step))
                     return
                 }
                 self.liveInstallRequestedAt = Date()
+                self.delegate?.settingsResetDriverInstallState()
                 self.delegate?.settingsApplyConfiguration()
                 self.startLiveInstallSequence()
             }
@@ -566,14 +625,24 @@ final class OnboardingModel: ObservableObject {
         installProgressIndex = driverInstalled ? OnboardingInstallStep.appRouting.rawValue : 0
 
         if driverInstalled {
-            if nearfieldDriverSelected {
+            if NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
+                driverInstalled: driverInstalled,
+                routerSelected: nearfieldDriverSelected,
+                allowsMissingStudioDisplays: allowsMissingStudioDisplaysForLiveInstall
+            ) {
                 installProgressIndex = OnboardingInstallStep.allCases.count
                 showStep(.settings)
-            } else {
-                installProgressIndex = OnboardingInstallStep.routingDriver.rawValue
-                delegate?.settingsApplyConfiguration()
-                startLiveInstallSequence()
+                return
             }
+
+            guard liveInstallCanCompleteConfiguration() else {
+                failLiveInstall(with: studioDisplayRequirementError(step: .environment))
+                return
+            }
+
+            installProgressIndex = OnboardingInstallStep.routingDriver.rawValue
+            delegate?.settingsApplyConfiguration()
+            startLiveInstallSequence()
             return
         }
 
@@ -643,16 +712,29 @@ final class OnboardingModel: ObservableObject {
                 self.refreshFromDelegate()
 
                 if self.isInstallingDriver {
+                    let activeStep: OnboardingInstallStep
+                    if case .installing(let phase) = self.driverInstallState {
+                        activeStep = phase.onboardingStep
+                    } else {
+                        activeStep = .approveDriver
+                    }
                     withAnimation(.smooth(duration: 0.24)) {
-                        self.installProgressIndex = max(self.installProgressIndex, OnboardingInstallStep.routingDriver.rawValue)
+                        self.installProgressIndex = max(
+                            self.installProgressIndex,
+                            activeStep.rawValue
+                        )
                     }
                     continue
+                }
+
+                if case .failed(let failure) = self.driverInstallState {
+                    self.failLiveInstall(with: failure.onboardingError)
+                    return
                 }
 
                 if NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                     driverInstalled: self.driverInstalled,
                     routerSelected: self.nearfieldDriverSelected,
-                    studioDisplayCount: self.studioDisplayCount,
                     allowsMissingStudioDisplays: self.allowsMissingStudioDisplaysForLiveInstall
                 ) {
                     withAnimation(.smooth(duration: 0.24)) {
@@ -683,12 +765,13 @@ final class OnboardingModel: ObservableObject {
                     return
                 }
 
-                if Date().timeIntervalSince(startedAt) > 1.2 {
+                if Date().timeIntervalSince(startedAt) > 5,
+                   self.driverInstallState == .idle {
                     self.failLiveInstall(
                         with: OnboardingInstallError(
-                            step: .approveDriver,
-                            title: "Permissions Not Granted",
-                            message: "Admin permissions needed to install HAL Driver"
+                            step: .routingDriver,
+                            title: "Driver Install Did Not Start",
+                            message: "Nearfield could not start the driver installer. Try again."
                         )
                     )
                     return

@@ -1,3 +1,4 @@
+import AppKit
 import CoreAudio
 import SwiftUI
 import XCTest
@@ -139,6 +140,27 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
+    func testForcedInstallCanFinishWithValidatedDriverBeforeCoreAudioActivation() {
+        XCTAssertTrue(
+            NearfieldRouterPolicy.shouldCompleteDriverInstallWithoutActivation(
+                currentDriverIsInstalledOnDisk: true,
+                allowsMissingStudioDisplays: true
+            )
+        )
+        XCTAssertFalse(
+            NearfieldRouterPolicy.shouldCompleteDriverInstallWithoutActivation(
+                currentDriverIsInstalledOnDisk: false,
+                allowsMissingStudioDisplays: true
+            )
+        )
+        XCTAssertFalse(
+            NearfieldRouterPolicy.shouldCompleteDriverInstallWithoutActivation(
+                currentDriverIsInstalledOnDisk: true,
+                allowsMissingStudioDisplays: false
+            )
+        )
+    }
+
     func testDriverInstallRequestsEncodeOnlySupportedContexts() {
         XCTAssertTrue(DriverInstallRequest.userInitiated.requiresConfirmation)
         XCTAssertTrue(DriverInstallRequest.userInitiated.presentsErrors)
@@ -154,12 +176,78 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertTrue(onboardingRequest.allowsMissingStudioDisplays)
     }
 
+    func testDriverInstallProgressWaitsForAuthorizationBeforeAdvancing() {
+        XCTAssertEqual(DriverInstallPhase.preparation.onboardingStep, .approveDriver)
+        XCTAssertEqual(
+            DriverInstallPhase.authorizationAndInstallation.onboardingStep,
+            .approveDriver
+        )
+        XCTAssertEqual(DriverInstallPhase.activation.onboardingStep, .routingDriver)
+        XCTAssertEqual(DriverInstallPhase.configuration.onboardingStep, .routingDriver)
+    }
+
+    func testRoutingDriverFailuresAreNotReportedAsPermissionFailures() {
+        let stages: [DriverInstallFailureStage] = [
+            .installation,
+            .activation,
+            .configuration
+        ]
+
+        for stage in stages {
+            let error = DriverInstallFailure(
+                stage: stage,
+                message: "Underlying failure"
+            ).onboardingError
+
+            XCTAssertEqual(error.step, .routingDriver)
+            XCTAssertNotEqual(error.title, "Permissions Not Granted")
+        }
+
+        let authorizationError = DriverInstallFailure(
+            stage: .authorization,
+            message: "Administrator approval was cancelled."
+        ).onboardingError
+        XCTAssertEqual(authorizationError.step, .approveDriver)
+        XCTAssertEqual(authorizationError.title, "Permissions Not Granted")
+
+        let preparationError = DriverInstallFailure(
+            stage: .preparation,
+            message: "Could not prepare the driver."
+        ).onboardingError
+        XCTAssertEqual(preparationError.step, .approveDriver)
+        XCTAssertEqual(preparationError.title, "Could Not Prepare Driver")
+    }
+
+    func testRoutingDriverStepWarnsThatInstallationCanTakeAWhile() {
+        XCTAssertTrue(
+            OnboardingInstallStep.routingDriver.activeDetail.contains(
+                "This step can take a while."
+            )
+        )
+    }
+
+    func testPrivilegedInstallerRecognizesAuthorizationCancellation() {
+        XCTAssertEqual(
+            DriverInstaller.privilegedInstallError(
+                errorNumber: -128,
+                message: "User canceled."
+            ),
+            .authorizationCancelled
+        )
+        XCTAssertEqual(
+            DriverInstaller.privilegedInstallError(
+                errorNumber: -1,
+                message: "Install command failed."
+            ),
+            .installFailed("Install command failed.")
+        )
+    }
+
     func testOnboardingCompletesForInstalledDriverWhenMissingDisplaysWereExplicitlyAllowed() {
         XCTAssertTrue(
             NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                 driverInstalled: true,
                 routerSelected: false,
-                studioDisplayCount: 0,
                 allowsMissingStudioDisplays: true
             )
         )
@@ -170,15 +258,13 @@ final class NearfieldRegressionTests: XCTestCase {
             NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                 driverInstalled: true,
                 routerSelected: false,
-                studioDisplayCount: 0,
                 allowsMissingStudioDisplays: false
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             NearfieldRouterPolicy.shouldCompleteOnboardingAfterDriverInstall(
                 driverInstalled: true,
                 routerSelected: false,
-                studioDisplayCount: 2,
                 allowsMissingStudioDisplays: true
             )
         )
@@ -208,12 +294,110 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertFalse(RouterDriverAvailability.installedOnDisk.isLoaded)
     }
 
+    func testOpenApplicationPolicyShowsOnboardingUntilExplicitlyCompleted() {
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.openApplicationPresentation(
+                hasCompletedOnboarding: false,
+                isLoginItemLaunch: false
+            ),
+            .onboarding
+        )
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.openApplicationPresentation(
+                hasCompletedOnboarding: false,
+                isLoginItemLaunch: true
+            ),
+            .onboarding
+        )
+    }
+
+    func testOpenApplicationPolicyShowsSettingsForManualLaunchButNotLoginItemLaunch() {
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.openApplicationPresentation(
+                hasCompletedOnboarding: true,
+                isLoginItemLaunch: false
+            ),
+            .settings
+        )
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.openApplicationPresentation(
+                hasCompletedOnboarding: true,
+                isLoginItemLaunch: true
+            ),
+            .none
+        )
+    }
+
+    func testMissingCurrentDriverRequiresOnboardingEvenWhenCompletionPersisted() {
+        XCTAssertFalse(
+            NearfieldLaunchPolicy.requiresOnboarding(
+                hasCompletedOnboarding: true,
+                currentDriverIsInstalled: true
+            )
+        )
+        XCTAssertTrue(
+            NearfieldLaunchPolicy.requiresOnboarding(
+                hasCompletedOnboarding: true,
+                currentDriverIsInstalled: false
+            )
+        )
+        XCTAssertTrue(
+            NearfieldLaunchPolicy.requiresOnboarding(
+                hasCompletedOnboarding: false,
+                currentDriverIsInstalled: true
+            )
+        )
+    }
+
+    func testReopenPolicyAlwaysProvidesAWindow() {
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.reopenPresentation(hasCompletedOnboarding: false),
+            .onboarding
+        )
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.reopenPresentation(hasCompletedOnboarding: true),
+            .settings
+        )
+    }
+
+    func testStatusItemLeftClickFocusesOnboardingThenReturnsToContextMenu() {
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.statusItemAction(
+                hasCompletedOnboarding: false,
+                explicitlyRequestsContextMenu: false
+            ),
+            .primaryWindow
+        )
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.statusItemAction(
+                hasCompletedOnboarding: true,
+                explicitlyRequestsContextMenu: false
+            ),
+            .contextMenu
+        )
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.statusItemAction(
+                hasCompletedOnboarding: false,
+                explicitlyRequestsContextMenu: true
+            ),
+            .contextMenu
+        )
+    }
+
     func testFullMenuBarMenuRemainsHiddenUntilInitialOnboardingReachesSettings() {
         XCTAssertFalse(
             NearfieldRouterPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: true)
         )
         XCTAssertTrue(
             NearfieldRouterPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: false)
+        )
+    }
+
+    func testAccessoryApplicationMenuUsesCommandQ() {
+        XCTAssertEqual(NearfieldApplicationMenuConfiguration.quitTitle, "Quit Nearfield")
+        XCTAssertEqual(NearfieldApplicationMenuConfiguration.quitKeyEquivalent, "q")
+        XCTAssertTrue(
+            NearfieldApplicationMenuConfiguration.quitModifierMask.contains(.command)
         )
     }
 
@@ -420,6 +604,138 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver.nearfield-installing"))
     }
 
+    func testDriverDiskStateRejectsLegacyAndMalformedCurrentDrivers() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldDriverStateTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .missing)
+
+        let legacyURL = rootURL.appendingPathComponent(
+            "ProxyAudioDevice.driver",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: legacyURL, withIntermediateDirectories: true)
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .legacy)
+
+        let currentURL = rootURL.appendingPathComponent(
+            "NearfieldAudioDevice.driver",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: currentURL, withIntermediateDirectories: true)
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .invalidCurrent)
+    }
+
+    func testDriverDiskStateAcceptsOnlyValidCurrentDriverBundle() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldDriverStateTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        let driverURL = rootURL.appendingPathComponent(
+            "NearfieldAudioDevice.driver",
+            isDirectory: true
+        )
+        try makeTestBundle(
+            at: driverURL,
+            bundleIdentifier: "com.kemuri.Nearfield.AudioDevice",
+            executableName: "NearfieldAudioDevice"
+        )
+
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .current)
+    }
+
+    func testDriverDiskStateRejectsCurrentFilenameWithWrongBundleIdentifier() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldDriverStateTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        let driverURL = rootURL.appendingPathComponent(
+            "NearfieldAudioDevice.driver",
+            isDirectory: true
+        )
+        try makeTestBundle(
+            at: driverURL,
+            bundleIdentifier: "com.example.NotNearfield",
+            executableName: "NearfieldAudioDevice"
+        )
+
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .invalidCurrent)
+    }
+
+    func testDriverDiskStateRevalidatesReplacementAtTheSamePath() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldDriverStateTests-\(UUID().uuidString)", isDirectory: true)
+        let driverURL = rootURL.appendingPathComponent(
+            "NearfieldAudioDevice.driver",
+            isDirectory: true
+        )
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try makeTestBundle(
+            at: driverURL,
+            bundleIdentifier: "com.example.StaleDriver",
+            executableName: "NearfieldAudioDevice"
+        )
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .invalidCurrent)
+
+        try fileManager.removeItem(at: driverURL)
+        try makeTestBundle(
+            at: driverURL,
+            bundleIdentifier: "com.kemuri.Nearfield.AudioDevice",
+            executableName: "NearfieldAudioDevice"
+        )
+
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .current)
+    }
+
+    func testDriverDiskWaitFindsDelayedInstallation() async throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldDriverWaitTests-\(UUID().uuidString)", isDirectory: true)
+        let stagedURL = rootURL.appendingPathComponent("Staged.driver", isDirectory: true)
+        let installedURL = rootURL.appendingPathComponent(
+            "NearfieldAudioDevice.driver",
+            isDirectory: true
+        )
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try makeTestBundle(
+            at: stagedURL,
+            bundleIdentifier: "com.kemuri.Nearfield.AudioDevice",
+            executableName: "NearfieldAudioDevice"
+        )
+
+        let delayedInstall = Task.detached {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            try? FileManager.default.copyItem(at: stagedURL, to: installedURL)
+        }
+        let didFindDriver = await DriverInstaller.waitForCurrentRouterDriverOnDisk(
+            in: rootURL,
+            timeout: 1,
+            interval: 0.01
+        )
+        await delayedInstall.value
+
+        XCTAssertTrue(didFindDriver)
+    }
+
     func testAppRoutingRulesDefaultToEmptyForFreshInstall() {
         let suiteName = "NearfieldTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
@@ -494,6 +810,64 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
+    func testOnboardingCompletionIsExplicitAndVersioned() {
+        let suiteName = "NearfieldTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated defaults suite")
+            return
+        }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        XCTAssertFalse(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
+
+        NearfieldPreferences.markOnboardingCompleted(in: defaults)
+
+        XCTAssertTrue(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
+        XCTAssertEqual(
+            defaults.integer(forKey: NearfieldPreferences.onboardingCompletionVersionKey),
+            NearfieldPreferences.latestOnboardingCompletionVersion
+        )
+
+        NearfieldPreferences.resetOnboardingCompletion(in: defaults)
+
+        XCTAssertFalse(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
+        XCTAssertNil(
+            defaults.object(forKey: NearfieldPreferences.onboardingCompletionVersionKey)
+        )
+    }
+
+    func testOnboardingMigrationRequiresCurrentDriverAndPriorSetupEvidence() {
+        let suiteName = "NearfieldTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated defaults suite")
+            return
+        }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        NearfieldPreferences.migrateOnboardingCompletionIfNeeded(
+            currentDriverIsInstalled: true,
+            in: defaults
+        )
+        XCTAssertFalse(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
+
+        NearfieldPreferences.markAggregateSchemaCurrent(in: defaults)
+        NearfieldPreferences.migrateOnboardingCompletionIfNeeded(
+            currentDriverIsInstalled: false,
+            in: defaults
+        )
+        XCTAssertFalse(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
+
+        NearfieldPreferences.migrateOnboardingCompletionIfNeeded(
+            currentDriverIsInstalled: true,
+            in: defaults
+        )
+        XCTAssertTrue(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
+    }
+
     func testApplicationMoverReplacesExistingBundleAfterStagingCopy() throws {
         let fileManager = FileManager.default
         let rootURL = fileManager.temporaryDirectory
@@ -548,6 +922,37 @@ final class NearfieldRegressionTests: XCTestCase {
             )
         )
         XCTAssertEqual(try String(contentsOf: versionURL, encoding: .utf8), "old")
+    }
+
+    private func makeTestBundle(
+        at bundleURL: URL,
+        bundleIdentifier: String,
+        executableName: String
+    ) throws {
+        let fileManager = FileManager.default
+        let contentsURL = bundleURL.appendingPathComponent("Contents", isDirectory: true)
+        let macOSURL = contentsURL.appendingPathComponent("MacOS", isDirectory: true)
+        try fileManager.createDirectory(at: macOSURL, withIntermediateDirectories: true)
+
+        let info: [String: Any] = [
+            "CFBundleExecutable": executableName,
+            "CFBundleIdentifier": bundleIdentifier,
+            "CFBundlePackageType": "BNDL",
+            "CFBundleVersion": "1"
+        ]
+        let infoData = try PropertyListSerialization.data(
+            fromPropertyList: info,
+            format: .xml,
+            options: 0
+        )
+        try infoData.write(to: contentsURL.appendingPathComponent("Info.plist"))
+
+        let executableURL = macOSURL.appendingPathComponent(executableName)
+        try Data("#!/bin/sh\n".utf8).write(to: executableURL)
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executableURL.path
+        )
     }
 
     #if !NEARFIELD_DISTRIBUTION

@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 import Darwin
 
 extension AppDelegate {
@@ -95,10 +96,22 @@ extension AppDelegate {
             return
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.promptForDriverUninstallIfApplicationWasRemoved(bundleURL: bundleURL)
+        // Finder, an installer, and Sparkle replace an application bundle by
+        // briefly removing/renaming the old bundle before putting the new one
+        // at the same path. Treat the event as a real uninstall only if the
+        // path remains absent throughout a replacement grace period.
+        Task { @MainActor [weak self] in
+            for _ in 0..<20 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard let self,
+                      !self.didPromptForDriverUninstallAfterApplicationRemoval else {
+                    return
+                }
+                if FileManager.default.fileExists(atPath: bundleURL.path) {
+                    return
+                }
             }
+            self?.promptForDriverUninstallIfApplicationWasRemoved(bundleURL: bundleURL)
         }
     }
 
@@ -159,17 +172,40 @@ extension AppDelegate {
 
     @discardableResult
     func presentInitialOnboardingIfNeeded() -> Bool {
-        guard !cachedRouterDriverAvailability.isInstalled else { return false }
+        guard isInitialOnboardingInProgress else { return false }
         openOnboarding()
         return true
     }
 
-    func presentSettingsIfMenuBarAppIsHiddenAfterDefaultLaunch(_ notification: Notification) {
-        guard !showMenuBarApp(),
-              notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool == true else {
-            return
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        // First-run onboarding is already shown synchronously during launch.
+        // Avoid restarting its simulation when AppKit handles the subsequent
+        // open-application event.
+        guard !isInitialOnboardingInProgress else {
+            return true
         }
-        openSettings()
+
+        let isLoginItemLaunch = NSAppleEventManager.shared()
+            .currentAppleEvent?
+            .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) != nil
+
+        switch NearfieldLaunchPolicy.openApplicationPresentation(
+            hasCompletedOnboarding: true,
+            isLoginItemLaunch: isLoginItemLaunch
+        ) {
+        case .onboarding:
+            openOnboarding()
+            return true
+        case .settings:
+            openSettings()
+            return true
+        case .none:
+            return false
+        }
     }
 
 }

@@ -40,6 +40,7 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsDidReachSettingsScreen() {
         guard isInitialOnboardingInProgress else { return }
+        NearfieldPreferences.markOnboardingCompleted()
         isInitialOnboardingInProgress = false
         #if NEARFIELD_DISTRIBUTION
         startUpdaterIfEligible(checkImmediately: true)
@@ -56,6 +57,17 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsIsInstallingDriver() -> Bool {
         isInstallingDriver
+    }
+
+    func settingsDriverInstallState() -> DriverInstallState {
+        driverInstallState
+    }
+
+    func settingsResetDriverInstallState() {
+        guard !isInstallingDriver else { return }
+        driverInstallState = .idle
+        clearRecoverableError()
+        refreshStatus()
     }
 
     func settingsNearfieldDriverSelected() -> Bool {
@@ -228,6 +240,7 @@ extension AppDelegate: SettingsDelegate {
         Task { @MainActor [weak self] in
             guard let self, await self.removeDriversAndTargets() else { return }
             if scope == .driversAndApp {
+                NearfieldPreferences.resetOnboardingCompletion()
                 self.removeApplicationBundleFromApplications()
             }
             self.refreshStatus()

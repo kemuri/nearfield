@@ -102,10 +102,39 @@ enum DriverInstallRequest: Equatable {
     }
 }
 
+enum DriverInstallFailureStage: Equatable {
+    case preparation
+    case authorization
+    case installation
+    case activation
+    case configuration
+}
+
+struct DriverInstallFailure: Equatable {
+    let stage: DriverInstallFailureStage
+    let message: String
+}
+
+enum DriverInstallPhase: Equatable {
+    case preparation
+    case authorizationAndInstallation
+    case activation
+    case configuration
+}
+
+enum DriverInstallState: Equatable {
+    case idle
+    case installing(DriverInstallPhase)
+    case succeeded
+    case failed(DriverInstallFailure)
+}
+
 @MainActor
 protocol SettingsDriverControlling: AnyObject {
     func settingsDriverInstalled() -> Bool
     func settingsIsInstallingDriver() -> Bool
+    func settingsDriverInstallState() -> DriverInstallState
+    func settingsResetDriverInstallState()
     func settingsInstallDriver(_ request: DriverInstallRequest)
     func settingsRemoveEverything()
 }

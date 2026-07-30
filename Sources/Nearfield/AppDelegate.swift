@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pendingUpdateInstallation: (() -> Void)?
     #endif
     var isInstallingDriver = false
+    var driverInstallState: DriverInstallState = .idle
     var audioStateSynchronizationDepth = 0
     var proxyPreparedDisplayState: [DisplayOutputState]?
     var routerVolumeContinuity = RouterVolumeContinuity()
@@ -62,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isAggregateDefaultOutput: false
     )
     var cachedRouterDriverAvailability = RouterDriverAvailability(
-        installedOnDisk: DriverInstaller.isRouterDriverInstalledOnDisk()
+        installedOnDisk: DriverInstaller.routerDriverDiskState().isCurrent
     )
     var cachedRouterDefaultOutput = false
     var coreAudioReadinessGeneration = 0
@@ -86,8 +87,17 @@ extension AppDelegate {
             return
         }
         proxyPreparedDisplayState = loadProxyPreparedDisplayState()
-        cachedRouterDriverAvailability = currentRouterDriverAvailability()
-        isInitialOnboardingInProgress = !cachedRouterDriverAvailability.isInstalled
+        let routerDriverDiskState = DriverInstaller.routerDriverDiskState()
+        cachedRouterDriverAvailability = RouterDriverAvailability(
+            installedOnDisk: routerDriverDiskState.isCurrent
+        )
+        NearfieldPreferences.migrateOnboardingCompletionIfNeeded(
+            currentDriverIsInstalled: routerDriverDiskState.isCurrent
+        )
+        isInitialOnboardingInProgress = NearfieldLaunchPolicy.requiresOnboarding(
+            hasCompletedOnboarding: NearfieldPreferences.hasCompletedOnboarding(),
+            currentDriverIsInstalled: routerDriverDiskState.isCurrent
+        )
         #if NEARFIELD_DISTRIBUTION
         startUpdaterIfEligible(checkImmediately: !isInitialOnboardingInProgress)
         #endif
@@ -114,9 +124,7 @@ extension AppDelegate {
             return
         }
 
-        startCoreAudioServices { [weak self] in
-            self?.presentSettingsIfMenuBarAppIsHiddenAfterDefaultLaunch(notification)
-        }
+        startCoreAudioServices()
     }
 
     /// Waits for Core Audio, then brings observation, media keys, and dynamic
@@ -161,9 +169,12 @@ extension AppDelegate {
     func currentRouterDriverAvailability(
         coreAudioIsReady: Bool = false
     ) -> RouterDriverAvailability {
-        RouterDriverAvailability(
-            installedOnDisk: DriverInstaller.isRouterDriverInstalledOnDisk(),
-            loadedByCoreAudio: coreAudioIsReady && routerDriverManager.isInstalled
+        let currentDriverIsInstalled = DriverInstaller.routerDriverDiskState().isCurrent
+        return RouterDriverAvailability(
+            installedOnDisk: currentDriverIsInstalled,
+            loadedByCoreAudio: currentDriverIsInstalled &&
+                coreAudioIsReady &&
+                routerDriverManager.isInstalled
         )
     }
 
@@ -198,14 +209,7 @@ extension AppDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if isInitialOnboardingInProgress {
-            onboardingWindowController?.show()
-            return false
-        }
-        guard !showMenuBarApp() else {
-            return true
-        }
-        openSettings()
+        presentPrimaryWindow()
         return false
     }
 

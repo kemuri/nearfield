@@ -5,11 +5,13 @@ enum NearfieldPreferences {
     static let leftDeviceUIDKey = "leftDeviceUID"
     static let balanceKey = "balance"
     static let showMenuBarAppKey = "showMenuBarApp"
+    static let onboardingCompletionVersionKey = "onboardingCompletionVersion"
     static let aggregateSchemaVersionKey = "aggregateSchemaVersion"
     static let proxyPreparedDisplayStateKey = "proxyPreparedDisplayState"
     static let appRoutingEnabledKey = "appRoutingEnabled"
     static let appRoutingRulesKey = "appRoutingRules"
     static let appRoutingAppBundleIDsKey = "appRoutingAppBundleIDs"
+    static let latestOnboardingCompletionVersion = 1
     static let latestAggregateSchemaVersion = 12
 
     static func outputMode(in defaults: UserDefaults = .standard) -> NearfieldOutputMode {
@@ -49,6 +51,52 @@ enum NearfieldPreferences {
 
     static func setShowMenuBarApp(_ enabled: Bool, in defaults: UserDefaults = .standard) {
         defaults.set(enabled, forKey: showMenuBarAppKey)
+    }
+
+    static func hasCompletedOnboarding(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.integer(forKey: onboardingCompletionVersionKey) >= latestOnboardingCompletionVersion
+    }
+
+    static func markOnboardingCompleted(in defaults: UserDefaults = .standard) {
+        defaults.set(latestOnboardingCompletionVersion, forKey: onboardingCompletionVersionKey)
+    }
+
+    static func resetOnboardingCompletion(in defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: onboardingCompletionVersionKey)
+    }
+
+    static func migrateOnboardingCompletionIfNeeded(
+        currentDriverIsInstalled: Bool,
+        in defaults: UserDefaults = .standard
+    ) {
+        guard defaults.object(forKey: onboardingCompletionVersionKey) == nil,
+              currentDriverIsInstalled,
+              hasPriorSetupEvidence(in: defaults) else {
+            return
+        }
+        markOnboardingCompleted(in: defaults)
+    }
+
+    static func hasPriorSetupEvidence(in defaults: UserDefaults = .standard) -> Bool {
+        if defaults.integer(forKey: aggregateSchemaVersionKey) >= latestAggregateSchemaVersion {
+            return true
+        }
+
+        let configuredKeys = [
+            outputModeKey,
+            leftDeviceUIDKey,
+            balanceKey,
+            showMenuBarAppKey,
+            proxyPreparedDisplayStateKey,
+            appRoutingRulesKey,
+            appRoutingAppBundleIDsKey
+        ]
+        if configuredKeys.contains(where: { defaults.object(forKey: $0) != nil }) {
+            return true
+        }
+
+        return defaults.object(forKey: appRoutingEnabledKey) != nil &&
+            defaults.bool(forKey: appRoutingEnabledKey)
     }
 
     static func aggregateSchemaNeedsCleanup(in defaults: UserDefaults = .standard) -> Bool {

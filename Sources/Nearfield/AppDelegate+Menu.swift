@@ -4,13 +4,41 @@ import ServiceManagement
 import Sparkle
 #endif
 
+enum NearfieldApplicationMenuConfiguration {
+    static let quitTitle = "Quit Nearfield"
+    static let quitKeyEquivalent = "q"
+    static let quitModifierMask: NSEvent.ModifierFlags = [.command]
+}
+
 extension AppDelegate {
     func configureMenu() {
+        configureApplicationMenu()
         statusItem.button?.image = menuBarIcon()
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.title = ""
+        statusItem.button?.toolTip = "Nearfield"
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(handleStatusItemButtonClick(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         menu.delegate = self
         applyMenuBarState()
+    }
+
+    /// Accessory apps do not receive the standard application menu that
+    /// normally owns Command-Q. Keep a minimal, invisible main menu so AppKit
+    /// can resolve the shortcut even when the status-item menu is closed.
+    func configureApplicationMenu() {
+        let applicationMenu = NSMenu()
+        applicationMenu.addItem(
+            makeQuitMenuItem(title: NearfieldApplicationMenuConfiguration.quitTitle)
+        )
+
+        let applicationMenuItem = NSMenuItem()
+        applicationMenuItem.submenu = applicationMenu
+
+        let mainMenu = NSMenu()
+        mainMenu.addItem(applicationMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     func menuBarIcon() -> NSImage? {
@@ -27,10 +55,53 @@ extension AppDelegate {
 
     @objc func openSettings() {
         guard !isInitialOnboardingInProgress else {
-            onboardingWindowController?.show()
+            if let onboardingWindowController {
+                onboardingWindowController.show()
+            } else {
+                openOnboarding()
+            }
             return
         }
         showOnboardingSettingsStage(showsPageIndicator: false)
+    }
+
+    @objc func handleStatusItemButtonClick(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let explicitlyRequestsContextMenu =
+            event?.type == .rightMouseUp ||
+            event?.modifierFlags.contains(.control) == true
+
+        switch NearfieldLaunchPolicy.statusItemAction(
+            hasCompletedOnboarding: !isInitialOnboardingInProgress,
+            explicitlyRequestsContextMenu: explicitlyRequestsContextMenu
+        ) {
+        case .primaryWindow:
+            presentPrimaryWindow()
+        case .contextMenu:
+            rebuildMenu()
+            menu.popUp(
+                positioning: nil,
+                at: NSPoint(x: 0, y: sender.bounds.maxY + 4),
+                in: sender
+            )
+        }
+    }
+
+    func presentPrimaryWindow() {
+        switch NearfieldLaunchPolicy.reopenPresentation(
+            hasCompletedOnboarding: !isInitialOnboardingInProgress
+        ) {
+        case .onboarding:
+            if let onboardingWindowController {
+                onboardingWindowController.show()
+            } else {
+                openOnboarding()
+            }
+        case .settings:
+            openSettings()
+        case .none:
+            break
+        }
     }
 
     @objc func openOnboarding() {
@@ -141,9 +212,19 @@ extension AppDelegate {
     #endif
 
     func addQuitMenuItem() {
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(confirmQuitHelper), keyEquivalent: "q")
+        menu.addItem(makeQuitMenuItem(title: "Quit"))
+    }
+
+    func makeQuitMenuItem(title: String) -> NSMenuItem {
+        let quitItem = NSMenuItem(
+            title: title,
+            action: #selector(confirmQuitHelper),
+            keyEquivalent: NearfieldApplicationMenuConfiguration.quitKeyEquivalent
+        )
+        quitItem.keyEquivalentModifierMask =
+            NearfieldApplicationMenuConfiguration.quitModifierMask
         quitItem.target = self
-        menu.addItem(quitItem)
+        return quitItem
     }
 
     @objc func confirmQuitHelper() {
@@ -163,7 +244,7 @@ extension AppDelegate {
     func applyMenuBarState() {
         statusItem.isVisible = showMenuBarApp()
         statusItem.button?.isEnabled = true
-        statusItem.menu = menu
+        statusItem.menu = nil
         rebuildMenu()
     }
 
