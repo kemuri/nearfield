@@ -10,6 +10,20 @@ enum NearfieldStatusItemAction: Equatable {
 }
 
 enum NearfieldLaunchPolicy {
+    static func initialLaunchPresentation(
+        hasCompletedOnboarding: Bool,
+        isDefaultLaunch: Bool,
+        isLoginItemLaunch: Bool
+    ) -> NearfieldWindowPresentation {
+        guard hasCompletedOnboarding else {
+            return .onboarding
+        }
+        guard isDefaultLaunch, !isLoginItemLaunch else {
+            return .none
+        }
+        return .settings
+    }
+
     static func requiresOnboarding(
         hasCompletedOnboarding: Bool,
         currentDriverIsInstalled: Bool

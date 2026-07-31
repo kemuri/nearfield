@@ -352,7 +352,7 @@ extension AppDelegate: SettingsDelegate {
             .resolvingSymlinksInPath()
     }
 
-    private func applicationRemovalError(_ message: String) -> NSError {
+    func applicationRemovalError(_ message: String) -> NSError {
         NSError(
             domain: "com.kemuri.Nearfield",
             code: 2,

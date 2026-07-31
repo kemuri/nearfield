@@ -118,10 +118,24 @@ extension AppDelegate {
             return
         }
         #endif
-        // First-run onboarding defers Core Audio startup until the user reaches
-        // the settings screen; see settingsDidReachSettingsScreen().
-        if presentInitialOnboardingIfNeeded() {
+
+        let isDefaultLaunch =
+            notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
+        let initialPresentation = NearfieldLaunchPolicy.initialLaunchPresentation(
+            hasCompletedOnboarding: !isInitialOnboardingInProgress,
+            isDefaultLaunch: isDefaultLaunch,
+            isLoginItemLaunch: currentAppleEventIsLoginItemLaunch()
+        )
+        switch initialPresentation {
+        case .onboarding:
+            // First-run onboarding defers Core Audio startup until the user
+            // reaches settings; see settingsDidReachSettingsScreen().
+            openOnboarding()
             return
+        case .settings:
+            openSettings()
+        case .none:
+            break
         }
 
         startCoreAudioServices()

@@ -108,10 +108,48 @@ extension AppDelegate {
                     return
                 }
                 if FileManager.default.fileExists(atPath: bundleURL.path) {
-                    return
+                    if ApplicationReplacementRelauncher
+                        .replacementSatisfiesCurrentApplicationRequirement(
+                            at: bundleURL
+                        ) {
+                        self.relaunchAfterApplicationReplacement(at: bundleURL)
+                        return
+                    }
+                    continue
                 }
             }
+            if FileManager.default.fileExists(atPath: bundleURL.path),
+               let self {
+                self.recordRecoverableError(
+                    self.applicationRemovalError(
+                        "The replacement Nearfield.app could not be verified."
+                    ),
+                    context: "Application replacement failed"
+                )
+                return
+            }
             self?.promptForDriverUninstallIfApplicationWasRemoved(bundleURL: bundleURL)
+        }
+    }
+
+    func relaunchAfterApplicationReplacement(at bundleURL: URL) {
+        guard !didPromptForDriverUninstallAfterApplicationRemoval else {
+            return
+        }
+
+        do {
+            try ApplicationReplacementRelauncher.scheduleRelaunch(
+                afterProcessExits: ProcessInfo.processInfo.processIdentifier,
+                applicationURL: bundleURL
+            )
+            didPromptForDriverUninstallAfterApplicationRemoval = true
+            stopApplicationRemovalMonitor()
+            NSApp.terminate(nil)
+        } catch {
+            recordRecoverableError(
+                error,
+                context: "Application replacement relaunch failed"
+            )
         }
     }
 
@@ -170,13 +208,6 @@ extension AppDelegate {
         }
     }
 
-    @discardableResult
-    func presentInitialOnboardingIfNeeded() -> Bool {
-        guard isInitialOnboardingInProgress else { return false }
-        openOnboarding()
-        return true
-    }
-
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         true
     }
@@ -188,14 +219,13 @@ extension AppDelegate {
         guard !isInitialOnboardingInProgress else {
             return true
         }
-
-        let isLoginItemLaunch = NSAppleEventManager.shared()
-            .currentAppleEvent?
-            .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) != nil
+        guard onboardingWindowController?.window?.isVisible != true else {
+            return true
+        }
 
         switch NearfieldLaunchPolicy.openApplicationPresentation(
             hasCompletedOnboarding: true,
-            isLoginItemLaunch: isLoginItemLaunch
+            isLoginItemLaunch: currentAppleEventIsLoginItemLaunch()
         ) {
         case .onboarding:
             openOnboarding()
@@ -206,6 +236,12 @@ extension AppDelegate {
         case .none:
             return false
         }
+    }
+
+    func currentAppleEventIsLoginItemLaunch() -> Bool {
+        NSAppleEventManager.shared()
+            .currentAppleEvent?
+            .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) != nil
     }
 
 }

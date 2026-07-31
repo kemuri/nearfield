@@ -311,6 +311,44 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
+    func testDefaultInitialLaunchAlwaysPresentsThePrimaryWindow() {
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.initialLaunchPresentation(
+                hasCompletedOnboarding: false,
+                isDefaultLaunch: true,
+                isLoginItemLaunch: false
+            ),
+            .onboarding
+        )
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.initialLaunchPresentation(
+                hasCompletedOnboarding: true,
+                isDefaultLaunch: true,
+                isLoginItemLaunch: false
+            ),
+            .settings
+        )
+    }
+
+    func testLoginAndNonDefaultInitialLaunchesStayWindowlessAfterOnboarding() {
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.initialLaunchPresentation(
+                hasCompletedOnboarding: true,
+                isDefaultLaunch: true,
+                isLoginItemLaunch: true
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            NearfieldLaunchPolicy.initialLaunchPresentation(
+                hasCompletedOnboarding: true,
+                isDefaultLaunch: false,
+                isLoginItemLaunch: false
+            ),
+            .none
+        )
+    }
+
     func testOpenApplicationPolicyShowsSettingsForManualLaunchButNotLoginItemLaunch() {
         XCTAssertEqual(
             NearfieldLaunchPolicy.openApplicationPresentation(
@@ -922,6 +960,27 @@ final class NearfieldRegressionTests: XCTestCase {
             )
         )
         XCTAssertEqual(try String(contentsOf: versionURL, encoding: .utf8), "old")
+    }
+
+    func testReplacementRelauncherPassesApplicationPathAsAnArgument() {
+        let applicationURL = URL(
+            fileURLWithPath: "/Applications/Nearfield user's copy.app",
+            isDirectory: true
+        )
+
+        let arguments = ApplicationReplacementRelauncher.helperArguments(
+            processIdentifier: 1234,
+            applicationURL: applicationURL
+        )
+
+        XCTAssertEqual(arguments.count, 5)
+        XCTAssertEqual(arguments[0], "-c")
+        XCTAssertEqual(arguments[2], "nearfield-relaunch")
+        XCTAssertEqual(arguments[3], "1234")
+        XCTAssertEqual(arguments[4], applicationURL.path)
+        XCTAssertTrue(arguments[1].contains("\"$1\""))
+        XCTAssertTrue(arguments[1].contains("\"$2\""))
+        XCTAssertFalse(arguments[1].contains(applicationURL.path))
     }
 
     private func makeTestBundle(
