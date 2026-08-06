@@ -83,31 +83,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        LaunchDiagnostics.record("applicationDidFinishLaunching entered")
         if moveToApplicationsIfNeeded() {
+            LaunchDiagnostics.record("application move scheduled; terminating original process")
             return
         }
+        LaunchDiagnostics.record("application location accepted")
         proxyPreparedDisplayState = loadProxyPreparedDisplayState()
+        LaunchDiagnostics.record("loaded saved proxy display state")
         let routerDriverDiskState = DriverInstaller.routerDriverDiskState()
+        LaunchDiagnostics.record("read router driver disk state=\(String(describing: routerDriverDiskState))")
         cachedRouterDriverAvailability = RouterDriverAvailability(
             installedOnDisk: routerDriverDiskState.isCurrent
         )
         NearfieldPreferences.migrateOnboardingCompletionIfNeeded(
             currentDriverIsInstalled: routerDriverDiskState.isCurrent
         )
+        let hasCompletedOnboarding = NearfieldPreferences.hasCompletedOnboarding()
         isInitialOnboardingInProgress = NearfieldLaunchPolicy.requiresOnboarding(
-            hasCompletedOnboarding: NearfieldPreferences.hasCompletedOnboarding(),
+            hasCompletedOnboarding: hasCompletedOnboarding,
             currentDriverIsInstalled: routerDriverDiskState.isCurrent
         )
+        LaunchDiagnostics.record(
+            "resolved onboarding state completed=\(hasCompletedOnboarding) " +
+                "required=\(isInitialOnboardingInProgress)"
+        )
         #if NEARFIELD_DISTRIBUTION
+        LaunchDiagnostics.record("configuring Sparkle updater")
         startUpdaterIfEligible(checkImmediately: !isInitialOnboardingInProgress)
+        LaunchDiagnostics.record("configured Sparkle updater")
         #endif
+        LaunchDiagnostics.record("configuring application and status-item menus")
         configureMenu()
+        LaunchDiagnostics.record("configured application and status-item menus")
         finishLaunching(notification: notification)
+        LaunchDiagnostics.record("applicationDidFinishLaunching completed")
     }
 
     func finishLaunching(notification: Notification) {
+        LaunchDiagnostics.record("finishLaunching entered")
         configureDynamicRoutingLifecycleNotifications()
+        LaunchDiagnostics.record("configured routing lifecycle notifications")
         startApplicationRemovalMonitorIfNeeded()
+        LaunchDiagnostics.record("configured application removal monitor")
         #if !NEARFIELD_DISTRIBUTION
         if ProcessInfo.processInfo.arguments.contains("--wave-lab") {
             openWaveLab()
@@ -121,24 +139,41 @@ extension AppDelegate {
 
         let isDefaultLaunch =
             notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
+        let isLoginItemLaunch = currentAppleEventIsLoginItemLaunch()
         let initialPresentation = NearfieldLaunchPolicy.initialLaunchPresentation(
             hasCompletedOnboarding: !isInitialOnboardingInProgress,
             isDefaultLaunch: isDefaultLaunch,
-            isLoginItemLaunch: currentAppleEventIsLoginItemLaunch()
+            isLoginItemLaunch: isLoginItemLaunch
+        )
+        LaunchDiagnostics.record(
+            "initial presentation=\(String(describing: initialPresentation)) " +
+                "defaultLaunch=\(isDefaultLaunch) loginItemLaunch=\(isLoginItemLaunch)"
         )
         switch initialPresentation {
         case .onboarding:
             // First-run onboarding defers Core Audio startup until the user
             // reaches settings; see settingsDidReachSettingsScreen().
+            LaunchDiagnostics.record("presenting onboarding window")
             openOnboarding()
+            LaunchDiagnostics.record(
+                "onboarding presentation returned visible=" +
+                    "\(onboardingWindowController?.window?.isVisible == true)"
+            )
             return
         case .settings:
+            LaunchDiagnostics.record("presenting settings window")
             openSettings()
+            LaunchDiagnostics.record(
+                "settings presentation returned visible=" +
+                    "\(onboardingWindowController?.window?.isVisible == true)"
+            )
         case .none:
             break
         }
 
+        LaunchDiagnostics.record("starting Core Audio services")
         startCoreAudioServices()
+        LaunchDiagnostics.record("finishLaunching completed")
     }
 
     /// Waits for Core Audio, then brings observation, media keys, and dynamic
@@ -228,6 +263,7 @@ extension AppDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        LaunchDiagnostics.record("applicationWillTerminate entered")
         stopApplicationRemovalMonitor()
         coreAudioStartupTask?.cancel()
         coreAudioReadinessGeneration += 1
@@ -237,6 +273,7 @@ extension AppDelegate {
         dynamicRoutingNotificationObservers.removeAll()
         mediaKeyVolumeController.stop()
         audioManager.stopObserving()
+        LaunchDiagnostics.record("applicationWillTerminate completed")
     }
 
 }

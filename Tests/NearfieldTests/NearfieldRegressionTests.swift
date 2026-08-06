@@ -5,6 +5,39 @@ import XCTest
 @testable import Nearfield
 
 final class NearfieldRegressionTests: XCTestCase {
+    func testMenuBarResourceLocatorUsesPackagedResourceBundle() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldResourceTests-\(UUID().uuidString)", isDirectory: true)
+        let missingDevelopmentRoot = rootURL.appendingPathComponent("MissingBuildResource.bundle")
+        let packagedRoot = rootURL
+            .appendingPathComponent("Nearfield.app/Contents/Resources/Nearfield_Nearfield.bundle")
+        let iconURL = packagedRoot.appendingPathComponent("menubar.svg")
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+
+        try fileManager.createDirectory(at: packagedRoot, withIntermediateDirectories: true)
+        try Data("<svg/>".utf8).write(to: iconURL)
+
+        XCTAssertEqual(
+            NearfieldResources.menuBarIconURL(
+                searchRoots: [missingDevelopmentRoot, packagedRoot],
+                fileManager: fileManager
+            ),
+            iconURL
+        )
+    }
+
+    func testMenuBarResourceLocatorReturnsNilInsteadOfCrashingWhenMissing() {
+        let missingRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MissingNearfieldResources-\(UUID().uuidString)")
+
+        XCTAssertNil(
+            NearfieldResources.menuBarIconURL(searchRoots: [missingRoot])
+        )
+    }
+
     func testTestTonePlayerDoesNotPrepareCoreAudioDuringInitialization() {
         let player = TestTonePlayer()
 

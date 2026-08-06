@@ -22,13 +22,17 @@ let package = Package(
             exclude: [
                 // Compiled separately into default.metallib by build_and_run.sh;
                 // `swift build` does not handle .metal sources.
-                "WaveLabEffects.metal"
-            ],
-            resources: [
-                .process("Resources")
+                "WaveLabEffects.metal",
+                // Distribution resources are copied explicitly by
+                // build_app_bundle.sh. Avoid SwiftPM's generated Bundle.module
+                // accessor because it embeds a fatal source-tree fallback.
+                "Resources"
             ],
             swiftSettings: [
-                .define("NEARFIELD_DISTRIBUTION", .when(configuration: .release))
+                .define("NEARFIELD_DISTRIBUTION", .when(configuration: .release)),
+                // SwiftPM otherwise adds the active Xcode toolchain as an
+                // absolute runtime search path to the executable.
+                .unsafeFlags(["-no-toolchain-stdlib-rpath"])
             ],
             linkerSettings: [
                 .linkedFramework("AVFAudio"),

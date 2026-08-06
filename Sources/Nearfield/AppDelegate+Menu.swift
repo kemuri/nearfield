@@ -42,8 +42,7 @@ extension AppDelegate {
     }
 
     func menuBarIcon() -> NSImage? {
-        guard let url = Bundle.module.url(forResource: "menubar", withExtension: "svg", subdirectory: "Icons") ??
-            Bundle.module.url(forResource: "menubar", withExtension: "svg"),
+        guard let url = NearfieldResources.menuBarIconURL(),
               let image = NSImage(contentsOf: url) else {
             return NSImage(systemSymbolName: "hifispeaker.2", accessibilityDescription: "Nearfield")
         }
