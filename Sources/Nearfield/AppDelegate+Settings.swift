@@ -530,9 +530,14 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsPlayIdentificationChime(on display: AudioDevice) {
         do {
+            let physicalOutputsArePrepared = proxyPreparedDisplayState != nil ||
+                routerDriverManager.isRouterDefaultOutput()
             try testTonePlayer.playIdentificationChime(
                 on: display,
-                volume: routerDriverManager.currentAudibleGain() ?? 0.7
+                volume: IdentificationChimeGain.playerVolume(
+                    physicalOutputsArePrepared: physicalOutputsArePrepared,
+                    routerAudibleGain: routerDriverManager.currentAudibleGain()
+                )
             )
         } catch {
             showError(error)

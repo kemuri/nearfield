@@ -196,6 +196,13 @@ enum DisplayOutputStateBaseline {
             capturedUIDs.insert(state.deviceUID).inserted
         }
     }
+
+    static func pendingStates(
+        from states: [DisplayOutputState],
+        afterRestoring restoredDeviceUIDs: Set<String>
+    ) -> [DisplayOutputState] {
+        states.filter { !restoredDeviceUIDs.contains($0.deviceUID) }
+    }
 }
 
 enum NearfieldError: LocalizedError {
@@ -433,7 +440,8 @@ final class StudioDisplayAudioManager {
         }
     }
 
-    func restoreDisplayOutputState(_ states: [DisplayOutputState]) throws {
+    func restoreDisplayOutputState(_ states: [DisplayOutputState]) throws -> [DisplayOutputState] {
+        var restoredDeviceUIDs = Set<String>()
         for state in states {
             guard let device = device(matchingUID: state.deviceUID) else {
                 continue
@@ -444,7 +452,12 @@ final class StudioDisplayAudioManager {
             if let isMuted = state.isMuted {
                 try setMute(isMuted, for: [device])
             }
+            restoredDeviceUIDs.insert(state.deviceUID)
         }
+        return DisplayOutputStateBaseline.pendingStates(
+            from: states,
+            afterRestoring: restoredDeviceUIDs
+        )
     }
 
     func startObserving(_ callback: @escaping () -> Void) {

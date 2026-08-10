@@ -690,6 +690,53 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
+    func testPreparedDisplayBaselineRetainsDisconnectedDisplaysForLaterRestoration() {
+        let states = [
+            DisplayOutputState(deviceUID: "display-a", volume: 0.35, isMuted: false),
+            DisplayOutputState(deviceUID: "display-b", volume: 0.4, isMuted: true),
+            DisplayOutputState(deviceUID: "display-c", volume: 0.55, isMuted: false)
+        ]
+
+        XCTAssertEqual(
+            DisplayOutputStateBaseline.pendingStates(
+                from: states,
+                afterRestoring: ["display-a", "display-c"]
+            ),
+            [states[1]]
+        )
+        XCTAssertTrue(
+            DisplayOutputStateBaseline.pendingStates(
+                from: states,
+                afterRestoring: Set(states.map(\.deviceUID))
+            ).isEmpty
+        )
+    }
+
+    func testIdentificationChimeGainUsesTheActiveMasterVolumePath() {
+        XCTAssertEqual(
+            IdentificationChimeGain.playerVolume(
+                physicalOutputsArePrepared: false,
+                routerAudibleGain: 0.2
+            ),
+            1
+        )
+        XCTAssertEqual(
+            IdentificationChimeGain.playerVolume(
+                physicalOutputsArePrepared: true,
+                routerAudibleGain: 0.2
+            ),
+            0.2,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            IdentificationChimeGain.playerVolume(
+                physicalOutputsArePrepared: true,
+                routerAudibleGain: 1.4
+            ),
+            1
+        )
+    }
+
     func testDisplayArrangementMovesDroppedDisplayToTargetPosition() {
         let first = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
         let second = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)

@@ -16,6 +16,20 @@ private enum IdentificationChimePlaybackError: LocalizedError {
     }
 }
 
+enum IdentificationChimeGain {
+    static func playerVolume(
+        physicalOutputsArePrepared: Bool,
+        routerAudibleGain: Float32?
+    ) -> Float32 {
+        guard physicalOutputsArePrepared else {
+            // The physical output's own volume control remains in the signal
+            // path, so play at unity and let it follow the system volume.
+            return 1
+        }
+        return min(max(routerAudibleGain ?? 1, 0), 1)
+    }
+}
+
 @MainActor
 final class TestTonePlayer {
     static let identificationSoundURL = URL(

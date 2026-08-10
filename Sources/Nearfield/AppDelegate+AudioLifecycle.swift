@@ -183,9 +183,9 @@ extension AppDelegate {
 
     func restoreDisplaysAfterProxyDeactivation() throws {
         guard let displayState = proxyPreparedDisplayState else { return }
-        try audioManager.restoreDisplayOutputState(displayState)
-        proxyPreparedDisplayState = nil
-        saveProxyPreparedDisplayState(nil)
+        let pendingDisplayState = try audioManager.restoreDisplayOutputState(displayState)
+        proxyPreparedDisplayState = pendingDisplayState.isEmpty ? nil : pendingDisplayState
+        saveProxyPreparedDisplayState(proxyPreparedDisplayState)
     }
 
     enum AggregateCleanupScope: Equatable {
