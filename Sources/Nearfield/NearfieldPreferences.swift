@@ -14,6 +14,19 @@ enum NearfieldPreferences {
     static let latestOnboardingCompletionVersion = 1
     static let latestAggregateSchemaVersion = 12
 
+    private static let allKeys = [
+        outputModeKey,
+        leftDeviceUIDKey,
+        balanceKey,
+        showMenuBarAppKey,
+        onboardingCompletionVersionKey,
+        aggregateSchemaVersionKey,
+        proxyPreparedDisplayStateKey,
+        appRoutingEnabledKey,
+        appRoutingRulesKey,
+        appRoutingAppBundleIDsKey
+    ]
+
     static func outputMode(in defaults: UserDefaults = .standard) -> NearfieldOutputMode {
         guard let rawValue = defaults.string(forKey: outputModeKey),
               let mode = NearfieldOutputMode(rawValue: rawValue) else {
@@ -63,6 +76,10 @@ enum NearfieldPreferences {
 
     static func resetOnboardingCompletion(in defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: onboardingCompletionVersionKey)
+    }
+
+    static func resetAll(in defaults: UserDefaults = .standard) {
+        allKeys.forEach { defaults.removeObject(forKey: $0) }
     }
 
     static func migrateOnboardingCompletionIfNeeded(

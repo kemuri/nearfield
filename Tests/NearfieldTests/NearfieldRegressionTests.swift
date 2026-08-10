@@ -482,6 +482,99 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertEqual(StudioDisplayConnectionStatus(connectedCount: 2).detail, "2 Studio Displays connected")
     }
 
+    func testStudioDisplayConnectionStatusDoesNotReportDisconnectedWhenCoreAudioIsUnavailable() {
+        let unavailable = StudioDisplayConnectionStatus(
+            connectedCount: 0,
+            coreAudioAvailability: .unavailable
+        )
+        XCTAssertEqual(unavailable.state, .coreAudioUnavailable)
+        XCTAssertEqual(unavailable.title, "Core Audio Unavailable")
+        XCTAssertEqual(
+            unavailable.detail,
+            "Unable to check Studio Displays until Core Audio recovers"
+        )
+
+        let checking = StudioDisplayConnectionStatus(
+            connectedCount: 0,
+            coreAudioAvailability: .checking
+        )
+        XCTAssertEqual(checking.state, .checking)
+        XCTAssertEqual(checking.title, "Checking Core Audio")
+    }
+
+    func testCoreAudioReadinessRequiresANonemptyUsableDeviceInventory() {
+        let objectSize = UInt32(MemoryLayout<AudioObjectID>.size)
+
+        XCTAssertFalse(
+            CoreAudioReadinessProbe.hasUsableDeviceInventory(
+                sizeStatus: noErr,
+                dataSize: 0
+            )
+        )
+        XCTAssertFalse(
+            CoreAudioReadinessProbe.hasUsableDeviceInventory(
+                sizeStatus: kAudioHardwareUnspecifiedError,
+                dataSize: objectSize
+            )
+        )
+        XCTAssertFalse(
+            CoreAudioReadinessProbe.hasUsableDeviceInventory(
+                sizeStatus: noErr,
+                dataSize: objectSize,
+                dataStatus: kAudioHardwareUnspecifiedError,
+                deviceIDs: [1]
+            )
+        )
+        XCTAssertFalse(
+            CoreAudioReadinessProbe.hasUsableDeviceInventory(
+                sizeStatus: noErr,
+                dataSize: objectSize,
+                deviceIDs: [kAudioObjectUnknown]
+            )
+        )
+        XCTAssertTrue(
+            CoreAudioReadinessProbe.hasUsableDeviceInventory(
+                sizeStatus: noErr,
+                dataSize: objectSize,
+                deviceIDs: [1]
+            )
+        )
+    }
+
+    @MainActor
+    func testDriverRemovalWorkflowAlwaysRemovesAfterBestEffortPreparation() async throws {
+        var steps: [String] = []
+
+        try await DriverRemovalWorkflow.run(
+            prepare: { steps.append("prepare") },
+            removeDriver: { steps.append("remove") },
+            finish: { steps.append("finish") }
+        )
+
+        XCTAssertEqual(steps, ["prepare", "remove", "finish"])
+    }
+
+    @MainActor
+    func testDriverRemovalWorkflowOnlyStopsForPrivilegedRemovalFailure() async {
+        var didFinish = false
+
+        do {
+            try await DriverRemovalWorkflow.run(
+                prepare: {},
+                removeDriver: {
+                    throw NSError(
+                        domain: "NearfieldTests.DriverRemoval",
+                        code: 1
+                    )
+                },
+                finish: { didFinish = true }
+            )
+            XCTFail("Expected privileged driver removal to fail")
+        } catch {
+            XCTAssertFalse(didFinish)
+        }
+    }
+
     func testRouterCapabilityRequiresDriverOwnedTargetAggregate() {
         XCTAssertTrue(
             RouterAudioDriverManager.supportsDriverOwnedTargetAggregate(
@@ -849,6 +942,37 @@ final class NearfieldRegressionTests: XCTestCase {
         NearfieldPreferences.clearAppRoutingEnabled(in: defaults)
 
         XCTAssertFalse(NearfieldPreferences.appRoutingEnabled(in: defaults))
+    }
+
+    func testFullUninstallResetsNearfieldPreferences() {
+        let suiteName = "NearfieldTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated defaults suite")
+            return
+        }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        NearfieldPreferences.setOutputMode(.mono, in: defaults)
+        NearfieldPreferences.setLeftDeviceUID("display-left", in: defaults)
+        NearfieldPreferences.setBalance(0.5, in: defaults)
+        NearfieldPreferences.setShowMenuBarApp(false, in: defaults)
+        NearfieldPreferences.markOnboardingCompleted(in: defaults)
+        NearfieldPreferences.setAppRoutingEnabled(true, in: defaults)
+        NearfieldPreferences.setAppRoutingRules("com.example.App=left", in: defaults)
+        NearfieldPreferences.setAppRoutingAppBundleIDs(["com.example.App"], in: defaults)
+
+        NearfieldPreferences.resetAll(in: defaults)
+
+        XCTAssertEqual(NearfieldPreferences.outputMode(in: defaults), .stereo)
+        XCTAssertNil(NearfieldPreferences.leftDeviceUID(in: defaults))
+        XCTAssertEqual(NearfieldPreferences.balance(in: defaults), 0)
+        XCTAssertTrue(NearfieldPreferences.showMenuBarApp(in: defaults))
+        XCTAssertFalse(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
+        XCTAssertFalse(NearfieldPreferences.appRoutingEnabled(in: defaults))
+        XCTAssertEqual(NearfieldPreferences.appRoutingRules(in: defaults), "")
+        XCTAssertNil(NearfieldPreferences.appRoutingAppBundleIDs(in: defaults))
     }
 
     func testPreferencesProvideDefaultsAndRoundTripConfiguration() {

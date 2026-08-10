@@ -43,6 +43,7 @@ enum SpatialRoutingChannel: String, Equatable {
 @MainActor
 protocol SettingsAudioStateProviding: AnyObject {
     func settingsDevices() -> [AudioDevice]
+    func settingsCoreAudioAvailability() -> CoreAudioAvailability
     func settingsRefreshAudioState() async -> Bool
     func settingsMode() -> NearfieldOutputMode
     func settingsLeftDeviceUID() -> String?

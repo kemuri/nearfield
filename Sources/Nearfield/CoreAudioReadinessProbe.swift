@@ -27,7 +27,45 @@ enum CoreAudioReadinessProbe {
             nil,
             &dataSize
         )
-        return status == noErr ? EXIT_SUCCESS : EXIT_FAILURE
+        guard hasUsableDeviceInventory(sizeStatus: status, dataSize: dataSize) else {
+            return EXIT_FAILURE
+        }
+
+        let deviceCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        var deviceIDs = Array(repeating: AudioObjectID(0), count: deviceCount)
+        let dataStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &deviceIDs
+        )
+        return hasUsableDeviceInventory(
+            sizeStatus: status,
+            dataSize: dataSize,
+            dataStatus: dataStatus,
+            deviceIDs: deviceIDs
+        ) ? EXIT_SUCCESS : EXIT_FAILURE
+    }
+
+    static func hasUsableDeviceInventory(
+        sizeStatus: OSStatus,
+        dataSize: UInt32,
+        dataStatus: OSStatus = noErr,
+        deviceIDs: [AudioObjectID]? = nil
+    ) -> Bool {
+        let objectSize = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard sizeStatus == noErr,
+              dataStatus == noErr,
+              dataSize >= objectSize,
+              dataSize.isMultiple(of: objectSize) else {
+            return false
+        }
+        guard let deviceIDs else {
+            return true
+        }
+        return !deviceIDs.isEmpty && deviceIDs.contains(where: { $0 != kAudioObjectUnknown })
     }
 
     static func waitUntilReady(timeout: TimeInterval = 5) async -> Bool {

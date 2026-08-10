@@ -1,9 +1,26 @@
 import AppKit
 import ServiceManagement
 
+@MainActor
+enum DriverRemovalWorkflow {
+    static func run(
+        prepare: () async -> Void,
+        removeDriver: () async throws -> Void,
+        finish: () async -> Void
+    ) async throws {
+        await prepare()
+        try await removeDriver()
+        await finish()
+    }
+}
+
 extension AppDelegate: SettingsDelegate {
     func settingsDevices() -> [AudioDevice] {
         cachedAudioState.detectedDisplays
+    }
+
+    func settingsCoreAudioAvailability() -> CoreAudioAvailability {
+        coreAudioAvailability
     }
 
     func settingsRefreshAudioState() async -> Bool {
@@ -240,7 +257,6 @@ extension AppDelegate: SettingsDelegate {
         Task { @MainActor [weak self] in
             guard let self, await self.removeDriversAndTargets() else { return }
             if scope == .driversAndApp {
-                NearfieldPreferences.resetOnboardingCompletion()
                 self.removeApplicationBundleFromApplications()
             }
             self.refreshStatus()
@@ -253,47 +269,147 @@ extension AppDelegate: SettingsDelegate {
         dynamicRoutingRulesTask = nil
         lastAppliedRouterRouteRules = nil
         NearfieldPreferences.clearAppRoutingEnabled()
+        isRemovingDriver = true
+        coreAudioStartupTask?.cancel()
+        pendingAudioStateChangeTask?.cancel()
+        pendingAudioStateChangeTask = nil
+        mediaKeyVolumeController.stop()
+        audioManager.stopObserving()
+        didStartAudioServices = false
+
+        var shouldRestorePhysicalDefault = proxyPreparedDisplayState != nil || cachedRouterDefaultOutput
         do {
-            let isCoreAudioReady = coreAudioAvailability == .available
-                ? true
-                : await refreshCachedAudioState()
-            guard isCoreAudioReady else {
-                throw CoreAudioStartupError.unavailable
-            }
-            let shouldRestorePhysicalDefault = nearfieldVirtualOutputIsAnyDefault()
+            try await DriverRemovalWorkflow.run(
+                prepare: { [self] in
+                    shouldRestorePhysicalDefault = prepareAudioForDriverRemoval(
+                        shouldRestorePhysicalDefault: shouldRestorePhysicalDefault
+                    )
+                },
+                removeDriver: {
+                    try await Task.detached(priority: .userInitiated) {
+                        try DriverInstaller().removeAllInstalledDriversAndRestartCoreAudio()
+                    }.value
+                },
+                finish: { [self] in
+                    await finishAudioCleanupAfterDriverRemoval(
+                        shouldRestorePhysicalDefault: shouldRestorePhysicalDefault
+                    )
+                }
+            )
+        } catch {
+            isRemovingDriver = false
+            showError(error)
+            refreshStatus()
+            resumeCoreAudioServicesAfterDriverRemoval()
+            return false
+        }
+
+        isRemovingDriver = false
+        refreshStatus()
+        resumeCoreAudioServicesAfterDriverRemoval()
+        return true
+    }
+
+    private func prepareAudioForDriverRemoval(
+        shouldRestorePhysicalDefault: Bool
+    ) -> Bool {
+        guard coreAudioAvailability == .available else {
+            recordRecoverableError(
+                CoreAudioStartupError.unavailable,
+                context: "Skipping pre-uninstall audio restoration"
+            )
+            return shouldRestorePhysicalDefault
+        }
+
+        var shouldRestorePhysicalDefault = shouldRestorePhysicalDefault
+        do {
+            shouldRestorePhysicalDefault = nearfieldVirtualOutputIsAnyDefault() || shouldRestorePhysicalDefault
             try performSynchronizedAudioUpdate {
                 try restoreDisplaysAfterProxyDeactivation()
                 if shouldRestorePhysicalDefault {
                     _ = try audioManager.selectFallbackOutputAsDefault()
                 }
             }
-            try await Task.detached(priority: .userInitiated) {
-                try DriverInstaller().removeAllInstalledDriversAndRestartCoreAudio()
-            }.value
-            invalidateCoreAudioReadiness()
-            guard await refreshCachedAudioState(timeout: 10) else {
-                throw CoreAudioStartupError.unavailable
+        } catch {
+            recordRecoverableError(error, context: "Pre-uninstall audio restoration failed")
+        }
+        return shouldRestorePhysicalDefault
+    }
+
+    private func finishAudioCleanupAfterDriverRemoval(
+        shouldRestorePhysicalDefault: Bool
+    ) async {
+        invalidateCoreAudioReadiness()
+        guard await waitForCoreAudioAfterDriverRemoval() else {
+            recordRecoverableError(
+                CoreAudioStartupError.unavailable,
+                context: "Driver removed; post-uninstall audio cleanup deferred"
+            )
+            return
+        }
+
+        var cleanupFailed = false
+        do {
+            try performSynchronizedAudioUpdate {
+                try restoreDisplaysAfterProxyDeactivation()
             }
-            if shouldRestorePhysicalDefault {
-                try await restorePhysicalDefaultOutputAfterCoreAudioRestart()
-            }
+        } catch {
+            cleanupFailed = true
+            recordRecoverableError(error, context: "Post-uninstall display restoration failed")
+        }
+
+        do {
             try performSynchronizedAudioUpdate {
                 try audioManager.cleanupAllNearfieldAggregates()
                 markAggregateSchemaCurrent()
-                proxyPreparedDisplayState = nil
-                saveProxyPreparedDisplayState(nil)
             }
-            if shouldRestorePhysicalDefault {
-                try await restorePhysicalDefaultOutputAfterCoreAudioRestart()
-            }
-            _ = await refreshCachedAudioState()
-            clearRecoverableError()
-            refreshStatus()
-            return true
         } catch {
-            showError(error)
-            refreshStatus()
-            return false
+            cleanupFailed = true
+            recordRecoverableError(error, context: "Post-uninstall target cleanup failed")
+        }
+
+        if shouldRestorePhysicalDefault {
+            do {
+                try await restorePhysicalDefaultOutputAfterCoreAudioRestart()
+            } catch {
+                cleanupFailed = true
+                recordRecoverableError(error, context: "Post-uninstall default output restoration failed")
+            }
+        }
+
+        if !cleanupFailed {
+            proxyPreparedDisplayState = nil
+            saveProxyPreparedDisplayState(nil)
+            clearRecoverableError()
+        }
+        _ = await refreshCachedAudioState()
+    }
+
+    private func waitForCoreAudioAfterDriverRemoval(
+        timeout: TimeInterval = 30,
+        interval: TimeInterval = 0.5
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { break }
+            if await refreshCachedAudioState(timeout: min(5, max(0.25, remaining))) {
+                return true
+            }
+            guard Date() < deadline else { break }
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        } while !Task.isCancelled
+        return false
+    }
+
+    private func resumeCoreAudioServicesAfterDriverRemoval() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            while self.coreAudioStartupTask != nil {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard !Task.isCancelled else { return }
+            }
+            self.startCoreAudioServices()
         }
     }
 
@@ -334,7 +450,15 @@ extension AppDelegate: SettingsDelegate {
         do {
             didPromptForDriverUninstallAfterApplicationRemoval = true
             stopApplicationRemovalMonitor()
+            if SMAppService.mainApp.status == .enabled {
+                do {
+                    try SMAppService.mainApp.unregister()
+                } catch {
+                    recordRecoverableError(error, context: "Open-at-login cleanup failed")
+                }
+            }
             try FileManager.default.removeItem(at: bundleURL)
+            NearfieldPreferences.resetAll()
             NSApp.terminate(nil)
         } catch {
             startApplicationRemovalMonitorIfNeeded()

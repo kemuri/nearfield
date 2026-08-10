@@ -4,6 +4,12 @@ import os
 import Sparkle
 #endif
 
+enum CoreAudioAvailability: Equatable {
+    case checking
+    case available
+    case unavailable
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     #if NEARFIELD_DISTRIBUTION
@@ -14,12 +20,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         static let laterActionIdentifier = "nearfield-update-later"
     }
     #endif
-
-    enum CoreAudioAvailability: Equatable {
-        case checking
-        case available
-        case unavailable
-    }
 
     let audioManager = StudioDisplayAudioManager()
     let routerDriverManager = RouterAudioDriverManager()
@@ -69,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var coreAudioReadinessGeneration = 0
     var coreAudioStartupTask: Task<Void, Never>?
     var didStartAudioServices = false
+    var isRemovingDriver = false
 
     enum UninstallScope {
         case driversOnly
@@ -180,26 +181,38 @@ extension AppDelegate {
     /// routing online. Safe to call from either the normal launch path or the
     /// end of first-run onboarding; repeat calls are ignored.
     func startCoreAudioServices(completion: (() -> Void)? = nil) {
-        guard !didStartAudioServices, coreAudioStartupTask == nil else {
+        guard !didStartAudioServices, !isRemovingDriver, coreAudioStartupTask == nil else {
             completion?()
             return
         }
 
         coreAudioStartupTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let isReady = await self.refreshCachedAudioState()
-            guard !Task.isCancelled else { return }
-            if isReady {
-                self.startAudioServices()
-            } else {
-                self.recordRecoverableError(
-                    CoreAudioStartupError.unavailable,
-                    context: "Core Audio startup failed"
-                )
+            defer { self.coreAudioStartupTask = nil }
+            var didRecordStartupFailure = false
+
+            while !Task.isCancelled, !self.didStartAudioServices, !self.isRemovingDriver {
+                let isReady = await self.refreshCachedAudioState()
+                guard !Task.isCancelled else { return }
+                if isReady {
+                    self.clearRecoverableError()
+                    self.startAudioServices()
+                    break
+                }
+
+                if !didRecordStartupFailure {
+                    self.recordRecoverableError(
+                        CoreAudioStartupError.unavailable,
+                        context: "Core Audio startup failed"
+                    )
+                    didRecordStartupFailure = true
+                }
+                self.refreshStatus()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
+
             self.refreshStatus()
             completion?()
-            self.coreAudioStartupTask = nil
         }
     }
 

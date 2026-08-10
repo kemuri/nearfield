@@ -149,6 +149,7 @@ final class OnboardingModel: ObservableObject {
     @Published var nearfieldDriverSelected = false
     @Published var appVersionText = "Version 0.1.0"
     @Published var studioDisplayCount = 0
+    @Published var coreAudioAvailability: CoreAudioAvailability = .checking
     @Published var spatialRoutingEnabled = true
     @Published var spatialRoutingApps: [SpatialRoutingApp] = []
     @Published var selectedSpatialRoutingAppID: String?
@@ -191,6 +192,7 @@ final class OnboardingModel: ObservableObject {
             driverInstalled = delegate.settingsDriverInstalled()
             nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
             studioDisplayCount = delegate.settingsDevices().count
+            coreAudioAvailability = delegate.settingsCoreAudioAvailability()
         }
         appVersionText = delegate.settingsAppVersionText()
         spatialRoutingEnabled = delegate.settingsAppRoutingEnabled()

@@ -21,7 +21,8 @@ struct SettingsOnboardingView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             StudioDisplayStatusPill(
                                 status: StudioDisplayConnectionStatus(
-                                    connectedCount: model.studioDisplayCount
+                                    connectedCount: model.studioDisplayCount,
+                                    coreAudioAvailability: model.coreAudioAvailability
                                 )
                             )
                             .frame(width: OnboardingLayout.contentWidth)
@@ -565,11 +566,27 @@ private struct StudioDisplayStatusPill: View {
     let status: StudioDisplayConnectionStatus
 
     private var statusColor: Color {
-        status.isConnected ? .green : .yellow
+        switch status.state {
+        case .connected:
+            return .green
+        case .coreAudioUnavailable:
+            return .red
+        case .checking, .notConnected:
+            return .yellow
+        }
     }
 
     private var statusSymbolName: String {
-        status.isConnected ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+        switch status.state {
+        case .connected:
+            return "checkmark.circle.fill"
+        case .checking:
+            return "clock.fill"
+        case .coreAudioUnavailable:
+            return "xmark.octagon.fill"
+        case .notConnected:
+            return "exclamationmark.triangle.fill"
+        }
     }
 
     var body: some View {

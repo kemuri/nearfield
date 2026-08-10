@@ -4835,8 +4835,14 @@ int ProxyAudioDevice::devicesListenerProc(AudioObjectID inObjectID,
 #pragma unused(inNumberAddresses)
 #pragma unused(inAddresses)
     DebugMsg("ProxyAudio: devicesListenerProc current devices changed");
-    rebuildDriverOwnedTargetAggregate(false);
-    setupTargetOutputDevice();
+    // Core Audio invokes this callback while it is processing a device-list
+    // change. Re-entering the HAL synchronously from here (the aggregate
+    // rebuild calls AudioHardwareCreateAggregateDevice) can deadlock the
+    // driver service and leave all clients with an empty device inventory.
+    ExecuteInAudioOutputThread(^{
+        rebuildDriverOwnedTargetAggregate(false);
+        setupTargetOutputDevice();
+    });
     return noErr;
 }
 

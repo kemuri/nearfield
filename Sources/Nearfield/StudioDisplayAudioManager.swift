@@ -9,16 +9,62 @@ struct NearfieldState {
 
 struct StudioDisplayConnectionStatus: Equatable {
     let connectedCount: Int
+    let coreAudioAvailability: CoreAudioAvailability
+
+    init(
+        connectedCount: Int,
+        coreAudioAvailability: CoreAudioAvailability = .available
+    ) {
+        self.connectedCount = connectedCount
+        self.coreAudioAvailability = coreAudioAvailability
+    }
+
+    enum State: Equatable {
+        case checking
+        case coreAudioUnavailable
+        case connected
+        case notConnected
+    }
+
+    var state: State {
+        switch coreAudioAvailability {
+        case .checking:
+            return .checking
+        case .unavailable:
+            return .coreAudioUnavailable
+        case .available:
+            return isConnected ? .connected : .notConnected
+        }
+    }
 
     var isConnected: Bool {
-        NearfieldRouterPolicy.shouldPublishRouter(studioDisplayCount: connectedCount)
+        coreAudioAvailability == .available &&
+            NearfieldRouterPolicy.shouldPublishRouter(studioDisplayCount: connectedCount)
     }
 
     var title: String {
-        isConnected ? "Connected" : "Not Connected"
+        switch state {
+        case .checking:
+            return "Checking Core Audio"
+        case .coreAudioUnavailable:
+            return "Core Audio Unavailable"
+        case .connected:
+            return "Connected"
+        case .notConnected:
+            return "Not Connected"
+        }
     }
 
     var detail: String {
+        switch state {
+        case .checking:
+            return "Checking Studio Display audio devices…"
+        case .coreAudioUnavailable:
+            return "Unable to check Studio Displays until Core Audio recovers"
+        case .connected, .notConnected:
+            break
+        }
+
         switch connectedCount {
         case 0:
             return "No Studio Displays connected"
