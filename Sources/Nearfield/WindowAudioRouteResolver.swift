@@ -14,6 +14,44 @@ final class WindowAudioRouteResolver {
         let area: CGFloat
     }
 
+    private let studioDisplays: () -> [AudioDevice]
+    private let leftDeviceUID: () -> String?
+    private let displayOrderUIDs: () -> [String]
+
+    init(
+        studioDisplays: @escaping () -> [AudioDevice] = { [] },
+        leftDeviceUID: @escaping () -> String? = { nil },
+        displayOrderUIDs: @escaping () -> [String] = { [] }
+    ) {
+        self.studioDisplays = studioDisplays
+        self.leftDeviceUID = leftDeviceUID
+        self.displayOrderUIDs = displayOrderUIDs
+    }
+
+    static func assignedRoutes(
+        for displays: [AudioDevice],
+        leftDeviceUID: String?,
+        displayOrderUIDs: [String] = []
+    ) -> [String: String] {
+        let arrangedDisplays = StudioDisplayAudioManager.orderedDisplays(
+            from: displays,
+            leftDeviceUID: leftDeviceUID,
+            displayOrderUIDs: displayOrderUIDs
+        )
+        guard arrangedDisplays.count >= 2 else { return [:] }
+        if arrangedDisplays.count >= 3 {
+            // The virtual routing bus remains stereo. A center-screen app must
+            // therefore keep its stereo pair; the physical center target gets
+            // the equal L/R mix when the driver fans that pair out to 3 outputs.
+            return [
+                arrangedDisplays[0].uid: "left",
+                arrangedDisplays[1].uid: "pair",
+                arrangedDisplays[2].uid: "right"
+            ]
+        }
+        return [arrangedDisplays[0].uid: "left", arrangedDisplays[1].uid: "right"]
+    }
+
     func resolvedRules(from rawRules: String) -> String {
         let rules = AppRoutingRules.parse(rawRules)
 
@@ -200,6 +238,34 @@ final class WindowAudioRouteResolver {
     }
 
     private func displayTargets() -> [DisplayTarget] {
+        let displays = studioDisplays()
+        let assignedRoutes = Self.assignedRoutes(
+            for: displays,
+            leftDeviceUID: leftDeviceUID(),
+            displayOrderUIDs: displayOrderUIDs()
+        )
+        let assignedTargets: [DisplayTarget] = displays.prefix(3).compactMap { display in
+            guard let route = assignedRoutes[display.uid] else { return nil }
+            guard let screen = StudioDisplayScreenMatcher.screen(forAudioDeviceUID: display.uid),
+                  let displayID = screen.deviceDescription[
+                    NSDeviceDescriptionKey("NSScreenNumber")
+                  ] as? CGDirectDisplayID else {
+                return nil
+            }
+            return DisplayTarget(
+                route: route,
+                bounds: CGDisplayBounds(displayID)
+            )
+        }
+        let assignedScreensAreUnique = assignedTargets.enumerated().allSatisfy { index, target in
+            !assignedTargets.prefix(index).contains(where: { $0.bounds == target.bounds })
+        }
+        if assignedTargets.count == min(3, displays.count), assignedScreensAreUnique {
+            return assignedTargets
+        }
+
+        // Older or non-Studio-Display setups cannot be matched through the
+        // USB/DisplayPort identity chain, so retain the spatial fallback.
         let screens = NSScreen.screens
         let studioScreens = screens.filter { $0.localizedName.localizedCaseInsensitiveContains("Studio Display") }
         let candidateScreens = studioScreens.count >= 2 ? studioScreens : screens
@@ -219,9 +285,14 @@ final class WindowAudioRouteResolver {
             }
 
         guard sortedScreens.count >= 2 else { return [] }
-        return [
-            DisplayTarget(route: "left", bounds: sortedScreens[0].bounds),
-            DisplayTarget(route: "right", bounds: sortedScreens[1].bounds)
-        ]
+        if sortedScreens.count >= 3 {
+            return [
+                DisplayTarget(route: "left", bounds: sortedScreens[0].bounds),
+                DisplayTarget(route: "pair", bounds: sortedScreens[1].bounds),
+                DisplayTarget(route: "right", bounds: sortedScreens[2].bounds)
+            ]
+        }
+        return [DisplayTarget(route: "left", bounds: sortedScreens[0].bounds),
+                DisplayTarget(route: "right", bounds: sortedScreens[1].bounds)]
     }
 }

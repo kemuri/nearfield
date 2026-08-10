@@ -23,8 +23,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let audioManager = StudioDisplayAudioManager()
     let routerDriverManager = RouterAudioDriverManager()
-    let windowRouteResolver = WindowAudioRouteResolver()
+    lazy var windowRouteResolver = WindowAudioRouteResolver(
+        studioDisplays: { [weak self] in
+            self?.audioManager.studioDisplayDevices() ?? []
+        },
+        leftDeviceUID: {
+            NearfieldPreferences.leftDeviceUID()
+        },
+        displayOrderUIDs: {
+            NearfieldPreferences.displayOrderUIDs()
+        }
+    )
     lazy var testTonePlayer = TestTonePlayer()
+    lazy var displayIdentificationController = DisplayIdentificationController()
     let logger = Logger(subsystem: "com.kemuri.Nearfield", category: "AudioState")
     var onboardingWindowController: OnboardingWindowController?
     #if !NEARFIELD_DISTRIBUTION
@@ -46,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var proxyPreparedDisplayState: [DisplayOutputState]?
     var routerVolumeContinuity = RouterVolumeContinuity()
     var pendingAudioStateChangeTask: Task<Void, Never>?
+    var pendingDisplayAssignmentTask: Task<Void, Never>?
     var dynamicRoutingRulesTask: Task<Void, Never>?
     var dynamicRoutingNotificationObservers: [NSObjectProtocol] = []
     var isDynamicRoutingSystemActive = true

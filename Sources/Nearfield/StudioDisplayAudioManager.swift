@@ -1,4 +1,5 @@
 import CoreAudio
+import CoreGraphics
 import Foundation
 
 struct NearfieldState {
@@ -82,6 +83,10 @@ struct AudioDevice: Equatable {
     let name: String
     let outputChannelCount: UInt32
 
+    var visualKind: DisplayEndpointVisualKind {
+        DisplayEndpointVisualKind(deviceUID: uid, deviceName: name)
+    }
+
     func displayName(index: Int) -> String {
         return "Display \(index + 1) - \(name) (\(shortIdentifier))"
     }
@@ -92,6 +97,66 @@ struct AudioDevice: Equatable {
             return String(uid.suffix(10))
         }
         return String(parts[parts.count - 2].suffix(8))
+    }
+}
+
+enum DisplayOrder {
+    static func normalizedUIDs(_ uids: [String], limit: Int = 3) -> [String] {
+        guard limit > 0 else { return [] }
+        var seen = Set<String>()
+        var result: [String] = []
+        for uid in uids where !uid.isEmpty && seen.insert(uid).inserted {
+            result.append(uid)
+            if result.count == limit {
+                break
+            }
+        }
+        return result
+    }
+}
+
+enum DisplayEndpointVisualKind: Equatable {
+    case monitor
+    case macBook
+
+    init(deviceUID: String, deviceName: String) {
+        let identity = "\(deviceUID) \(deviceName)"
+        self = identity.localizedCaseInsensitiveContains("MacBook") ||
+            identity.localizedCaseInsensitiveContains("BuiltInSpeaker") ||
+            identity.localizedCaseInsensitiveContains("Built-in")
+            ? .macBook
+            : .monitor
+    }
+
+    var symbolName: String {
+        switch self {
+        case .monitor: "display"
+        case .macBook: "laptopcomputer"
+        }
+    }
+}
+
+enum DisplayEndpointVisibility {
+    static func builtInDisplayIsVisible() -> Bool {
+        var displayCount: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &displayCount) == .success,
+              displayCount > 0 else {
+            return false
+        }
+        var displayIDs = Array(repeating: CGDirectDisplayID(0), count: Int(displayCount))
+        guard CGGetActiveDisplayList(displayCount, &displayIDs, &displayCount) == .success else {
+            return false
+        }
+        return displayIDs.prefix(Int(displayCount)).contains { CGDisplayIsBuiltin($0) != 0 }
+    }
+
+    static func visibleDevices(
+        from devices: [AudioDevice],
+        builtInDisplayIsVisible: Bool
+    ) -> [AudioDevice] {
+        devices.filter { device in
+            device.visualKind != .macBook || builtInDisplayIsVisible
+        }
     }
 }
 
@@ -112,12 +177,25 @@ enum NearfieldOutputMode: String, CaseIterable {
 struct NearfieldConfiguration {
     var mode: NearfieldOutputMode
     var leftDeviceUID: String?
+    var displayOrderUIDs: [String] = []
 }
 
-struct DisplayOutputState: Codable {
+struct DisplayOutputState: Codable, Equatable {
     let deviceUID: String
     let volume: Float32?
     let isMuted: Bool?
+}
+
+enum DisplayOutputStateBaseline {
+    static func merging(
+        existing: [DisplayOutputState],
+        current: [DisplayOutputState]
+    ) -> [DisplayOutputState] {
+        var capturedUIDs = Set(existing.map(\.deviceUID))
+        return existing + current.filter { state in
+            capturedUIDs.insert(state.deviceUID).inserted
+        }
+    }
 }
 
 enum NearfieldError: LocalizedError {
@@ -173,8 +251,12 @@ final class StudioDisplayAudioManager {
         guard displays.count >= 2 else {
             throw NearfieldError.notEnoughStudioDisplays(displays.count)
         }
-        return Self.orderedDisplays(from: displays, leftDeviceUID: configuration.leftDeviceUID)
-            .prefix(2)
+        return Self.orderedDisplays(
+            from: displays,
+            leftDeviceUID: configuration.leftDeviceUID,
+            displayOrderUIDs: configuration.displayOrderUIDs
+        )
+            .prefix(3)
             .map(\.uid)
     }
 
@@ -256,7 +338,7 @@ final class StudioDisplayAudioManager {
             throw NearfieldError.studioPairNotActive
         }
 
-        let displays = Array(studioDisplayOutputs().prefix(2))
+        let displays = Array(studioDisplayOutputs().prefix(3))
         guard displays.count >= 2 else {
             throw NearfieldError.notEnoughStudioDisplays(displays.count)
         }
@@ -272,7 +354,7 @@ final class StudioDisplayAudioManager {
             throw NearfieldError.studioPairNotActive
         }
 
-        let displays = Array(studioDisplayOutputs().prefix(2))
+        let displays = Array(studioDisplayOutputs().prefix(3))
         guard displays.count >= 2 else {
             throw NearfieldError.notEnoughStudioDisplays(displays.count)
         }
@@ -281,24 +363,39 @@ final class StudioDisplayAudioManager {
         try setMute(shouldMute, for: displays)
     }
 
-    func setDisplayBalance(_ balance: Float32, leftDeviceUID: String?) throws {
+    func setDisplayBalance(
+        _ balance: Float32,
+        leftDeviceUID: String?,
+        displayOrderUIDs: [String] = []
+    ) throws {
         let displays = studioDisplayOutputs()
         guard displays.count >= 2 else {
             throw NearfieldError.notEnoughStudioDisplays(displays.count)
         }
-        let ordered = Self.orderedDisplays(from: displays, leftDeviceUID: leftDeviceUID)
+        let ordered = Self.orderedDisplays(
+            from: displays,
+            leftDeviceUID: leftDeviceUID,
+            displayOrderUIDs: displayOrderUIDs
+        )
+        let rightDisplay = ordered.count >= 3 ? ordered[2] : ordered[1]
         let volumes = BalanceMath.channelVolumes(
             currentLeft: volume(for: ordered[0]),
-            currentRight: volume(for: ordered[1]),
+            currentRight: volume(for: rightDisplay),
             balance: balance,
             minimumBaseVolume: 0.01
         )
         try setVolume(volumes.left, for: [ordered[0]])
-        try setVolume(volumes.right, for: [ordered[1]])
+        if ordered.count == 2 {
+            try setVolume(volumes.right, for: [ordered[1]])
+        } else {
+            let centerVolume = max(volumes.left, volumes.right)
+            try setVolume(centerVolume, for: [ordered[1]])
+            try setVolume(volumes.right, for: [ordered[2]])
+        }
     }
 
     func prepareDisplaysForProxyOutput() throws {
-        let displays = Array(studioDisplayOutputs().prefix(2))
+        let displays = Array(studioDisplayOutputs().prefix(3))
         guard displays.count >= 2 else {
             throw NearfieldError.notEnoughStudioDisplays(displays.count)
         }
@@ -322,7 +419,7 @@ final class StudioDisplayAudioManager {
     }
 
     func captureDisplayOutputState() throws -> [DisplayOutputState] {
-        let displays = Array(studioDisplayOutputs().prefix(2))
+        let displays = Array(studioDisplayOutputs().prefix(3))
         guard displays.count >= 2 else {
             throw NearfieldError.notEnoughStudioDisplays(displays.count)
         }
@@ -387,9 +484,10 @@ final class StudioDisplayAudioManager {
     }
 
     private func studioDisplayOutputs() -> [AudioDevice] {
-        allDevices()
+        Array(allDevices()
             .filter { $0.outputChannelCount > 0 && $0.name.localizedCaseInsensitiveContains("Studio Display") }
             .sorted { $0.uid < $1.uid }
+            .prefix(3))
     }
 
     private func allDevices() -> [AudioDevice] {
@@ -590,16 +688,24 @@ final class StudioDisplayAudioManager {
         )
     }
 
-    static func orderedDisplays(from displays: [AudioDevice], leftDeviceUID: String?) -> [AudioDevice] {
-        let selectedDisplays = Array(displays.prefix(2))
-        guard selectedDisplays.count == 2, let leftDeviceUID else {
-            return selectedDisplays
+    static func orderedDisplays(
+        from displays: [AudioDevice],
+        leftDeviceUID: String?,
+        displayOrderUIDs: [String] = []
+    ) -> [AudioDevice] {
+        let selectedDisplays = Array(displays.prefix(3))
+        guard selectedDisplays.count >= 2 else { return selectedDisplays }
+
+        let storedOrder = DisplayOrder.normalizedUIDs(displayOrderUIDs.isEmpty
+            ? leftDeviceUID.map { [$0] } ?? []
+            : displayOrderUIDs)
+        let ordered = storedOrder.compactMap { uid in
+            selectedDisplays.first(where: { $0.uid == uid })
         }
-        guard let left = selectedDisplays.first(where: { $0.uid == leftDeviceUID }),
-              let right = selectedDisplays.first(where: { $0.uid != leftDeviceUID }) else {
-            return selectedDisplays
+        let remaining = selectedDisplays.filter { display in
+            !ordered.contains(where: { $0.uid == display.uid })
         }
-        return [left, right]
+        return ordered + remaining
     }
 
     private func destroyAggregate(_ deviceID: AudioObjectID) throws {

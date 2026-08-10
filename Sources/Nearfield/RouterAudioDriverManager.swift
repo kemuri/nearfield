@@ -4,6 +4,7 @@ import Foundation
 enum RouterAudioDriverError: LocalizedError {
     case notInstalled
     case unsupportedDriver
+    case unsupportedThreeDisplayDriver
     case configurationFailed(String, OSStatus)
     case defaultOutputFailed(OSStatus)
     case balanceFailed(String, OSStatus)
@@ -14,6 +15,8 @@ enum RouterAudioDriverError: LocalizedError {
             return "NearfieldAudioDevice.driver is not installed or CoreAudio has not loaded it yet."
         case .unsupportedDriver:
             return "The installed Nearfield audio driver is outdated and does not support private target routing. Reinstall the driver from Nearfield Settings."
+        case .unsupportedThreeDisplayDriver:
+            return "The installed Nearfield audio driver is outdated and does not support three-display output. Reinstall the driver from Nearfield Settings."
         case .configurationFailed(let setting, let status):
             return "Configuring router driver setting '\(setting)' failed with CoreAudio status \(status)."
         case .defaultOutputFailed(let status):
@@ -64,6 +67,10 @@ final class RouterAudioDriverManager {
         try setConfiguratorPID(Int32(ProcessInfo.processInfo.processIdentifier), boxID: boxID)
         guard supportsDriverOwnedTargetAggregate(boxID: boxID) else {
             throw RouterAudioDriverError.unsupportedDriver
+        }
+        if targetDeviceUIDs.count >= 3,
+           !supportsThreeDisplayTargetAggregate(boxID: boxID) {
+            throw RouterAudioDriverError.unsupportedThreeDisplayDriver
         }
         try setConfiguration("deviceName", value: displayName, boxID: boxID)
         try setConfiguration("targetAggregateDevices", value: targetDeviceUIDs.joined(separator: "\n"), boxID: boxID)
@@ -124,6 +131,25 @@ final class RouterAudioDriverManager {
             return nil
         }
         return max(left, right)
+    }
+
+    func currentAudibleGain() -> Float32? {
+        guard !isMuted() else { return 0 }
+        guard let controls = volumeControlIDs(),
+              let leftScalar = volumeControlValue(controls.left),
+              let rightScalar = volumeControlValue(controls.right) else {
+            return nil
+        }
+        let louderControl = leftScalar >= rightScalar ? controls.left : controls.right
+        let louderScalar = max(leftScalar, rightScalar)
+        guard louderScalar > 0 else { return 0 }
+        guard let decibels: Float32 = CoreAudioProperty.read(
+            from: louderControl,
+            selector: kAudioLevelControlPropertyDecibelValue
+        ) else {
+            return louderScalar
+        }
+        return min(max(powf(10, decibels / 20), 0), 1)
     }
 
     func setBalance(_ balance: Float32) throws {
@@ -215,10 +241,27 @@ final class RouterAudioDriverManager {
     }
 
     static func supportsDriverOwnedTargetAggregate(in capabilities: String?) -> Bool {
+        capabilityTokens(in: capabilities)
+            .contains("driverOwnedTargetAggregate")
+    }
+
+    private func supportsThreeDisplayTargetAggregate(boxID: AudioObjectID) -> Bool {
+        guard let capabilities = try? configurationValue(.driverCapabilities, boxID: boxID) else {
+            return false
+        }
+        return Self.supportsThreeDisplayTargetAggregate(in: capabilities)
+    }
+
+    static func supportsThreeDisplayTargetAggregate(in capabilities: String?) -> Bool {
+        capabilityTokens(in: capabilities)
+            .contains("threeDisplayTargetAggregate")
+    }
+
+    private static func capabilityTokens(in capabilities: String?) -> [String] {
         capabilities?
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .contains("driverOwnedTargetAggregate") == true
+            ?? []
     }
 
     private func configurationValue(_ type: ConfigType, boxID: AudioObjectID) throws -> String? {

@@ -1,4 +1,5 @@
 import AppKit
+import AVFAudio
 import CoreAudio
 import SwiftUI
 import XCTest
@@ -38,10 +39,25 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testTestTonePlayerDoesNotPrepareCoreAudioDuringInitialization() {
+    @MainActor
+    func testIdentificationChimePlayerDoesNotPrepareCoreAudioDuringInitialization() {
         let player = TestTonePlayer()
 
         XCTAssertFalse(player.isAudioGraphPrepared)
+    }
+
+    @MainActor
+    func testIdentificationChimeUsesALongerMacOSSystemSound() throws {
+        XCTAssertEqual(TestTonePlayer.identificationSoundURL.pathExtension, "aiff")
+        XCTAssertTrue(
+            TestTonePlayer.identificationSoundURL.path.hasPrefix("/System/Library/Sounds/")
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: TestTonePlayer.identificationSoundURL.path))
+
+        let soundFile = try AVAudioFile(forReading: TestTonePlayer.identificationSoundURL)
+        let duration = Double(soundFile.length) / soundFile.fileFormat.sampleRate
+        XCTAssertGreaterThanOrEqual(duration, 1)
+        XCTAssertLessThanOrEqual(duration, 3)
     }
 
     func testBalanceMathPreservesLouderSideAndReducesOppositeChannel() {
@@ -585,6 +601,20 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertFalse(RouterAudioDriverManager.supportsDriverOwnedTargetAggregate(in: nil))
     }
 
+    func testRouterCapabilityAdvertisesThreeDisplayOutputSeparately() {
+        XCTAssertTrue(
+            RouterAudioDriverManager.supportsThreeDisplayTargetAggregate(
+                in: "driverOwnedTargetAggregate, threeDisplayTargetAggregate"
+            )
+        )
+        XCTAssertFalse(
+            RouterAudioDriverManager.supportsThreeDisplayTargetAggregate(
+                in: "driverOwnedTargetAggregate"
+            )
+        )
+        XCTAssertFalse(RouterAudioDriverManager.supportsThreeDisplayTargetAggregate(in: nil))
+    }
+
     func testDisplayOrderingUsesSelectedLeftDisplay() {
         let first = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
         let second = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)
@@ -595,7 +625,294 @@ final class NearfieldRegressionTests: XCTestCase {
             leftDeviceUID: second.uid
         )
 
-        XCTAssertEqual(ordered, [second, first])
+        XCTAssertEqual(ordered, [second, first, third])
+    }
+
+    func testDisplayOrderingPreservesThreeSavedChannelRoles() {
+        let first = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
+        let second = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)
+        let third = AudioDevice(id: 3, uid: "display-c", name: "Studio Display C", outputChannelCount: 2)
+
+        XCTAssertEqual(
+            StudioDisplayAudioManager.orderedDisplays(
+                from: [first, second, third],
+                leftDeviceUID: first.uid,
+                displayOrderUIDs: [third.uid, first.uid, second.uid]
+            ),
+            [third, first, second]
+        )
+        XCTAssertEqual(
+            DisplayChannelRole.roles(displayCount: 3),
+            [.left, .center, .right]
+        )
+    }
+
+    func testDisplayOrderDropsEmptyDuplicateAndExcessUIDs() {
+        XCTAssertEqual(
+            DisplayOrder.normalizedUIDs([
+                "display-a",
+                "",
+                "display-a",
+                "display-b",
+                "display-c",
+                "display-d"
+            ]),
+            ["display-a", "display-b", "display-c"]
+        )
+
+        let first = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
+        let second = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)
+        let third = AudioDevice(id: 3, uid: "display-c", name: "Studio Display C", outputChannelCount: 2)
+        XCTAssertEqual(
+            StudioDisplayAudioManager.orderedDisplays(
+                from: [first, second, third],
+                leftDeviceUID: nil,
+                displayOrderUIDs: [second.uid, second.uid, first.uid]
+            ),
+            [second, first, third]
+        )
+    }
+
+    func testPreparedDisplayBaselineCapturesNewThirdDisplayWithoutOverwritingExistingState() {
+        let existing = [
+            DisplayOutputState(deviceUID: "display-a", volume: 0.35, isMuted: false),
+            DisplayOutputState(deviceUID: "display-b", volume: 0.4, isMuted: true)
+        ]
+        let current = [
+            DisplayOutputState(deviceUID: "display-a", volume: 1, isMuted: false),
+            DisplayOutputState(deviceUID: "display-b", volume: 1, isMuted: false),
+            DisplayOutputState(deviceUID: "display-c", volume: 0.55, isMuted: false)
+        ]
+
+        XCTAssertEqual(
+            DisplayOutputStateBaseline.merging(existing: existing, current: current),
+            existing + [current[2]]
+        )
+    }
+
+    func testDisplayArrangementMovesDroppedDisplayToTargetPosition() {
+        let first = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
+        let second = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)
+        let third = AudioDevice(id: 3, uid: "display-c", name: "Studio Display C", outputChannelCount: 2)
+
+        let reordered = DisplayArrangement.moving(
+            displayUID: third.uid,
+            onto: first.uid,
+            in: [first, second, third]
+        )
+
+        XCTAssertEqual(reordered, [third, first, second])
+    }
+
+    func testDisplayArrangementIgnoresUnknownOrSameDisplayDrops() {
+        let first = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
+        let second = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)
+        let displays = [first, second]
+
+        XCTAssertEqual(
+            DisplayArrangement.moving(
+                displayUID: first.uid,
+                onto: first.uid,
+                in: displays
+            ),
+            displays
+        )
+        XCTAssertEqual(
+            DisplayArrangement.moving(
+                displayUID: "missing-display",
+                onto: second.uid,
+                in: displays
+            ),
+            displays
+        )
+    }
+
+    func testMacBookTileKindAndClosedLidVisibility() {
+        let monitor = AudioDevice(
+            id: 1,
+            uid: "studio-display",
+            name: "Studio Display Speakers",
+            outputChannelCount: 2
+        )
+        let macBook = AudioDevice(
+            id: 2,
+            uid: "BuiltInSpeakerDevice",
+            name: "MacBook Pro Speakers",
+            outputChannelCount: 2
+        )
+
+        XCTAssertEqual(monitor.visualKind, .monitor)
+        XCTAssertEqual(monitor.visualKind.symbolName, "display")
+        XCTAssertEqual(macBook.visualKind, .macBook)
+        XCTAssertEqual(macBook.visualKind.symbolName, "laptopcomputer")
+        XCTAssertEqual(
+            DisplayEndpointVisibility.visibleDevices(
+                from: [monitor, macBook],
+                builtInDisplayIsVisible: false
+            ),
+            [monitor]
+        )
+        XCTAssertEqual(
+            DisplayEndpointVisibility.visibleDevices(
+                from: [monitor, macBook],
+                builtInDisplayIsVisible: true
+            ),
+            [monitor, macBook]
+        )
+    }
+
+    #if !NEARFIELD_DISTRIBUTION
+    func testDebugDisplayScenariosCycleThroughRequestedLayouts() {
+        let threeStudioDisplays = DebugDisplayScenario.threeStudioDisplays.devices
+        XCTAssertEqual(threeStudioDisplays.count, 3)
+        XCTAssertTrue(threeStudioDisplays.allSatisfy { $0.visualKind == .monitor })
+
+        let twoStudioDisplaysAndMacBook = DebugDisplayScenario.twoStudioDisplaysAndMacBook.devices
+        XCTAssertEqual(twoStudioDisplaysAndMacBook.map(\.visualKind), [.monitor, .monitor, .macBook])
+
+        let oneStudioDisplayAndMacBook = DebugDisplayScenario.oneStudioDisplayAndMacBook.devices
+        XCTAssertEqual(oneStudioDisplayAndMacBook.map(\.visualKind), [.monitor, .macBook])
+
+        XCTAssertEqual(
+            DebugDisplayScenario.threeStudioDisplays.next,
+            .twoStudioDisplaysAndMacBook
+        )
+        XCTAssertEqual(
+            DebugDisplayScenario.twoStudioDisplaysAndMacBook.next,
+            .oneStudioDisplayAndMacBook
+        )
+        XCTAssertEqual(
+            DebugDisplayScenario.oneStudioDisplayAndMacBook.next,
+            .threeStudioDisplays
+        )
+    }
+    #endif
+
+    func testDisplayIdentificationUsesPhysicalDiscoveryOrderAfterChannelSwap() {
+        let physicalLeft = AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2)
+        let physicalRight = AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2)
+        let discoveredDisplays = [physicalLeft, physicalRight]
+
+        XCTAssertEqual(
+            DisplayArrangement.identificationSide(
+                for: physicalLeft.uid,
+                in: discoveredDisplays
+            ),
+            .left
+        )
+        XCTAssertEqual(
+            DisplayArrangement.identificationSide(
+                for: physicalRight.uid,
+                in: discoveredDisplays
+            ),
+            .right
+        )
+
+        let channelOrder = DisplayArrangement.orderedDisplays(
+            from: discoveredDisplays,
+            leftDeviceUID: physicalRight.uid
+        )
+        XCTAssertEqual(channelOrder, [physicalRight, physicalLeft])
+        XCTAssertEqual(
+            DisplayArrangement.identificationSide(
+                for: channelOrder[1].uid,
+                in: discoveredDisplays
+            ),
+            .left
+        )
+    }
+
+    func testThreeDisplayIdentificationIncludesCenterFallback() {
+        let displays = [
+            AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2),
+            AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2),
+            AudioDevice(id: 3, uid: "display-c", name: "Studio Display C", outputChannelCount: 2)
+        ]
+
+        XCTAssertEqual(
+            DisplayArrangement.identificationSide(for: displays[1].uid, in: displays),
+            .center
+        )
+    }
+
+    @MainActor
+    func testWindowRoutingFollowsAssignedDisplayChannels() {
+        let physicalLeft = AudioDevice(
+            id: 1,
+            uid: "display-left",
+            name: "Studio Display Left",
+            outputChannelCount: 2
+        )
+        let physicalRight = AudioDevice(
+            id: 2,
+            uid: "display-right",
+            name: "Studio Display Right",
+            outputChannelCount: 2
+        )
+
+        XCTAssertEqual(
+            WindowAudioRouteResolver.assignedRoutes(
+                for: [physicalLeft, physicalRight],
+                leftDeviceUID: physicalRight.uid
+            ),
+            [physicalRight.uid: "left", physicalLeft.uid: "right"]
+        )
+    }
+
+    @MainActor
+    func testThreeDisplayWindowRoutingUsesPairForCenter() {
+        let displays = [
+            AudioDevice(id: 1, uid: "display-a", name: "Studio Display A", outputChannelCount: 2),
+            AudioDevice(id: 2, uid: "display-b", name: "Studio Display B", outputChannelCount: 2),
+            AudioDevice(id: 3, uid: "display-c", name: "Studio Display C", outputChannelCount: 2)
+        ]
+
+        XCTAssertEqual(
+            WindowAudioRouteResolver.assignedRoutes(
+                for: displays,
+                leftDeviceUID: displays[0].uid,
+                displayOrderUIDs: [displays[2].uid, displays[0].uid, displays[1].uid]
+            ),
+            [displays[2].uid: "left", displays[0].uid: "pair", displays[1].uid: "right"]
+        )
+    }
+
+    func testStudioDisplayScreenMatcherExtractsAudioUSBSerial() {
+        XCTAssertEqual(
+            StudioDisplayScreenMatcher.usbSerial(
+                fromAudioDeviceUID: "AppleUSBAudioEngine:Apple Inc.:Studio Display:00008030-001A406C3404802E:8,9"
+            ),
+            "00008030-001A406C3404802E"
+        )
+        XCTAssertNil(
+            StudioDisplayScreenMatcher.usbSerial(
+                fromAudioDeviceUID: "BuiltInSpeakerDevice"
+            )
+        )
+        XCTAssertTrue(
+            StudioDisplayScreenMatcher.isBuiltInAudioDeviceUID("BuiltInSpeakerDevice")
+        )
+    }
+
+    func testStudioDisplayScreenMatcherFindsUSBContainerInEDID() throws {
+        let identifier = try XCTUnwrap(UUID(uuidString: "cd872969-8f84-4350-aec4-ef3eb4f414f7"))
+        var identifierBytes = identifier.uuid
+        var edid = Data([0x00, 0x10])
+        edid.append(withUnsafeBytes(of: &identifierBytes) { Data($0) })
+        edid.append(contentsOf: [0x01, 0x00])
+
+        XCTAssertTrue(
+            StudioDisplayScreenMatcher.edid(
+                edid,
+                containsContainerIdentifier: identifier
+            )
+        )
+        XCTAssertFalse(
+            StudioDisplayScreenMatcher.edid(
+                edid,
+                containsContainerIdentifier: UUID()
+            )
+        )
     }
 
     @MainActor
@@ -956,6 +1273,10 @@ final class NearfieldRegressionTests: XCTestCase {
 
         NearfieldPreferences.setOutputMode(.mono, in: defaults)
         NearfieldPreferences.setLeftDeviceUID("display-left", in: defaults)
+        NearfieldPreferences.setDisplayOrderUIDs(
+            ["display-left", "display-center", "display-right"],
+            in: defaults
+        )
         NearfieldPreferences.setBalance(0.5, in: defaults)
         NearfieldPreferences.setShowMenuBarApp(false, in: defaults)
         NearfieldPreferences.markOnboardingCompleted(in: defaults)
@@ -967,6 +1288,7 @@ final class NearfieldRegressionTests: XCTestCase {
 
         XCTAssertEqual(NearfieldPreferences.outputMode(in: defaults), .stereo)
         XCTAssertNil(NearfieldPreferences.leftDeviceUID(in: defaults))
+        XCTAssertEqual(NearfieldPreferences.displayOrderUIDs(in: defaults), [])
         XCTAssertEqual(NearfieldPreferences.balance(in: defaults), 0)
         XCTAssertTrue(NearfieldPreferences.showMenuBarApp(in: defaults))
         XCTAssertFalse(NearfieldPreferences.hasCompletedOnboarding(in: defaults))
@@ -988,16 +1310,25 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertEqual(NearfieldPreferences.outputMode(in: defaults), .stereo)
         XCTAssertTrue(NearfieldPreferences.showMenuBarApp(in: defaults))
         XCTAssertNil(NearfieldPreferences.leftDeviceUID(in: defaults))
+        XCTAssertEqual(NearfieldPreferences.displayOrderUIDs(in: defaults), [])
 
         NearfieldPreferences.setOutputMode(.mono, in: defaults)
         NearfieldPreferences.setShowMenuBarApp(false, in: defaults)
         NearfieldPreferences.setLeftDeviceUID("display-left", in: defaults)
+        NearfieldPreferences.setDisplayOrderUIDs(
+            ["display-left", "display-center", "display-right", "ignored-fourth"],
+            in: defaults
+        )
         NearfieldPreferences.setBalance(-0.25, in: defaults)
         NearfieldPreferences.setAppRoutingAppBundleIDs(["com.example.App"], in: defaults)
 
         XCTAssertEqual(NearfieldPreferences.outputMode(in: defaults), .mono)
         XCTAssertFalse(NearfieldPreferences.showMenuBarApp(in: defaults))
         XCTAssertEqual(NearfieldPreferences.leftDeviceUID(in: defaults), "display-left")
+        XCTAssertEqual(
+            NearfieldPreferences.displayOrderUIDs(in: defaults),
+            ["display-left", "display-center", "display-right"]
+        )
         XCTAssertEqual(NearfieldPreferences.balance(in: defaults), -0.25, accuracy: 0.0001)
         XCTAssertEqual(
             NearfieldPreferences.appRoutingAppBundleIDs(in: defaults),

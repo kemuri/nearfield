@@ -5568,24 +5568,52 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
         Float32 *outputData = (Float32 *)outputBuffer.mData;
 
         if (outOutputData->mNumberBuffers > 1) {
-            UInt32 inputChannelIndex = bufferIndex % currentInputDeviceChannelCount;
             UInt32 targetChannelCount = std::min<UInt32>(outputChannelCount, currentInputDeviceChannelCount);
-            Float32 volumeFactor = (inputChannelIndex == 0) ? volumeFactorL : volumeFactorR;
+            bool isThreeDisplayCenter = outOutputData->mNumberBuffers >= 3 && bufferIndex == 1;
 
             for (UInt32 targetChannel = 0; targetChannel < targetChannelCount; targetChannel++) {
-                Float32 *in = (Float32 *)workBuffer + inputChannelIndex;
                 Float32 *out = outputData + targetChannel;
 
-                for (UInt32 frame = 0; frame < frameCount; frame++) {
-                    *out = *in * volumeFactor;
-                    in += currentInputDeviceChannelCount;
-                    out += outputChannelCount;
+                if (isThreeDisplayCenter && currentInputDeviceChannelCount >= 2) {
+                    Float32 *inL = (Float32 *)workBuffer;
+                    Float32 *inR = (Float32 *)workBuffer + 1;
+                    for (UInt32 frame = 0; frame < frameCount; frame++) {
+                        *out = ((*inL * volumeFactorL) + (*inR * volumeFactorR)) * 0.5f;
+                        inL += currentInputDeviceChannelCount;
+                        inR += currentInputDeviceChannelCount;
+                        out += outputChannelCount;
+                    }
+                } else {
+                    UInt32 inputChannelIndex = outOutputData->mNumberBuffers >= 3
+                        ? (bufferIndex == 0 ? 0 : 1)
+                        : bufferIndex % currentInputDeviceChannelCount;
+                    Float32 volumeFactor = (inputChannelIndex == 0) ? volumeFactorL : volumeFactorR;
+                    Float32 *in = (Float32 *)workBuffer + inputChannelIndex;
+                    for (UInt32 frame = 0; frame < frameCount; frame++) {
+                        *out = *in * volumeFactor;
+                        in += currentInputDeviceChannelCount;
+                        out += outputChannelCount;
+                    }
                 }
             }
         } else {
             UInt32 targetChannelCount = std::min<UInt32>(outputChannelCount, currentInputDeviceChannelCount);
 
-            if (outputChannelCount == 1 && currentInputDeviceChannelCount >= 2) {
+            if (outputChannelCount >= 3 && currentInputDeviceChannelCount >= 2) {
+                Float32 *inL = (Float32 *)workBuffer;
+                Float32 *inR = (Float32 *)workBuffer + 1;
+
+                for (UInt32 frame = 0; frame < frameCount; frame++) {
+                    Float32 left = *inL * volumeFactorL;
+                    Float32 right = *inR * volumeFactorR;
+                    Float32 *out = outputData + (frame * outputChannelCount);
+                    out[0] = left;
+                    out[1] = (left + right) * 0.5f;
+                    out[2] = right;
+                    inL += currentInputDeviceChannelCount;
+                    inR += currentInputDeviceChannelCount;
+                }
+            } else if (outputChannelCount == 1 && currentInputDeviceChannelCount >= 2) {
                 Float32 *inL = (Float32 *)workBuffer;
                 Float32 *inR = (Float32 *)workBuffer + 1;
                 Float32 *out = outputData;
@@ -5919,7 +5947,7 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
             return routeRulesString ? CFStringCreateCopy(NULL, routeRulesString) : CFStringCreateCopy(NULL, CFSTR(""));
 
         case ConfigType::driverCapabilities:
-            return CFStringCreateCopy(NULL, CFSTR("driverOwnedTargetAggregate"));
+            return CFStringCreateCopy(NULL, CFSTR("driverOwnedTargetAggregate,threeDisplayTargetAggregate"));
 
         case ConfigType::targetAggregateDevices:
             return targetAggregateDevicesString ? CFStringCreateCopy(NULL, targetAggregateDevicesString) : CFStringCreateCopy(NULL, CFSTR(""));
@@ -6143,7 +6171,7 @@ void ProxyAudioDevice::rebuildDriverOwnedTargetAggregate(Boolean forceRebuild) {
     }
     CFArraySmartRef subdevicesRef(subdevices);
 
-    for (size_t index = 0; index < deviceUIDs.size() && index < 2; ++index) {
+    for (size_t index = 0; index < deviceUIDs.size() && index < 3; ++index) {
         CFStringSmartRef subdeviceUID(CFStringCreateWithCString(NULL, deviceUIDs[index].c_str(), kCFStringEncodingUTF8));
         if (!subdeviceUID) {
             continue;

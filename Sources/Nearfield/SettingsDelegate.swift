@@ -47,10 +47,15 @@ protocol SettingsAudioStateProviding: AnyObject {
     func settingsRefreshAudioState() async -> Bool
     func settingsMode() -> NearfieldOutputMode
     func settingsLeftDeviceUID() -> String?
+    func settingsDisplayOrderUIDs() -> [String]
     func settingsNearfieldDriverSelected() -> Bool
     func settingsFooterStatus() -> String
     func settingsApplyConfiguration()
-    func settingsPlayTestTone(_ channel: TestToneChannel)
+    func settingsPlayIdentificationChime(on display: AudioDevice)
+    func settingsShowDisplayIdentification(
+        for displayUID: String,
+        fallbackSide: DisplayIdentificationSide
+    )
 }
 
 @MainActor
@@ -65,7 +70,7 @@ protocol SettingsPreferencesControlling: AnyObject {
     func settingsSetBalance(_ balance: Float)
     func settingsSetMode(_ mode: NearfieldOutputMode)
     func settingsSetLeftDeviceUID(_ uid: String)
-    func settingsSwapAssignment()
+    func settingsSetDisplayOrderUIDs(_ uids: [String])
 }
 
 enum DriverInstallRequest: Equatable {

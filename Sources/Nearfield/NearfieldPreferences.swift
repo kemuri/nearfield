@@ -3,6 +3,7 @@ import Foundation
 enum NearfieldPreferences {
     static let outputModeKey = "outputMode"
     static let leftDeviceUIDKey = "leftDeviceUID"
+    static let displayOrderUIDsKey = "displayOrderUIDs"
     static let balanceKey = "balance"
     static let showMenuBarAppKey = "showMenuBarApp"
     static let onboardingCompletionVersionKey = "onboardingCompletionVersion"
@@ -17,6 +18,7 @@ enum NearfieldPreferences {
     private static let allKeys = [
         outputModeKey,
         leftDeviceUIDKey,
+        displayOrderUIDsKey,
         balanceKey,
         showMenuBarAppKey,
         onboardingCompletionVersionKey,
@@ -45,6 +47,18 @@ enum NearfieldPreferences {
 
     static func setLeftDeviceUID(_ uid: String, in defaults: UserDefaults = .standard) {
         defaults.set(uid, forKey: leftDeviceUIDKey)
+    }
+
+    static func displayOrderUIDs(in defaults: UserDefaults = .standard) -> [String] {
+        DisplayOrder.normalizedUIDs(defaults.stringArray(forKey: displayOrderUIDsKey) ?? [])
+    }
+
+    static func setDisplayOrderUIDs(_ uids: [String], in defaults: UserDefaults = .standard) {
+        let normalizedUIDs = DisplayOrder.normalizedUIDs(uids)
+        defaults.set(normalizedUIDs, forKey: displayOrderUIDsKey)
+        if let leftUID = normalizedUIDs.first {
+            setLeftDeviceUID(leftUID, in: defaults)
+        }
     }
 
     static func balance(in defaults: UserDefaults = .standard) -> Float {
@@ -102,6 +116,7 @@ enum NearfieldPreferences {
         let configuredKeys = [
             outputModeKey,
             leftDeviceUIDKey,
+            displayOrderUIDsKey,
             balanceKey,
             showMenuBarAppKey,
             proxyPreparedDisplayStateKey,

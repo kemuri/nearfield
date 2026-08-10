@@ -237,9 +237,6 @@ validate_packaged_app_layout() {
   fi
 }
 
-remove_build_toolchain_rpaths
-validate_packaged_app_layout
-
 sign_path() {
   local path="$1"
   local args=(--force --deep --sign "$CODE_SIGN_IDENTITY")
@@ -252,8 +249,10 @@ sign_path() {
   codesign "${args[@]}" "$path" >/dev/null
 }
 
+remove_build_toolchain_rpaths
 sign_path "$APP_FRAMEWORKS/Sparkle.framework"
 sign_path "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 sign_path "$APP_BUNDLE"
+validate_packaged_app_layout
 
 echo "$APP_BUNDLE"

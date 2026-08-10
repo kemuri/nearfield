@@ -51,7 +51,9 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         window.title = ""
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.isMovableByWindowBackground = true
+        // Keep the title bar draggable, but let arrangement cards receive
+        // mouse drags instead of moving the entire window.
+        window.isMovableByWindowBackground = false
         window.isOpaque = false
         window.backgroundColor = .clear
         let fixedFrameSize = window.frameRect(forContentRect: contentRect).size
@@ -211,12 +213,16 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
                   characters.count == 1 else {
                 return false
             }
-            switch characters {
+            switch characters.lowercased() {
             case "h":
                 model.toggleHeaderGraphic()
             case "l":
                 model.toggleDebugColorSchemeOverride()
                 updateWindowAppearance()
+            #if !NEARFIELD_DISTRIBUTION
+            case "m":
+                model.cycleDebugDisplayScenario()
+            #endif
             case "a":
                 guard model.step == .install else { return false }
                 model.runInstallScenario(.smooth)

@@ -51,17 +51,7 @@ struct SettingsOnboardingView: View {
                                 SettingsGroup {
                                     BalanceSettingRow(model: model)
                                     SettingsDivider()
-                                    ActionSettingRow(title: "Test Sound", buttonTitle: "Play") {
-                                        model.playTestSound()
-                                    }
-                                    SettingsDivider()
-                                    ActionSettingRow(
-                                        title: "Arrangement",
-                                        buttonTitle: "Swap Channels",
-                                        enabled: model.canSwapChannels
-                                    ) {
-                                        model.swapChannels()
-                                    }
+                                    DisplayArrangementRow(model: model)
                                 }
                             }
 
@@ -301,6 +291,219 @@ private struct BalanceSettingRow: View {
         }
         .padding(.horizontal, 10)
         .frame(height: 66)
+    }
+}
+
+private struct DisplayArrangementRow: View {
+    @ObservedObject var model: OnboardingModel
+    @State private var dropTargetUID: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                Text("Arrangement")
+                    .settingsTitleStyle()
+
+                Spacer(minLength: 8)
+
+                Button("Identify") {
+                    model.identifyDisplays()
+                }
+                .controlSize(.small)
+                .disabled(!model.canArrangeDisplays)
+                .help("Play a chime through each display in channel order")
+            }
+
+            Text("Drag displays to rearrange them.")
+                .settingsDetailStyle()
+
+            HStack(spacing: 8) {
+                ForEach(model.arrangedDisplays, id: \.uid) { display in
+                    let channelIndex = model.arrangedDisplays.firstIndex(of: display) ?? 0
+                    let channelRole = model.channelRole(at: channelIndex)
+                    let displayTitle = model.displayTitle(for: display)
+
+                    VStack(spacing: 7) {
+                        Button {
+                            model.visuallyIdentifyDisplay(display.uid)
+                        } label: {
+                            DisplayArrangementTile(
+                                title: displayTitle,
+                                iconName: display.visualKind.symbolName,
+                                isIdentified: model.identifiedDisplayUID == display.uid,
+                                isDropTarget: dropTargetUID == display.uid
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!model.canArrangeDisplays)
+                        .draggable(display.uid) {
+                            DisplayArrangementDragPreview(
+                                title: displayTitle,
+                                iconName: display.visualKind.symbolName
+                            )
+                        }
+                        .dropDestination(for: String.self) { displayUIDs, _ in
+                            guard let displayUID = displayUIDs.first,
+                                  displayUID != display.uid else {
+                                return false
+                            }
+                            model.moveDisplay(displayUID, onto: display.uid)
+                            return true
+                        } isTargeted: { isTargeted in
+                            withAnimation(.smooth(duration: 0.16)) {
+                                if isTargeted {
+                                    dropTargetUID = display.uid
+                                } else if dropTargetUID == display.uid {
+                                    dropTargetUID = nil
+                                }
+                            }
+                        }
+                        .help(
+                            "Click to highlight \(displayTitle). " +
+                                "Drag this display box to change its channel."
+                        )
+                        .accessibilityLabel(displayTitle)
+                        .accessibilityHint("Highlights this physical monitor. Drag to change its channel.")
+                        .accessibilityActions {
+                            if channelIndex > 0 {
+                                Button("Move Left") {
+                                    model.moveDisplay(
+                                        display.uid,
+                                        onto: model.arrangedDisplays[channelIndex - 1].uid
+                                    )
+                                }
+                            }
+                            if channelIndex + 1 < model.arrangedDisplays.count {
+                                Button("Move Right") {
+                                    model.moveDisplay(
+                                        display.uid,
+                                        onto: model.arrangedDisplays[channelIndex + 1].uid
+                                    )
+                                }
+                            }
+                        }
+
+                        Text(channelRole.title)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(height: 17)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("\(channelRole.title) channel")
+                }
+
+                ForEach(Array(0..<max(0, 2 - model.arrangedDisplays.count)), id: \.self) { _ in
+                    MissingDisplayArrangementCard()
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(minHeight: 150, alignment: .center)
+    }
+}
+
+private struct DisplayArrangementTile: View {
+    let title: String
+    let iconName: String
+    let isIdentified: Bool
+    let isDropTarget: Bool
+
+    private var accentColor: Color {
+        Color(nsColor: .controlAccentColor)
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(
+                    isDropTarget
+                        ? accentColor.opacity(0.11)
+                        : Color(nsColor: .controlBackgroundColor).opacity(0.72)
+                )
+
+            VStack(spacing: 5) {
+                ZStack {
+                    Image(systemName: iconName)
+                        .opacity(isIdentified ? 0 : 1)
+                        .scaleEffect(isIdentified ? 0.25 : 1)
+                        .blur(radius: isIdentified ? 4 : 0)
+
+                    Image(systemName: "speaker.wave.2.fill")
+                        .opacity(isIdentified ? 1 : 0)
+                        .scaleEffect(isIdentified ? 1 : 0.25)
+                        .blur(radius: isIdentified ? 0 : 4)
+                }
+                .font(.system(size: 17, weight: .medium))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(isIdentified ? accentColor : .secondary)
+
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.primary)
+            }
+        }
+        .frame(height: 52)
+        .frame(maxWidth: .infinity)
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(
+                    isIdentified || isDropTarget ? accentColor : Color(nsColor: .separatorColor),
+                    lineWidth: isIdentified || isDropTarget ? 1.5 : 0.5
+                )
+        }
+        .scaleEffect(isIdentified ? 1.02 : (isDropTarget ? 0.98 : 1))
+        .animation(.smooth(duration: 0.3), value: isIdentified)
+        .animation(.smooth(duration: 0.16), value: isDropTarget)
+        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+}
+
+private struct DisplayArrangementDragPreview: View {
+    let title: String
+    let iconName: String
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: iconName)
+                .font(.system(size: 13, weight: .medium))
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
+private struct MissingDisplayArrangementCard: View {
+    var body: some View {
+        VStack(spacing: 7) {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(
+                    Color(nsColor: .separatorColor).opacity(0.7),
+                    style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                )
+                .overlay {
+                    Image(systemName: "display")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(height: 52)
+
+            Text("Not connected")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.tertiary)
+                .frame(height: 17)
+        }
+        .padding(5)
+        .frame(maxWidth: .infinity)
+        .background(
+            Color(nsColor: .labelColor).opacity(0.015),
+            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+        )
+        .accessibilityLabel("Studio Display not connected")
     }
 }
 

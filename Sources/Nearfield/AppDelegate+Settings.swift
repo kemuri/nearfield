@@ -37,6 +37,10 @@ extension AppDelegate: SettingsDelegate {
         NearfieldPreferences.leftDeviceUID()
     }
 
+    func settingsDisplayOrderUIDs() -> [String] {
+        NearfieldPreferences.displayOrderUIDs()
+    }
+
     func settingsOpenAtLogin() -> Bool {
         SMAppService.mainApp.status == .enabled
     }
@@ -215,7 +219,12 @@ extension AppDelegate: SettingsDelegate {
                     _ = try prepareDisplaysForVirtualOutputActivation()
                 }
             } else {
-                try audioManager.setDisplayBalance(Float32(clamped), leftDeviceUID: currentConfiguration().leftDeviceUID)
+                let configuration = currentConfiguration()
+                try audioManager.setDisplayBalance(
+                    Float32(clamped),
+                    leftDeviceUID: configuration.leftDeviceUID,
+                    displayOrderUIDs: configuration.displayOrderUIDs
+                )
             }
         } catch {
             showError(error)
@@ -229,17 +238,52 @@ extension AppDelegate: SettingsDelegate {
     }
 
     func settingsSetLeftDeviceUID(_ uid: String) {
-        NearfieldPreferences.setLeftDeviceUID(uid)
-        refreshStatus()
+        let currentOrder = try? audioManager.orderedStudioDisplayUIDs(configuration: currentConfiguration())
+        let reordered = currentOrder.map { order in
+            [uid] + order.filter { $0 != uid }
+        } ?? [uid]
+        settingsSetDisplayOrderUIDs(reordered)
     }
 
-    func settingsSwapAssignment() {
-        let devices = Array(audioManager.studioDisplayDevices().prefix(2))
-        guard devices.count >= 2 else { return }
-        let currentLeftUID = NearfieldPreferences.leftDeviceUID() ?? devices[0].uid
-        let nextLeftUID = devices.first(where: { $0.uid != currentLeftUID })?.uid ?? devices[1].uid
-        NearfieldPreferences.setLeftDeviceUID(nextLeftUID)
+    func settingsSetDisplayOrderUIDs(_ uids: [String]) {
+        let normalizedUIDs = DisplayOrder.normalizedUIDs(uids)
+        guard !normalizedUIDs.isEmpty,
+              NearfieldPreferences.displayOrderUIDs() != normalizedUIDs else {
+            return
+        }
+        pendingDisplayAssignmentTask?.cancel()
+        let preservedMasterVolume = routerDriverManager.currentBaseVolume()
+        NearfieldPreferences.setDisplayOrderUIDs(normalizedUIDs)
+        // Persisting the visual order and applying the driver configuration are
+        // one operation: a successful drop must change the real channel map.
         rebuildForConfigurationChange()
+
+        guard routerDriverManager.isInstalled else { return }
+        pendingDisplayAssignmentTask = Task { @MainActor [weak self] in
+            // The driver rebuilds its private aggregate asynchronously. Its
+            // private device is intentionally hidden from app-side device
+            // enumeration, so reapply balance after the observed rebuild gap.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled,
+                  let self,
+                  NearfieldPreferences.displayOrderUIDs() == normalizedUIDs else {
+                return
+            }
+            do {
+                if let preservedMasterVolume {
+                    try self.routerDriverManager.setBalancedVolume(
+                        preservedMasterVolume,
+                        balance: self.currentBalance()
+                    )
+                } else {
+                    try self.routerDriverManager.setBalance(self.currentBalance())
+                }
+            } catch {
+                self.showError(error)
+            }
+            self.pendingDisplayAssignmentTask = nil
+            self.refreshStatus()
+        }
     }
 
     func settingsApplyConfiguration() {
@@ -484,11 +528,24 @@ extension AppDelegate: SettingsDelegate {
         )
     }
 
-    func settingsPlayTestTone(_ channel: TestToneChannel) {
+    func settingsPlayIdentificationChime(on display: AudioDevice) {
         do {
-            try testTonePlayer.play(channel: channel)
+            try testTonePlayer.playIdentificationChime(
+                on: display,
+                volume: routerDriverManager.currentAudibleGain() ?? 0.7
+            )
         } catch {
             showError(error)
         }
+    }
+
+    func settingsShowDisplayIdentification(
+        for displayUID: String,
+        fallbackSide: DisplayIdentificationSide
+    ) {
+        displayIdentificationController.show(
+            displayUID: displayUID,
+            fallbackSide: fallbackSide
+        )
     }
 }

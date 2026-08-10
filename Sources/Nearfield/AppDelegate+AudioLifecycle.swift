@@ -159,12 +159,16 @@ extension AppDelegate {
     }
 
     func prepareDisplaysForVirtualOutputActivation() throws -> [DisplayOutputState]? {
-        var capturedDisplayState: [DisplayOutputState]?
-        if proxyPreparedDisplayState == nil {
-            let displayState = try audioManager.captureDisplayOutputState()
-            proxyPreparedDisplayState = displayState
-            saveProxyPreparedDisplayState(displayState)
-            capturedDisplayState = displayState
+        let currentDisplayState = try audioManager.captureDisplayOutputState()
+        let existingDisplayState = proxyPreparedDisplayState ?? []
+        let mergedDisplayState = DisplayOutputStateBaseline.merging(
+            existing: existingDisplayState,
+            current: currentDisplayState
+        )
+        let capturedDisplayState = proxyPreparedDisplayState == nil ? currentDisplayState : nil
+        if proxyPreparedDisplayState == nil || mergedDisplayState.count != existingDisplayState.count {
+            proxyPreparedDisplayState = mergedDisplayState
+            saveProxyPreparedDisplayState(mergedDisplayState)
         }
         try audioManager.prepareDisplaysForProxyOutput()
         return capturedDisplayState
@@ -249,7 +253,12 @@ extension AppDelegate {
                     try configureRouterDriver()
                 } else {
                     try cleanupNearfieldTargetsIfNeeded(scope: .allManaged)
-                    try audioManager.setDisplayBalance(currentBalance(), leftDeviceUID: currentConfiguration().leftDeviceUID)
+                    let configuration = currentConfiguration()
+                    try audioManager.setDisplayBalance(
+                        currentBalance(),
+                        leftDeviceUID: configuration.leftDeviceUID,
+                        displayOrderUIDs: configuration.displayOrderUIDs
+                    )
                 }
             }
         } catch {
@@ -265,7 +274,8 @@ extension AppDelegate {
     func currentConfiguration() -> NearfieldConfiguration {
         NearfieldConfiguration(
             mode: currentMode(),
-            leftDeviceUID: NearfieldPreferences.leftDeviceUID()
+            leftDeviceUID: NearfieldPreferences.leftDeviceUID(),
+            displayOrderUIDs: NearfieldPreferences.displayOrderUIDs()
         )
     }
 

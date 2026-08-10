@@ -123,6 +123,112 @@ struct SpatialRoutingApp: Identifiable, Equatable {
     var url: URL?
 }
 
+enum DisplayArrangement {
+    static func orderedDisplays(
+        from displays: [AudioDevice],
+        leftDeviceUID: String?,
+        displayOrderUIDs: [String] = []
+    ) -> [AudioDevice] {
+        StudioDisplayAudioManager.orderedDisplays(
+            from: displays,
+            leftDeviceUID: leftDeviceUID,
+            displayOrderUIDs: displayOrderUIDs
+        )
+    }
+
+    static func moving(
+        displayUID: String,
+        onto targetUID: String,
+        in displays: [AudioDevice]
+    ) -> [AudioDevice] {
+        guard displayUID != targetUID,
+              let sourceIndex = displays.firstIndex(where: { $0.uid == displayUID }),
+              let targetIndex = displays.firstIndex(where: { $0.uid == targetUID }) else {
+            return displays
+        }
+
+        var reordered = displays
+        let display = reordered.remove(at: sourceIndex)
+        reordered.insert(display, at: targetIndex)
+        return reordered
+    }
+
+    static func identificationSide(
+        for displayUID: String,
+        in discoveredDisplays: [AudioDevice]
+    ) -> DisplayIdentificationSide? {
+        guard let displayIndex = discoveredDisplays.firstIndex(where: { $0.uid == displayUID }) else {
+            return nil
+        }
+        if discoveredDisplays.count >= 3, displayIndex == 1 {
+            return .center
+        }
+        return displayIndex == 0 ? .left : .right
+    }
+}
+
+enum DisplayChannelRole: Equatable {
+    case left
+    case center
+    case right
+
+    static func roles(displayCount: Int) -> [DisplayChannelRole] {
+        displayCount >= 3 ? [.left, .center, .right] : [.left, .right]
+    }
+
+    var title: String {
+        switch self {
+        case .left: "Left"
+        case .center: "Center"
+        case .right: "Right"
+        }
+    }
+
+}
+
+#if !NEARFIELD_DISTRIBUTION
+enum DebugDisplayScenario: CaseIterable, Equatable {
+    case threeStudioDisplays
+    case twoStudioDisplaysAndMacBook
+    case oneStudioDisplayAndMacBook
+
+    var next: DebugDisplayScenario {
+        switch self {
+        case .threeStudioDisplays: .twoStudioDisplaysAndMacBook
+        case .twoStudioDisplaysAndMacBook: .oneStudioDisplayAndMacBook
+        case .oneStudioDisplayAndMacBook: .threeStudioDisplays
+        }
+    }
+
+    var devices: [AudioDevice] {
+        let studioDisplayCount = switch self {
+        case .threeStudioDisplays: 3
+        case .twoStudioDisplaysAndMacBook: 2
+        case .oneStudioDisplayAndMacBook: 1
+        }
+        var devices = (0..<studioDisplayCount).map { index in
+            AudioDevice(
+                id: UInt32(9_001 + index),
+                uid: "debug-studio-display-\(index + 1)",
+                name: "Studio Display Speakers",
+                outputChannelCount: 2
+            )
+        }
+        if self != .threeStudioDisplays {
+            devices.append(
+                AudioDevice(
+                    id: 9_010,
+                    uid: "BuiltInSpeakerDevice.debug",
+                    name: "MacBook Pro Speakers",
+                    outputChannelCount: 2
+                )
+            )
+        }
+        return devices
+    }
+}
+#endif
+
 @MainActor
 final class OnboardingModel: ObservableObject {
     private enum Metrics {
@@ -149,6 +255,10 @@ final class OnboardingModel: ObservableObject {
     @Published var nearfieldDriverSelected = false
     @Published var appVersionText = "Version 0.1.0"
     @Published var studioDisplayCount = 0
+    @Published var studioDisplays: [AudioDevice] = []
+    @Published var leftDeviceUID: String?
+    @Published var displayOrderUIDs: [String] = []
+    @Published var identifiedDisplayUID: String?
     @Published var coreAudioAvailability: CoreAudioAvailability = .checking
     @Published var spatialRoutingEnabled = true
     @Published var spatialRoutingApps: [SpatialRoutingApp] = []
@@ -157,12 +267,16 @@ final class OnboardingModel: ObservableObject {
     @Published var showHeaderGraphic = true
     @Published var stepTransitionDuration = Metrics.defaultStepTransitionDuration
     @Published var debugColorSchemeOverride: ColorScheme?
+    #if !NEARFIELD_DISTRIBUTION
+    @Published private(set) var debugDisplayScenario: DebugDisplayScenario?
+    #endif
     @Published var introAnimationToken = 0
 
     private var dummyInstallTask: Task<Void, Never>?
     private var pendingLiveInstallStartTask: Task<Void, Never>?
     private var liveInstallTask: Task<Void, Never>?
     private var liveInstallRequestedAt: Date?
+    private var displayIdentificationTask: Task<Void, Never>?
     private var spatialRoutingActivityTask: Task<Void, Never>?
     private var isWindowVisible = false
     private var installScenario: OnboardingInstallScenario = .smooth
@@ -177,6 +291,7 @@ final class OnboardingModel: ObservableObject {
         dummyInstallTask?.cancel()
         pendingLiveInstallStartTask?.cancel()
         liveInstallTask?.cancel()
+        displayIdentificationTask?.cancel()
         spatialRoutingActivityTask?.cancel()
     }
 
@@ -191,7 +306,20 @@ final class OnboardingModel: ObservableObject {
         if !installingDriver {
             driverInstalled = delegate.settingsDriverInstalled()
             nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
-            studioDisplayCount = delegate.settingsDevices().count
+            let liveDisplays = DisplayEndpointVisibility.visibleDevices(
+                from: delegate.settingsDevices(),
+                builtInDisplayIsVisible: DisplayEndpointVisibility.builtInDisplayIsVisible()
+            )
+            let displays = displayedDevices(from: liveDisplays)
+            studioDisplays = displays
+            studioDisplayCount = displays.count
+            if !isDebugDisplaySimulationActive {
+                leftDeviceUID = delegate.settingsLeftDeviceUID()
+                displayOrderUIDs = delegate.settingsDisplayOrderUIDs()
+            } else {
+                leftDeviceUID = displays.first?.uid
+                displayOrderUIDs = displays.map(\.uid)
+            }
             coreAudioAvailability = delegate.settingsCoreAudioAvailability()
         }
         appVersionText = delegate.settingsAppVersionText()
@@ -231,6 +359,9 @@ final class OnboardingModel: ObservableObject {
         if nextStep != .install {
             cancelInstallTasks()
         }
+        if nextStep != .settings {
+            cancelDisplayIdentification()
+        }
         stepTransitionDuration = slowMotion
             ? Metrics.slowStepTransitionDuration
             : Metrics.defaultStepTransitionDuration
@@ -267,8 +398,30 @@ final class OnboardingModel: ObservableObject {
         }
     }
 
+    #if !NEARFIELD_DISTRIBUTION
+    func cycleDebugDisplayScenario() {
+        guard BuildConfiguration.debugToolsEnabled else { return }
+        cancelDisplayIdentification()
+        let nextScenario = debugDisplayScenario?.next ?? .threeStudioDisplays
+        let displays = nextScenario.devices
+        withAnimation(.smooth(duration: 0.22)) {
+            debugDisplayScenario = nextScenario
+            studioDisplays = displays
+            studioDisplayCount = displays.count
+            leftDeviceUID = displays.first?.uid
+            displayOrderUIDs = displays.map(\.uid)
+        }
+        if step != .settings {
+            showStep(.settings)
+        }
+    }
+    #endif
+
     func setWindowVisible(_ isVisible: Bool) {
         isWindowVisible = isVisible
+        if !isVisible {
+            cancelDisplayIdentification()
+        }
         updateSpatialRoutingActivityRefresh()
     }
 
@@ -445,17 +598,120 @@ final class OnboardingModel: ObservableObject {
         return balance < 0 ? "\(Int(abs(balance) * 100))% L" : "\(Int(balance * 100))% R"
     }
 
-    func playTestSound() {
-        delegate?.settingsPlayTestTone(.stereo)
+    var arrangedDisplays: [AudioDevice] {
+        DisplayArrangement.orderedDisplays(
+            from: studioDisplays,
+            leftDeviceUID: leftDeviceUID,
+            displayOrderUIDs: displayOrderUIDs
+        )
     }
 
-    var canSwapChannels: Bool {
-        studioDisplayCount >= 2 && !isInstallingDriver
+    var canArrangeDisplays: Bool {
+        (2...3).contains(arrangedDisplays.count) && !isInstallingDriver
     }
 
-    func swapChannels() {
-        delegate?.settingsSwapAssignment()
+    func displayNumber(for display: AudioDevice) -> Int {
+        (studioDisplays.firstIndex(where: { $0.uid == display.uid }) ?? 0) + 1
+    }
+
+    func displayTitle(for display: AudioDevice) -> String {
+        display.visualKind == .macBook
+            ? "MacBook"
+            : "Display \(displayNumber(for: display))"
+    }
+
+    func channelRole(at index: Int) -> DisplayChannelRole {
+        let roles = DisplayChannelRole.roles(displayCount: arrangedDisplays.count)
+        return roles.indices.contains(index) ? roles[index] : .right
+    }
+
+    func moveDisplay(_ displayUID: String, onto targetUID: String) {
+        guard canArrangeDisplays else { return }
+        cancelDisplayIdentification()
+        let reordered = DisplayArrangement.moving(
+            displayUID: displayUID,
+            onto: targetUID,
+            in: arrangedDisplays
+        )
+        guard reordered != arrangedDisplays, let nextLeftDisplay = reordered.first else { return }
+
+        withAnimation(.smooth(duration: 0.22)) {
+            leftDeviceUID = nextLeftDisplay.uid
+            displayOrderUIDs = reordered.map(\.uid)
+        }
+        guard !isDebugDisplaySimulationActive else { return }
+        delegate?.settingsSetDisplayOrderUIDs(reordered.map(\.uid))
         refreshFromDelegate()
+    }
+
+    func identifyDisplays() {
+        guard canArrangeDisplays else { return }
+        let displays = arrangedDisplays
+        cancelDisplayIdentification()
+
+        displayIdentificationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            for display in displays {
+                await identify(display)
+                guard !Task.isCancelled else { return }
+            }
+            withAnimation(.smooth(duration: 0.18)) {
+                identifiedDisplayUID = nil
+            }
+            displayIdentificationTask = nil
+        }
+    }
+
+    private func identify(_ display: AudioDevice) async {
+        guard !Task.isCancelled else { return }
+        withAnimation(.smooth(duration: 0.18)) {
+            identifiedDisplayUID = display.uid
+        }
+        if !isDebugDisplaySimulationActive {
+            delegate?.settingsPlayIdentificationChime(on: display)
+        }
+        try? await Task.sleep(nanoseconds: 1_850_000_000)
+    }
+
+    func visuallyIdentifyDisplay(_ displayUID: String) {
+        guard canArrangeDisplays,
+              let side = DisplayArrangement.identificationSide(
+                for: displayUID,
+                in: studioDisplays
+              ) else {
+            return
+        }
+        delegate?.settingsShowDisplayIdentification(
+            for: displayUID,
+            fallbackSide: side
+        )
+    }
+
+    private func cancelDisplayIdentification() {
+        displayIdentificationTask?.cancel()
+        displayIdentificationTask = nil
+        if identifiedDisplayUID != nil {
+            withAnimation(.smooth(duration: 0.15)) {
+                identifiedDisplayUID = nil
+            }
+        }
+    }
+
+    private var isDebugDisplaySimulationActive: Bool {
+        #if !NEARFIELD_DISTRIBUTION
+        debugDisplayScenario != nil
+        #else
+        false
+        #endif
+    }
+
+    private func displayedDevices(from liveDisplays: [AudioDevice]) -> [AudioDevice] {
+        #if !NEARFIELD_DISTRIBUTION
+        debugDisplayScenario?.devices ?? liveDisplays
+        #else
+        liveDisplays
+        #endif
     }
 
     func installDriver() {

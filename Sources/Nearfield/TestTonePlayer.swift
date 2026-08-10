@@ -1,61 +1,94 @@
+import AudioToolbox
 import AVFAudio
 import Foundation
 
-enum TestToneChannel {
-    case stereo
-    case left
-    case right
+private enum IdentificationChimePlaybackError: LocalizedError {
+    case outputAudioUnitUnavailable
+    case selectOutputDeviceFailed(OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .outputAudioUnitUnavailable:
+            "The selected Studio Display audio output is unavailable."
+        case .selectOutputDeviceFailed(let status):
+            "Selecting the Studio Display audio output failed with Core Audio status \(status)."
+        }
+    }
 }
 
+@MainActor
 final class TestTonePlayer {
-    private var engine: AVAudioEngine?
-    private var player: AVAudioPlayerNode?
+    static let identificationSoundURL = URL(
+        fileURLWithPath: "/System/Library/Sounds/Glass.aiff",
+        isDirectory: false
+    )
+
+    private var identificationEngine: AVAudioEngine?
+    private var identificationPlayer: AVAudioPlayerNode?
+    private var identificationFile: AVAudioFile?
+    private var identificationCleanupTask: Task<Void, Never>?
 
     var isAudioGraphPrepared: Bool {
-        engine != nil
+        identificationEngine != nil
     }
 
-    func play(channel: TestToneChannel) throws {
-        let (engine, player) = audioGraph()
-        let sampleRate = 48_000.0
-        let duration = 0.55
-        let frameCount = AVAudioFrameCount(sampleRate * duration)
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
-              let channels = buffer.floatChannelData else {
-            return
-        }
-
-        buffer.frameLength = frameCount
-        let frequency = 660.0
-        let amplitude: Float = 0.28
-        for frame in 0..<Int(frameCount) {
-            let envelope = min(1, Float(frame) / 2_400) * min(1, Float(Int(frameCount) - frame) / 2_400)
-            let sample = amplitude * envelope * Float(sin(2.0 * .pi * frequency * Double(frame) / sampleRate))
-            channels[0][frame] = channel == .right ? 0 : sample
-            channels[1][frame] = channel == .left ? 0 : sample
-        }
-
-        if !engine.isRunning {
-            try engine.start()
-        }
-        player.stop()
-        player.scheduleBuffer(buffer, at: nil, options: .interrupts)
-        player.play()
-    }
-
-    private func audioGraph() -> (AVAudioEngine, AVAudioPlayerNode) {
-        if let engine, let player {
-            return (engine, player)
-        }
+    func playIdentificationChime(on display: AudioDevice, volume: Float32) throws {
+        identificationCleanupTask?.cancel()
+        identificationCleanupTask = nil
+        identificationPlayer?.stop()
+        identificationEngine?.stop()
+        identificationEngine = nil
+        identificationPlayer = nil
+        identificationFile = nil
 
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
+        let outputNode = engine.outputNode
+        guard let outputAudioUnit = outputNode.audioUnit else {
+            throw IdentificationChimePlaybackError.outputAudioUnitUnavailable
+        }
+
+        var deviceID = display.id
+        let selectStatus = AudioUnitSetProperty(
+            outputAudioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            UInt32(MemoryLayout<AudioObjectID>.size)
+        )
+        guard selectStatus == noErr else {
+            throw IdentificationChimePlaybackError.selectOutputDeviceFailed(selectStatus)
+        }
+
+        let soundFile = try AVAudioFile(forReading: Self.identificationSoundURL)
         engine.attach(player)
-        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        self.engine = engine
-        self.player = player
-        return (engine, player)
+        engine.connect(player, to: engine.mainMixerNode, format: soundFile.processingFormat)
+        player.volume = min(max(volume, 0), 1)
+        engine.prepare()
+        try engine.start()
+        player.scheduleFile(soundFile, at: nil)
+        player.play()
+
+        identificationEngine = engine
+        identificationPlayer = player
+        identificationFile = soundFile
+        let playbackDuration = Double(soundFile.length) / soundFile.fileFormat.sampleRate
+        identificationCleanupTask = Task { @MainActor [weak self, weak engine, weak player] in
+            try? await Task.sleep(
+                nanoseconds: UInt64((playbackDuration + 0.1) * 1_000_000_000)
+            )
+            guard !Task.isCancelled,
+                  let self,
+                  self.identificationEngine === engine else {
+                return
+            }
+            player?.stop()
+            engine?.stop()
+            self.identificationEngine = nil
+            self.identificationPlayer = nil
+            self.identificationFile = nil
+            self.identificationCleanupTask = nil
+        }
     }
 }
