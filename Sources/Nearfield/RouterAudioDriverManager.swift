@@ -179,29 +179,24 @@ final class RouterAudioDriverManager {
         try setVolumeControl(controls.right, value: volumes.right, channel: "right")
     }
 
-    func adjustVolume(by delta: Float32) throws {
+    func adjustVolume(by delta: Float32, balance: Float32) throws {
         guard let controls = volumeControlIDs() else {
             throw RouterAudioDriverError.notInstalled
         }
         let currentLeft = volumeControlValue(controls.left) ?? 0.5
         let currentRight = volumeControlValue(controls.right) ?? 0.5
-        let currentBase = max(currentLeft, currentRight)
-        let nextBase = min(max(currentBase + delta, 0), 1)
-        let nextLeft: Float32
-        let nextRight: Float32
-        if currentBase > 0 {
-            let scale = nextBase / currentBase
-            nextLeft = min(max(currentLeft * scale, 0), 1)
-            nextRight = min(max(currentRight * scale, 0), 1)
-        } else {
-            nextLeft = nextBase
-            nextRight = nextBase
-        }
+        let volumes = BalanceMath.adjustedChannelVolumes(
+            currentLeft: currentLeft,
+            currentRight: currentRight,
+            delta: delta,
+            balance: balance
+        )
+        let nextBase = max(volumes.left, volumes.right)
         if nextBase > 0 {
             try setMuted(false)
         }
-        try setVolumeControl(controls.left, value: nextLeft, channel: "left")
-        try setVolumeControl(controls.right, value: nextRight, channel: "right")
+        try setVolumeControl(controls.left, value: volumes.left, channel: "left")
+        try setVolumeControl(controls.right, value: volumes.right, channel: "right")
     }
 
     func toggleMute() throws {

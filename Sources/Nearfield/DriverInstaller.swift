@@ -90,7 +90,6 @@ final class DriverInstaller {
         let temporaryPath = "\(destinationPath).nearfield-installing"
         let cleanupPaths = installCleanupPaths(temporaryPath: temporaryPath)
         let command = [
-            "set -e",
             "/bin/mkdir -p \(shellQuoted(Self.halDriverDirectory))",
             driverServiceRestartCommand(),
             removeCommand(paths: cleanupPaths),
@@ -114,6 +113,13 @@ final class DriverInstaller {
             coreAudioRestartCommand()
         ].joined(separator: "\n")
         try runPrivilegedShell(command)
+        try Self.verifyDriverRemoval(paths: Self.installedDriverRemovalPaths())
+    }
+
+    static func verifyDriverRemoval(paths: [String], fileManager: FileManager = .default) throws {
+        if let remainingPath = paths.first(where: { fileManager.fileExists(atPath: $0) }) {
+            throw DriverInstallerError.installFailed("Driver removal did not remove \(remainingPath).")
+        }
     }
 
     static func driverPath(fromBuildOutput output: String, expectedSuffix: String = routerDriverBundleName) throws -> String {
@@ -402,15 +408,21 @@ final class DriverInstaller {
         }
     }
 
+    static func maintenanceShellCommand(_ command: String) -> String {
+        let commands = command
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        // Restart commands explicitly tolerate an absent process with `|| true`.
+        // File-operation errors must still propagate to the caller.
+        return (["set -e"] + commands).joined(separator: "; ")
+    }
+
     private func runPrivilegedShell(_ command: String) throws {
         // Callers build this command only from fixed executable names and
         // newline/NUL-free paths that were individually shell-quoted. The
         // second escaping pass below is solely for the AppleScript string.
-        let compactCommand = command
-            .split(whereSeparator: \.isNewline)
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "; ")
+        let compactCommand = Self.maintenanceShellCommand(command)
         let escapedCommand = "\(compactCommand) 2>&1"
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")

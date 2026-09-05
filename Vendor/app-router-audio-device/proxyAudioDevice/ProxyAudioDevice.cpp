@@ -5090,8 +5090,6 @@ void ProxyAudioDevice::resetInputData() {
 OSStatus ProxyAudioDevice::StartIO(AudioServerPlugInDriverRef inDriver,
                                    AudioObjectID inDeviceObjectID,
                                    UInt32 inClientID) {
-#pragma unused(inDriver)
-#pragma unused(inDeviceObjectID)
     //    This call tells the device that IO is starting for the given client. When this routine
     //    returns, the device's clock is running and it is ready to have data read/written. It is
     //    important to note that multiple clients can have IO running on the device at the same time.
@@ -5102,16 +5100,22 @@ OSStatus ProxyAudioDevice::StartIO(AudioServerPlugInDriverRef inDriver,
 #pragma unused(inClientID)
     
     DebugMsg("ProxyAudio: StartIO");
-    resetInputData();
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
 
     CAMutex::Locker locker(stateMutex);
+    CAMutex::Locker ioLocker(IOMutex);
 
     //    figure out what we need to do
     if (gDevice_IOIsRunning == UINT64_MAX) {
         //    overflowing is an error
         theAnswer = kAudioHardwareIllegalOperationError;
     } else if (gDevice_IOIsRunning == 0) {
-        //    We need to start the hardware, which in this case is just anchoring the time line.
+        // Only the first client starts a new shared timeline. Later clients
+        // must leave the buffered audio and timing of existing clients intact.
+        resetInputDataNoLock();
+        CAMutex::Locker timestampLocker(getZeroTimestampMutex);
         gDevice_IOIsRunning = 1;
         gDevice_NumberTimeStamps = 0;
         gDevice_AnchorSampleTime = 0;
@@ -5140,10 +5144,6 @@ OSStatus ProxyAudioDevice::StopIO(AudioServerPlugInDriverRef inDriver,
 
 #pragma unused(inClientID)
     DebugMsg("ProxyAudio: StopIO");
-    {
-        CAMutex::Locker locker(&IOMutex);
-        inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
-    }
 
     //    declare the local variables
     OSStatus theAnswer = 0;
@@ -5165,7 +5165,9 @@ OSStatus ProxyAudioDevice::StopIO(AudioServerPlugInDriverRef inDriver,
             //    underflowing is an error
             theAnswer = kAudioHardwareIllegalOperationError;
         } else if (gDevice_IOIsRunning == 1) {
-            //    We need to stop the hardware, which in this case means that there's nothing to do.
+            // A client stopping must not truncate audio from remaining clients.
+            CAMutex::Locker ioLocker(IOMutex);
+            inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
             gDevice_IOIsRunning = 0;
         } else {
             //    IO is still running, so just bump the counter
@@ -5446,19 +5448,13 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     Float64 currentOutputDeviceSampleRate = outputDevice.sampleRate;
     UInt32 currentOutputDeviceBufferFrameSize = outputDevice.bufferFrameSize;
     UInt32 currentOutputDeviceSafetyOffset = outputDevice.safetyOffset;
-    Float64 currentInputDeviceSampleRate;
-    UInt32 currentInputDeviceChannelCount;
-    Float32 currentVolumeR, currentVolumeL;
-    bool currentMute;
-
-    {
-        CAMutex::Locker stateLocker(&stateMutex);
-        currentInputDeviceSampleRate = gDevice_SampleRate;
-        currentInputDeviceChannelCount = gDevice_ChannelsPerFrame;
-        currentVolumeR = gVolume_Output_R_Value;
-        currentVolumeL = gVolume_Output_L_Value;
-        currentMute = gMute_Output_Mute;
-    }
+    // These independent scalar controls are lock-free; route parsing and
+    // persistence may hold stateMutex for much longer than an audio deadline.
+    const Float64 currentInputDeviceSampleRate = gDevice_SampleRate.load(std::memory_order_relaxed);
+    const UInt32 currentInputDeviceChannelCount = gDevice_ChannelsPerFrame;
+    const Float32 currentVolumeR = gVolume_Output_R_Value.load(std::memory_order_relaxed);
+    const Float32 currentVolumeL = gVolume_Output_L_Value.load(std::memory_order_relaxed);
+    const bool currentMute = gMute_Output_Mute.load(std::memory_order_relaxed);
     
     {
         CAMutex::Locker locker(&getZeroTimestampMutex);

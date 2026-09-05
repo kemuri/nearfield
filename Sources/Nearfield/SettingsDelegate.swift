@@ -145,16 +145,18 @@ protocol SettingsDriverControlling: AnyObject {
     func settingsRemoveEverything()
 }
 
+struct AppAudioRouteRequest {
+    let bundleIdentifier: String
+    let routingBundleIdentifiers: [String]
+}
+
 @MainActor
 protocol SettingsRoutingControlling: AnyObject {
     func settingsAppRoutingEnabled() -> Bool
     func settingsSetAppRoutingEnabled(_ enabled: Bool)
     func settingsAppRoutingAppBundleIDs() -> [String]?
     func settingsSetAppRoutingAppBundleIDs(_ bundleIDs: [String])
-    func settingsSpatialRoutingChannel(
-        for bundleIdentifier: String,
-        routingBundleIdentifiers: [String]
-    ) -> SpatialRoutingChannel?
+    func settingsSpatialRoutingChannels(for requests: [AppAudioRouteRequest]) -> [String: SpatialRoutingChannel]
     func settingsRoutingRules() -> String
     func settingsSetRoutingRules(_ rules: String)
 }

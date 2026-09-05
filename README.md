@@ -57,7 +57,11 @@ Build and run the Swift package tests with:
 ```sh
 swift build
 swift test
+./script/test_router_driver.sh
 ```
+
+The driver regression tests exercise audio callbacks in an isolated process without
+installing the driver or changing system audio.
 
 Useful scripts:
 

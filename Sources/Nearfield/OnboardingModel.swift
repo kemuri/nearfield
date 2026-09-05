@@ -1117,16 +1117,15 @@ final class OnboardingModel: ObservableObject {
     private func refreshSpatialRoutingActivity(animated: Bool = true) {
         guard let delegate else { return }
 
+        let requests = spatialRoutingApps.filter { spatialRoutingEnabled && $0.isEnabled }.map {
+            AppAudioRouteRequest(bundleIdentifier: $0.bundleIdentifier, routingBundleIdentifiers: $0.routingBundleIdentifiers)
+        }
+        let channels = delegate.settingsSpatialRoutingChannels(for: requests)
         var nextApps = spatialRoutingApps
         var changed = false
         for index in nextApps.indices {
             let app = nextApps[index]
-            let nextChannel = spatialRoutingEnabled && app.isEnabled
-                ? delegate.settingsSpatialRoutingChannel(
-                    for: app.bundleIdentifier,
-                    routingBundleIdentifiers: app.routingBundleIdentifiers
-                )
-                : nil
+            let nextChannel = channels[app.bundleIdentifier]
 
             if nextApps[index].activeChannel != nextChannel {
                 nextApps[index].activeChannel = nextChannel

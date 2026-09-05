@@ -3,9 +3,14 @@ import CoreGraphics
 
 @MainActor
 final class WindowAudioRouteResolver {
-    private struct DisplayTarget {
+    struct DisplayTarget {
         let route: String
         let bounds: CGRect
+    }
+
+    struct RunningApplication {
+        let bundleID: String
+        let processID: pid_t
     }
 
     private struct WindowRoute {
@@ -17,15 +22,32 @@ final class WindowAudioRouteResolver {
     private let studioDisplays: () -> [AudioDevice]
     private let leftDeviceUID: () -> String?
     private let displayOrderUIDs: () -> [String]
+    private let runningApplications: () -> [RunningApplication]
+    private let windowList: () -> [[String: Any]]
+    private let targetProvider: (() -> [DisplayTarget])?
 
     init(
         studioDisplays: @escaping () -> [AudioDevice] = { [] },
         leftDeviceUID: @escaping () -> String? = { nil },
-        displayOrderUIDs: @escaping () -> [String] = { [] }
+        displayOrderUIDs: @escaping () -> [String] = { [] },
+        runningApplications: @escaping () -> [RunningApplication] = {
+            NSWorkspace.shared.runningApplications.compactMap { app in
+                guard !app.isTerminated, let bundleID = app.bundleIdentifier else { return nil }
+                return RunningApplication(bundleID: bundleID, processID: app.processIdentifier)
+            }
+        },
+        windowList: @escaping () -> [[String: Any]] = {
+            CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] ?? []
+        },
+        displayTargets: (() -> [DisplayTarget])? = nil
     ) {
         self.studioDisplays = studioDisplays
         self.leftDeviceUID = leftDeviceUID
         self.displayOrderUIDs = displayOrderUIDs
+        self.runningApplications = runningApplications
+        self.windowList = windowList
+        self.targetProvider = displayTargets
     }
 
     static func assignedRoutes(
@@ -54,11 +76,17 @@ final class WindowAudioRouteResolver {
 
     func resolvedRules(from rawRules: String) -> String {
         let rules = AppRoutingRules.parse(rawRules)
+        let sourceBundleIDs = Set(windowScopedSourceBundleIDs(in: rawRules))
+        let routesByBundleID = sourceBundleIDs.isEmpty ? [:] : visibleWindowRoutes(
+            for: sourceBundleIDs,
+            runningApps: runningApplications()
+        )
 
         var resolvedRules: [String] = []
         for rule in rules {
             if AppRoutingRules.isWindowScopedDestination(rule.destination) {
-                let expandedRule = windowScopedRules(for: windowScopedSourceBundleID(for: rule))
+                let routes = routesByBundleID[windowScopedSourceBundleID(for: rule)] ?? []
+                let expandedRule = windowScopedRules(routes: routes)
                 resolvedRules.append(contentsOf: expandedRule.processRules)
                 resolvedRules.append("\(rule.bundleID)=\(expandedRule.fallbackRoute)")
             } else {
@@ -92,25 +120,31 @@ final class WindowAudioRouteResolver {
         return isAnyBundleRunning(bundleIDs)
     }
 
-    func currentRoute(
-        for primaryBundleID: String,
-        routingBundleIDs: [String],
-        rawRules: String
-    ) -> String? {
-        let bundleIDs = ([primaryBundleID] + routingBundleIDs).uniquePreservingOrder()
-        guard isAnyBundleRunning(bundleIDs) else {
-            return nil
+    func currentRoutes(for requests: [AppAudioRouteRequest], rawRules: String) -> [String: String] {
+        guard !requests.isEmpty else { return [:] }
+        let runningApps = runningApplications()
+        let runningBundleIDs = Set(runningApps.map(\.bundleID))
+        let rules = AppRoutingRules.parse(rawRules)
+        var selectedRules: [String: AppRoutingRule] = [:]
+        for request in requests {
+            let bundleIDs = Set([request.bundleIdentifier] + request.routingBundleIdentifiers)
+            guard !runningBundleIDs.isDisjoint(with: bundleIDs) else { continue }
+            let matchingRules = rules.filter { bundleIDs.contains($0.bundleID) }
+            selectedRules[request.bundleIdentifier] = matchingRules.first {
+                $0.bundleID == request.bundleIdentifier
+            } ?? matchingRules.first
         }
-
-        let rules = AppRoutingRules.parse(rawRules).filter { bundleIDs.contains($0.bundleID) }
-        guard let rule = rules.first(where: { $0.bundleID == primaryBundleID }) ?? rules.first else {
-            return nil
+        let sourceBundleIDs = Set(selectedRules.values
+            .filter { AppRoutingRules.isWindowScopedDestination($0.destination) }
+            .map { windowScopedSourceBundleID(for: $0) })
+        let routesByBundleID = visibleWindowRoutes(for: sourceBundleIDs, runningApps: runningApps)
+        return selectedRules.compactMapValues { rule in
+            if AppRoutingRules.isWindowScopedDestination(rule.destination) {
+                return routesByBundleID[windowScopedSourceBundleID(for: rule)]?
+                    .max(by: { $0.area < $1.area })?.route
+            }
+            return normalizedDestination(rule.destination)
         }
-
-        if AppRoutingRules.isWindowScopedDestination(rule.destination) {
-            return currentWindowScopedRoute(for: windowScopedSourceBundleID(for: rule))
-        }
-        return normalizedDestination(rule.destination)
     }
 
     private func normalizedDestination(_ destination: String) -> String {
@@ -134,8 +168,7 @@ final class WindowAudioRouteResolver {
             .uniquePreservingOrder()
     }
 
-    private func windowScopedRules(for bundleID: String) -> (processRules: [String], fallbackRoute: String) {
-        let routes = visibleWindowRoutes(for: bundleID)
+    private func windowScopedRules(routes: [WindowRoute]) -> (processRules: [String], fallbackRoute: String) {
         guard !routes.isEmpty else {
             return ([], "pair")
         }
@@ -156,36 +189,31 @@ final class WindowAudioRouteResolver {
         return (processRules, fallbackRoute)
     }
 
-    private func currentWindowScopedRoute(for bundleID: String) -> String? {
-        visibleWindowRoutes(for: bundleID)
-            .max(by: { $0.area < $1.area })?
-            .route
-    }
-
     private func isAnyBundleRunning(_ bundleIDs: [String]) -> Bool {
         let bundleIDs = Set(bundleIDs)
-        return NSWorkspace.shared.runningApplications.contains {
-            guard let bundleIdentifier = $0.bundleIdentifier else { return false }
-            return !$0.isTerminated && bundleIDs.contains(bundleIdentifier)
-        }
+        return runningApplications().contains { bundleIDs.contains($0.bundleID) }
     }
 
-    private func visibleWindowRoutes(for bundleID: String) -> [WindowRoute] {
-        let runningPIDs = Set(NSWorkspace.shared.runningApplications
-            .filter { $0.bundleIdentifier == bundleID && !$0.isTerminated }
-            .map(\.processIdentifier))
-        // Spatial routing only reads required window-list metadata (PID, layer,
-        // bounds, and alpha). It never captures screen contents or window names,
-        // so Screen Recording authorization is neither needed nor requested.
-        guard !runningPIDs.isEmpty,
-              let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return []
+    private func visibleWindowRoutes(
+        for bundleIDs: Set<String>,
+        runningApps: [RunningApplication]
+    ) -> [String: [WindowRoute]] {
+        guard !bundleIDs.isEmpty else { return [:] }
+        var bundleIDByPID: [pid_t: String] = [:]
+        for app in runningApps where bundleIDs.contains(app.bundleID) {
+            bundleIDByPID[app.processID] = app.bundleID
         }
-
-        var routes: [WindowRoute] = []
+        guard !bundleIDByPID.isEmpty else { return [:] }
+        // Capture metadata and resolve physical display identities once per
+        // refresh, shared by every window and helper-app alias in the batch.
+        // This reads no screen contents or window titles.
+        let windowInfo = windowList()
+        let targets = targetProvider?() ?? displayTargets()
+        guard targets.count >= 2 else { return [:] }
+        var routes: [String: [WindowRoute]] = [:]
         for window in windowInfo {
             guard let pidNumber = window[kCGWindowOwnerPID as String] as? NSNumber,
-                  runningPIDs.contains(pidNumber.int32Value),
+                  let bundleID = bundleIDByPID[pidNumber.int32Value],
                   let layerNumber = window[kCGWindowLayer as String] as? NSNumber,
                   layerNumber.intValue == 0,
                   let boundsDictionary = window[kCGWindowBounds as String] as? NSDictionary,
@@ -200,11 +228,11 @@ final class WindowAudioRouteResolver {
                 continue
             }
 
-            guard let route = displayRoute(for: bounds) else {
+            guard let route = displayRoute(for: bounds, targets: targets) else {
                 continue
             }
 
-            routes.append(WindowRoute(
+            routes[bundleID, default: []].append(WindowRoute(
                 processID: pidNumber.int32Value,
                 route: route,
                 area: bounds.width * bounds.height
@@ -214,10 +242,7 @@ final class WindowAudioRouteResolver {
         return routes
     }
 
-    private func displayRoute(for windowBounds: CGRect) -> String? {
-        let targets = displayTargets()
-        guard targets.count >= 2 else { return nil }
-
+    private func displayRoute(for windowBounds: CGRect, targets: [DisplayTarget]) -> String? {
         var bestTarget: DisplayTarget?
         var bestIntersectionArea: CGFloat = 0
         for target in targets {

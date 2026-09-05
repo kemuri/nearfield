@@ -69,7 +69,7 @@ final class MediaKeyVolumeController {
 
     private func adjustVolume(by delta: Float32) throws {
         if routerDriverManager.isRouterDefaultOutput() {
-            try routerDriverManager.adjustVolume(by: delta)
+            try routerDriverManager.adjustVolume(by: delta, balance: NearfieldPreferences.balance())
         } else {
             try audioManager.adjustNearfieldVolume(by: delta)
         }

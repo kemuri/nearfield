@@ -566,7 +566,11 @@ class ProxyAudioDevice {
     UInt32 gPlugIn_RefCount = 0;
     AudioServerPlugInHostRef gPlugIn_Host = NULL;
     Boolean gBox_Acquired = true;
-    Float64 gDevice_SampleRate = 44100.0;
+    // Render callbacks must never wait for configuration/storage under stateMutex.
+    static_assert(__atomic_always_lock_free(sizeof(Float64), nullptr), "Sample rate must be lock-free");
+    static_assert(__atomic_always_lock_free(sizeof(Float32), nullptr), "Volume must be lock-free");
+    static_assert(__atomic_always_lock_free(sizeof(bool), nullptr), "Mute must be lock-free");
+    std::atomic<Float64> gDevice_SampleRate{44100.0};
     std::vector<Float64> gDevice_SampleRates = {22050, 44100, 48000, 88200, 96000, 176400, 192000};
     UInt64 gDevice_IOIsRunning = 0;
     const UInt32 kDevice_RingBufferSize = 16384;
@@ -578,9 +582,9 @@ class ProxyAudioDevice {
     bool gStream_Output_IsActive = true;
     const Float32 kVolume_MinDB = -63.5;
     const Float32 kVolume_MaxDB = 0.0;
-    Float32 gVolume_Output_L_Value = 1.0;
-    Float32 gVolume_Output_R_Value = 1.0;
-    bool gMute_Output_Mute = false;
+    std::atomic<Float32> gVolume_Output_L_Value{1.0};
+    std::atomic<Float32> gVolume_Output_R_Value{1.0};
+    std::atomic<bool> gMute_Output_Mute{false};
     const UInt32 gDevice_BytesPerFrameInChannel = 4;
     const UInt32 gDevice_ChannelsPerFrame = 2;
     const UInt32 gDevice_SafetyOffset = 0;

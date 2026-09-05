@@ -1,4 +1,14 @@
 enum BalanceMath {
+    static func adjustedChannelVolumes(
+        currentLeft: Float32,
+        currentRight: Float32,
+        delta: Float32,
+        balance: Float32
+    ) -> (left: Float32, right: Float32) {
+        let nextVolume = min(max(max(currentLeft, currentRight) + delta, 0), 1)
+        return channelVolumes(currentLeft: nextVolume, currentRight: nextVolume, balance: balance)
+    }
+
     static func channelVolumes(
         currentLeft: Float32?,
         currentRight: Float32?,

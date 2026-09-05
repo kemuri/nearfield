@@ -132,21 +132,10 @@ extension AppDelegate: SettingsDelegate {
         refreshStatus()
     }
 
-    func settingsSpatialRoutingChannel(
-        for bundleIdentifier: String,
-        routingBundleIdentifiers: [String]
-    ) -> SpatialRoutingChannel? {
-        guard appRoutingEnabled(), cachedRouterDriverAvailability.isLoaded else {
-            return nil
-        }
-        guard let route = windowRouteResolver.currentRoute(
-            for: bundleIdentifier,
-            routingBundleIDs: routingBundleIdentifiers,
-            rawRules: currentRoutingRules()
-        ) else {
-            return nil
-        }
-        return SpatialRoutingChannel(route: route)
+    func settingsSpatialRoutingChannels(for requests: [AppAudioRouteRequest]) -> [String: SpatialRoutingChannel] {
+        guard appRoutingEnabled(), cachedRouterDriverAvailability.isLoaded else { return [:] }
+        return windowRouteResolver.currentRoutes(for: requests, rawRules: currentRoutingRules())
+            .compactMapValues { SpatialRoutingChannel(route: $0) }
     }
 
     func settingsRoutingRules() -> String {
@@ -252,7 +241,6 @@ extension AppDelegate: SettingsDelegate {
             return
         }
         pendingDisplayAssignmentTask?.cancel()
-        let preservedMasterVolume = routerDriverManager.currentBaseVolume()
         NearfieldPreferences.setDisplayOrderUIDs(normalizedUIDs)
         // Persisting the visual order and applying the driver configuration are
         // one operation: a successful drop must change the real channel map.
@@ -270,14 +258,9 @@ extension AppDelegate: SettingsDelegate {
                 return
             }
             do {
-                if let preservedMasterVolume {
-                    try self.routerDriverManager.setBalancedVolume(
-                        preservedMasterVolume,
-                        balance: self.currentBalance()
-                    )
-                } else {
-                    try self.routerDriverManager.setBalance(self.currentBalance())
-                }
+                // Read the live master volume when applying balance. A user may
+                // have changed it through macOS or media keys during the rebuild.
+                try self.routerDriverManager.setBalance(self.currentBalance())
             } catch {
                 self.showError(error)
             }

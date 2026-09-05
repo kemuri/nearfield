@@ -38,7 +38,7 @@ not require installing the driver.
 
 1. Keep each pull request focused on one change.
 2. Add or update regression tests for behavior changes.
-3. Run `swift build`, `swift test`, and `git diff --check`.
+3. Run `swift build`, `swift test`, `./script/test_router_driver.sh`, and `git diff --check`.
 4. Explain user-visible behavior, permissions, or driver changes in the pull
    request description.
 5. Never commit credentials, provisioning profiles, or locally generated app
