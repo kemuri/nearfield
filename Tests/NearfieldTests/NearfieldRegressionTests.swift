@@ -447,30 +447,6 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testStatusItemLeftClickFocusesOnboardingThenReturnsToContextMenu() {
-        XCTAssertEqual(
-            NearfieldLaunchPolicy.statusItemAction(
-                hasCompletedOnboarding: false,
-                explicitlyRequestsContextMenu: false
-            ),
-            .primaryWindow
-        )
-        XCTAssertEqual(
-            NearfieldLaunchPolicy.statusItemAction(
-                hasCompletedOnboarding: true,
-                explicitlyRequestsContextMenu: false
-            ),
-            .contextMenu
-        )
-        XCTAssertEqual(
-            NearfieldLaunchPolicy.statusItemAction(
-                hasCompletedOnboarding: false,
-                explicitlyRequestsContextMenu: true
-            ),
-            .contextMenu
-        )
-    }
-
     func testFullMenuBarMenuRemainsHiddenUntilInitialOnboardingReachesSettings() {
         XCTAssertFalse(
             NearfieldRouterPolicy.shouldShowFullMenuBarMenu(isInitialOnboardingInProgress: true)

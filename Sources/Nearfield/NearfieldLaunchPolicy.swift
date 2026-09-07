@@ -4,11 +4,6 @@ enum NearfieldWindowPresentation: Equatable {
     case settings
 }
 
-enum NearfieldStatusItemAction: Equatable {
-    case primaryWindow
-    case contextMenu
-}
-
 enum NearfieldLaunchPolicy {
     static func initialLaunchPresentation(
         hasCompletedOnboarding: Bool,
@@ -50,13 +45,4 @@ enum NearfieldLaunchPolicy {
         hasCompletedOnboarding ? .settings : .onboarding
     }
 
-    static func statusItemAction(
-        hasCompletedOnboarding: Bool,
-        explicitlyRequestsContextMenu: Bool
-    ) -> NearfieldStatusItemAction {
-        if explicitlyRequestsContextMenu || hasCompletedOnboarding {
-            return .contextMenu
-        }
-        return .primaryWindow
-    }
 }

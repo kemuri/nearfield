@@ -91,6 +91,8 @@ xcodebuild -downloadComponent MetalToolchain
 
 ## Contributing
 
+For production releases, follow the [release changelog workflow](docs/production-releases.md).
+
 Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for the development workflow. Please report security issues as described in
 [SECURITY.md](SECURITY.md), not in a public issue.

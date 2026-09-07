@@ -17,9 +17,6 @@ extension AppDelegate {
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.title = ""
         statusItem.button?.toolTip = "Nearfield"
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(handleStatusItemButtonClick(_:))
-        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         menu.delegate = self
         applyMenuBarState()
     }
@@ -62,28 +59,6 @@ extension AppDelegate {
             return
         }
         showOnboardingSettingsStage(showsPageIndicator: false)
-    }
-
-    @objc func handleStatusItemButtonClick(_ sender: NSStatusBarButton) {
-        let event = NSApp.currentEvent
-        let explicitlyRequestsContextMenu =
-            event?.type == .rightMouseUp ||
-            event?.modifierFlags.contains(.control) == true
-
-        switch NearfieldLaunchPolicy.statusItemAction(
-            hasCompletedOnboarding: !isInitialOnboardingInProgress,
-            explicitlyRequestsContextMenu: explicitlyRequestsContextMenu
-        ) {
-        case .primaryWindow:
-            presentPrimaryWindow()
-        case .contextMenu:
-            rebuildMenu()
-            menu.popUp(
-                positioning: nil,
-                at: NSPoint(x: 0, y: sender.bounds.maxY + 4),
-                in: sender
-            )
-        }
     }
 
     func presentPrimaryWindow() {
@@ -151,6 +126,10 @@ extension AppDelegate {
         guard NearfieldRouterPolicy.shouldShowFullMenuBarMenu(
             isInitialOnboardingInProgress: isInitialOnboardingInProgress
         ) else {
+            let setupItem = NSMenuItem(title: "Continue Setup…", action: #selector(openSettings), keyEquivalent: "")
+            setupItem.target = self
+            menu.addItem(setupItem)
+            menu.addItem(.separator())
             addQuitMenuItem()
             return
         }
@@ -243,8 +222,9 @@ extension AppDelegate {
     func applyMenuBarState() {
         statusItem.isVisible = showMenuBarApp()
         statusItem.button?.isEnabled = true
-        statusItem.menu = nil
         rebuildMenu()
+        // Let AppKit own menu tracking, screen-edge placement, and appearance.
+        statusItem.menu = menu
     }
 
     func showMenuBarApp() -> Bool {
