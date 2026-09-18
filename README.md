@@ -23,6 +23,11 @@ Apple Studio Displays into one volume-controllable stereo output.
 Nearfield is an early-stage project. App and per-window routing are experimental,
 and macOS may expose several windows from one app as a single audio process. In
 that case, Nearfield cannot split those windows into separate audio streams.
+Window following keeps tracking the established window when another window from
+the same process opens or moves. If several windows already exist when routing
+starts, it initially chooses the largest visible window. It chooses a new window
+when the tracked window is no longer visible; it cannot detect playback switching
+between windows that share an audio process.
 
 ## Requirements
 

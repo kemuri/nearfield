@@ -140,10 +140,34 @@ static void testRenderDoesNotWaitForConfigurationMutex() {
     assert(f.output[0] == 0.0f && f.output[1] == 0.5f);
 }
 
+static void testClosingSilentSafariClientPreservesPlayingHelper() {
+    DriverFixture f;
+    f.device.routingEnabled = true;
+    f.device.routeRulesString = CFSTR("com.apple.Safari=left; com.apple.WebKit.GPU=left");
+    f.device.rebuildRouteRulesNoLock();
+    const AudioServerPlugInClientInfo playing = {1, 101, true, CFSTR("com.apple.WebKit.GPU")};
+    const AudioServerPlugInClientInfo silentWindow = {2, 102, true, CFSTR("com.apple.Safari")};
+    assert(f.device.AddDeviceClient(gAudioServerPlugInDriverRef, kObjectID_Device, &playing) == noErr);
+    f.start(1);
+    f.write(0, kAudioServerPlugInIOOperationMixOutput, 1);
+    assert(f.device.AddDeviceClient(gAudioServerPlugInDriverRef, kObjectID_Device, &silentWindow) == noErr);
+    f.start(2);
+    f.write(512, kAudioServerPlugInIOOperationMixOutput, 1);
+    f.stop(2);
+    assert(f.device.RemoveDeviceClient(gAudioServerPlugInDriverRef, kObjectID_Device, &silentWindow) == noErr);
+    f.write(1024, kAudioServerPlugInIOOperationMixOutput, 1);
+    f.render(1024);
+    for (size_t i = 0; i < 1024; i += 2) {
+        assert(f.output[i] == 0.5f && f.output[i + 1] == 0.0f);
+    }
+    assert(f.device.inputFinalFrameTime == -1);
+}
+
 int main() {
     testOverlappingClientsPreservePlayback();
     testInvalidLifecycleCallsDoNotChangeAudio();
     testRoutedMixSurvivesClientStop();
     testRenderDoesNotWaitForConfigurationMutex();
-    std::cout << "4 driver regression tests passed\n";
+    testClosingSilentSafariClientPreservesPlayingHelper();
+    std::cout << "5 driver regression tests passed\n";
 }

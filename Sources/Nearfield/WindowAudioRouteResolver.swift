@@ -15,10 +15,17 @@ final class WindowAudioRouteResolver {
 
     private struct WindowRoute {
         let processID: pid_t
+        let windowID: CGWindowID?
         let route: String
         let area: CGFloat
     }
 
+    private struct WindowSelection {
+        let bundleID: String
+        let windowID: CGWindowID
+    }
+
+    private var selectedWindows: [pid_t: WindowSelection] = [:]
     private let studioDisplays: () -> [AudioDevice]
     private let leftDeviceUID: () -> String?
     private let displayOrderUIDs: () -> [String]
@@ -77,6 +84,7 @@ final class WindowAudioRouteResolver {
     func resolvedRules(from rawRules: String) -> String {
         let rules = AppRoutingRules.parse(rawRules)
         let sourceBundleIDs = Set(windowScopedSourceBundleIDs(in: rawRules))
+        selectedWindows = selectedWindows.filter { sourceBundleIDs.contains($0.value.bundleID) }
         let routesByBundleID = sourceBundleIDs.isEmpty ? [:] : visibleWindowRoutes(
             for: sourceBundleIDs,
             runningApps: runningApplications()
@@ -199,6 +207,9 @@ final class WindowAudioRouteResolver {
         runningApps: [RunningApplication]
     ) -> [String: [WindowRoute]] {
         guard !bundleIDs.isEmpty else { return [:] }
+        selectedWindows = selectedWindows.filter { pid, selection in
+            runningApps.contains { $0.processID == pid && $0.bundleID == selection.bundleID }
+        }
         var bundleIDByPID: [pid_t: String] = [:]
         for app in runningApps where bundleIDs.contains(app.bundleID) {
             bundleIDByPID[app.processID] = app.bundleID
@@ -234,12 +245,35 @@ final class WindowAudioRouteResolver {
 
             routes[bundleID, default: []].append(WindowRoute(
                 processID: pidNumber.int32Value,
+                windowID: (window[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
                 route: route,
                 area: bounds.width * bounds.height
             ))
         }
 
-        return routes
+        var selectedRoutes: [String: [WindowRoute]] = [:]
+        for (pid, bundleID) in bundleIDByPID {
+            let candidates = (routes[bundleID] ?? []).filter { $0.processID == pid }
+            // A process can carry audio for several windows without exposing
+            // which one is playing. Keep following the established window by
+            // identity; a new/larger/frontmost window is not evidence that the
+            // audio source changed. Re-select only when that window disappears.
+            let previousID = selectedWindows[pid]?.windowID
+            let selected = candidates.first { candidate in
+                previousID != nil && candidate.windowID == previousID
+            } ?? candidates.max(by: { $0.area < $1.area })
+            guard let selected else {
+                selectedWindows.removeValue(forKey: pid)
+                continue
+            }
+            if let windowID = selected.windowID {
+                selectedWindows[pid] = WindowSelection(bundleID: bundleID, windowID: windowID)
+            } else {
+                selectedWindows.removeValue(forKey: pid)
+            }
+            selectedRoutes[bundleID, default: []].append(selected)
+        }
+        return selectedRoutes
     }
 
     private func displayRoute(for windowBounds: CGRect, targets: [DisplayTarget]) -> String? {
