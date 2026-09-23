@@ -263,6 +263,15 @@ class Diagnostics {
     DiagnosticQueue<1024> queue;
 };
 
+// Counts requests the driver makes to Core Audio as a HAL client, reported in
+// the status so idle activity can be measured.
+inline std::atomic<uint64_t> &halRequestCount() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+inline void countHALRequest() { halRequestCount().fetch_add(1, std::memory_order_relaxed); }
+
 } // namespace nearfield
 
 #endif /* NearfieldDiagnostics_h */
