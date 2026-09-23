@@ -11,6 +11,11 @@
 
 #include "AudioDevice.h"
 #include "CAMutex.h"
+#include "NearfieldDiagnostics.h"
+
+#ifndef NEARFIELD_DRIVER_DIAGNOSTICS
+#define NEARFIELD_DRIVER_DIAGNOSTICS 0
+#endif
 
 class AudioRingBuffer;
 
@@ -593,6 +598,18 @@ class ProxyAudioDevice {
     const UInt32 gDevice_BytesPerFrameInChannel = 4;
     const UInt32 gDevice_ChannelsPerFrame = 2;
     const UInt32 gDevice_SafetyOffset = 0;
+
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+    // Diagnostic builds only: records timing and buffer state around
+    // underruns without logging or blocking on the audio threads.
+    nearfield::Diagnostics diagnostics;
+    nearfield::CallbackWindow writerWindow;
+    nearfield::CallbackWindow readerWindow;
+    std::atomic<uint64_t> outputStartRequestedHostTime{0};
+    std::atomic<uint64_t> maxZeroTimestampLockWaitTicks{0};
+    UInt32 lastWriterBufferFrameSize = 0;
+    void drainDiagnostics();
+#endif
 };
 
 extern "C" void *ProxyAudio_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID);

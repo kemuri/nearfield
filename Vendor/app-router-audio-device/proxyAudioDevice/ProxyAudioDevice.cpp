@@ -13,6 +13,12 @@
 #include "debugHelpers.h"
 #include "utilities.h"
 
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+#define NF_DIAG(...) __VA_ARGS__
+#else
+#define NF_DIAG(...)
+#endif
+
 #pragma mark Utility Functions
 
 template<typename T>
@@ -587,6 +593,10 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
 
     //    store the AudioServerPlugInHostRef
     gPlugIn_Host = inHost;
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+    diagnostics.enabled.store(true);
+    syslog(LOG_NOTICE, "NearfieldDiag: diagnostics build active");
+#endif
 
     //    initialize the box acquired property from the settings
     CFPropertyListRef theSettingsData = NULL;
@@ -832,6 +842,7 @@ OSStatus ProxyAudioDevice::PerformDeviceConfigurationChange(AudioServerPlugInDri
         theHostClockFrequency *= 1000000000.0;
         gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
     }
+    NF_DIAG(diagnostics.record(nearfield::kDiagnosticSampleRate, 0, 0, 0, (Float64)inChangeAction, -1));
 
     DebugMsg("ProxyAudio: finished PerformDeviceConfigurationChange, will match sample rate");
     matchOutputDeviceSampleRate();
@@ -4881,10 +4892,13 @@ void ProxyAudioDevice::updateOutputDeviceStartedState() {
 
     if (!outputDevice.isStarted && shouldStart) {
         DebugMsg("ProxyAudio: starting outputDevice");
+        NF_DIAG(outputStartRequestedHostTime.store(mach_absolute_time()));
+        NF_DIAG(diagnostics.record(nearfield::kDiagnosticOutputStartRequested));
         outputDevice.start();
     } else if (outputDevice.isStarted && !shouldStart) {
         DebugMsg("ProxyAudio: stopping outputDevice");
         outputDevice.stop();
+        NF_DIAG(diagnostics.record(nearfield::kDiagnosticOutputStopped));
         resetInputData();
     }
 
@@ -4913,6 +4927,7 @@ void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
         CAMutex::Locker stateMutexLocker(stateMutex);
         currentInputSampleRate = gDevice_SampleRate;
     }
+    NF_DIAG(diagnostics.record(nearfield::kDiagnosticSampleRate, 1, 0, 0, currentInputSampleRate, outputDevice.sampleRate));
     
     if (currentInputSampleRate == outputDevice.sampleRate) {
         outputDeviceReady = true;
@@ -5137,6 +5152,7 @@ OSStatus ProxyAudioDevice::StartIO(AudioServerPlugInDriverRef inDriver,
     }
     
     inputIOIsActive = (gDevice_IOIsRunning > 0);
+    NF_DIAG(diagnostics.record(nearfield::kDiagnosticStartIO, (int32_t)gDevice_IOIsRunning, inClientID));
     ExecuteInAudioOutputThread(^ () { updateOutputDeviceStartedState(); });
     
     DebugMsg("ProxyAudio: StartIO finished");
@@ -5182,6 +5198,7 @@ OSStatus ProxyAudioDevice::StopIO(AudioServerPlugInDriverRef inDriver,
             --gDevice_IOIsRunning;
         }
         inputIOIsActive = (gDevice_IOIsRunning > 0);
+        NF_DIAG(diagnostics.record(nearfield::kDiagnosticStopIO, (int32_t)gDevice_IOIsRunning, inClientID));
     }
     
     ExecuteInAudioOutputThread(^ () { updateOutputDeviceStartedState(); });
@@ -5227,7 +5244,17 @@ OSStatus ProxyAudioDevice::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
                    "GetZeroTimeStamp: bad device ID");
 
     {
+        NF_DIAG(const UInt64 lockStart = mach_absolute_time());
         CAMutex::Locker locker(&getZeroTimestampMutex);
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+        {
+            const UInt64 waited = mach_absolute_time() - lockStart;
+            UInt64 previous = maxZeroTimestampLockWaitTicks.load(std::memory_order_relaxed);
+            while (waited > previous &&
+                   !maxZeroTimestampLockWaitTicks.compare_exchange_weak(previous, waited, std::memory_order_relaxed)) {
+            }
+        }
+#endif
         
         //    get the current host time
         theCurrentHostTime = mach_absolute_time();
@@ -5254,6 +5281,9 @@ OSStatus ProxyAudioDevice::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
         if (theNextHostTime <= theCurrentHostTime) {
             ++gDevice_NumberTimeStamps;
             gDevice_ElapsedTicks += theHostTicksPerRingBuffer;
+            NF_DIAG(diagnostics.record(nearfield::kDiagnosticClock,
+                                       (int32_t)outputAccumulatedRateRatioSamples, (int64_t)gDevice_NumberTimeStamps, 0,
+                                       (rateRatio - 1.0) * 1e6, rateRatio));
         }
 
         //    set the return values
@@ -5387,6 +5417,23 @@ OSStatus ProxyAudioDevice::DoIOOperation(AudioServerPlugInDriverRef inDriver,
                    Done,
                    "DoIOOperation: bad stream ID");
 
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+    if (inOperationID == kAudioServerPlugInIOOperationMixOutput || inOperationID == kAudioServerPlugInIOOperationWriteMix) {
+        const UInt64 diagnosticNow = mach_absolute_time();
+        const UInt64 cycleStart = inIOCycleInfo->mCurrentTime.mHostTime;
+        writerWindow.noteCallback(diagnosticNow, diagnosticNow > cycleStart ? diagnosticNow - cycleStart : 0);
+        writerWindow.noteFill(inIOBufferFrameSize);
+        if (inIOBufferFrameSize != lastWriterBufferFrameSize) {
+            lastWriterBufferFrameSize = inIOBufferFrameSize;
+            diagnostics.record(nearfield::kDiagnosticBufferSizes, (int32_t)inIOBufferFrameSize, outputDevice.bufferFrameSize);
+        }
+        nearfield::DiagnosticRecord window;
+        if (writerWindow.finish(diagnosticNow, nearfield::kDiagnosticWriterWindow, window)) {
+            diagnostics.push(window);
+        }
+    }
+#endif
+
     //    clear the buffer if this iskAudioServerPlugInIOOperationReadInput
     if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
         memset(ioMainBuffer, 0, inIOBufferFrameSize * 8);
@@ -5394,7 +5441,9 @@ OSStatus ProxyAudioDevice::DoIOOperation(AudioServerPlugInDriverRef inDriver,
     } else if (inOperationID == kAudioServerPlugInIOOperationMixOutput) {
         if (inputBuffer && routeMixBuffer) {
             RouteDestination destination = routeDestinationForClientIDSnapshot(inClientID);
+            NF_DIAG(const UInt64 lockStart = mach_absolute_time());
             CAMutex::Locker locker(IOMutex);
+            NF_DIAG(writerWindow.noteLockWait(mach_absolute_time() - lockStart));
             SInt64 startFrame = (SInt64)inIOCycleInfo->mOutputTime.mSampleTime;
 
             inputBuffer->Fetch(routeMixBuffer, inIOBufferFrameSize, startFrame);
@@ -5410,7 +5459,9 @@ OSStatus ProxyAudioDevice::DoIOOperation(AudioServerPlugInDriverRef inDriver,
         }
     } else if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
         if (inputBuffer) {
+            NF_DIAG(const UInt64 lockStart = mach_absolute_time());
             CAMutex::Locker locker(IOMutex);
+            NF_DIAG(writerWindow.noteLockWait(mach_absolute_time() - lockStart));
 
             inputBuffer->Store((const Byte *)ioMainBuffer, inIOBufferFrameSize, inIOCycleInfo->mOutputTime.mSampleTime);
             
@@ -5449,7 +5500,22 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
 #pragma unused(inNow)
 #pragma unused(inInputData)
 #pragma unused(inInputTime)
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+    const UInt64 diagnosticNow = mach_absolute_time();
+    const UInt64 callbackStart = inNow ? inNow->mHostTime : diagnosticNow;
+    const UInt64 lateness = diagnosticNow > callbackStart ? diagnosticNow - callbackStart : 0;
+    {
+        const UInt64 startRequested = outputStartRequestedHostTime.exchange(0);
+        if (startRequested != 0) {
+            diagnostics.record(nearfield::kDiagnosticOutputFirstCallback, 0, 0, 0,
+                               nearfield::hostTicksToMilliseconds(diagnosticNow - startRequested));
+        }
+    }
+    readerWindow.noteCallback(diagnosticNow, lateness);
+    const UInt64 lockStart = diagnosticNow;
+#endif
     CAMutex::Locker locker1(IOMutex);
+    NF_DIAG(readerWindow.noteLockWait(mach_absolute_time() - lockStart));
 
     // In theory we don't need a locking mechanism here, because outputDevice will only be modified
     // while it is not playing.
@@ -5465,7 +5531,9 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     const bool currentMute = gMute_Output_Mute.load(std::memory_order_relaxed);
     
     {
+        NF_DIAG(const UInt64 timestampLockStart = mach_absolute_time());
         CAMutex::Locker locker(&getZeroTimestampMutex);
+        NF_DIAG(readerWindow.noteLockWait(mach_absolute_time() - timestampLockStart));
         
         // We don't need to keep taking samples of the device's ratio past
         // 10000 samples. If we get that far then the device is idling.
@@ -5507,7 +5575,34 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
         outputOverrunCount = 0;
     }
 
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+    {
+        const Float64 bufferedFrames =
+            (Float64)inputBuffer->mEndFrame - (startFrame + (Float64)currentOutputDeviceBufferFrameSize);
+        readerWindow.noteFill(bufferedFrames);
+        if (overrun && inputFinalFrameTime == -1 && startFrame >= inputBuffer->mStartFrame) {
+            diagnostics.record(nearfield::kDiagnosticUnderrun,
+                               (int32_t)std::max<Float64>(0, -bufferedFrames),
+                               (int64_t)startFrame,
+                               inputBuffer->mEndFrame,
+                               bufferedFrames,
+                               lastInputBufferFrameSize + currentOutputDeviceBufferFrameSize + currentOutputDeviceSafetyOffset,
+                               nearfield::hostTicksToMicroseconds(lateness));
+        } else if (overrun && inputFinalFrameTime == -1) {
+            diagnostics.record(nearfield::kDiagnosticOverrun,
+                               (int32_t)(inputBuffer->mStartFrame - (SInt64)startFrame),
+                               (int64_t)startFrame,
+                               inputBuffer->mEndFrame);
+        }
+        nearfield::DiagnosticRecord window;
+        if (readerWindow.finish(diagnosticNow, nearfield::kDiagnosticReaderWindow, window)) {
+            diagnostics.push(window);
+        }
+    }
+#endif
+
     if (outputOverrunCount >= kOutputOverrunResyncThreshold) {
+        NF_DIAG(diagnostics.record(nearfield::kDiagnosticResync, outputOverrunCount, (int64_t)startFrame, inputBuffer->mEndFrame));
         syslog(LOG_WARNING, "ProxyAudio: output overrun persisted, resyncing");
         inputOutputSampleDelta = -1;
         smallestFramesToBufferEnd = -1;
@@ -6545,6 +6640,7 @@ void ProxyAudioDevice::setRouteRules(CFStringRef newRules) {
 #pragma mark Other stuff!
 
 void ProxyAudioDevice::monitorUserActivity() {
+    NF_DIAG(drainDiagnostics());
     {
         CAMutex::Locker outputMutexLocker(outputDeviceMutex);
         updateOutputDeviceStartedState();
@@ -6618,6 +6714,38 @@ void ProxyAudioDevice::refreshTargetOutputReadiness() {
         readyTargetConfigurationRevision.store(revision);
     }
 }
+
+#if NEARFIELD_DRIVER_DIAGNOSTICS
+void ProxyAudioDevice::drainDiagnostics() {
+    const UInt64 zeroTimestampWait = maxZeroTimestampLockWaitTicks.exchange(0);
+    if (zeroTimestampWait > 0) {
+        syslog(LOG_NOTICE,
+               "NearfieldDiag: kind=zero-timestamp-lock maxWaitUs=%.0f",
+               nearfield::hostTicksToMicroseconds(zeroTimestampWait));
+    }
+    nearfield::DiagnosticRecord entry;
+    int drained = 0;
+    while (drained < 256 && diagnostics.pop(entry)) {
+        ++drained;
+        syslog(LOG_NOTICE,
+               "NearfieldDiag: kind=%s host=%llu i0=%d i1=%lld i2=%lld d0=%.3f d1=%.3f d2=%.3f",
+               nearfield::diagnosticKindName(entry.kind),
+               entry.hostTime,
+               entry.i0,
+               entry.i1,
+               entry.i2,
+               entry.d0,
+               entry.d1,
+               entry.d2);
+    }
+    const uint64_t dropped = diagnostics.dropped();
+    static uint64_t reportedDropped = 0;
+    if (dropped != reportedDropped) {
+        syslog(LOG_NOTICE, "NearfieldDiag: kind=dropped total=%llu", dropped);
+        reportedDropped = dropped;
+    }
+}
+#endif
 
 dispatch_queue_t ProxyAudioDevice::AudioOutputDispatchQueue() {
     return audioOutputQueue;

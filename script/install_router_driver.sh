@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRIVER_SOURCE="$("$ROOT_DIR/script/build_router_driver.sh" | tail -1)"
+DRIVER_SOURCE="$("$ROOT_DIR/script/build_router_driver.sh" "$@" | tail -1)"
 HAL_DIR="/Library/Audio/Plug-Ins/HAL"
 DRIVER_DEST="$HAL_DIR/NearfieldAudioDevice.driver"
 LEGACY_ROUTER_DEST="$HAL_DIR/StudioPairRouterAudioDevice.driver"
