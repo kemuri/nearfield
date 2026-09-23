@@ -5,6 +5,7 @@ enum RouterAudioDriverError: LocalizedError {
     case notInstalled
     case unsupportedDriver
     case unsupportedThreeDisplayDriver
+    case unsupportedReadinessDriver
     case configurationFailed(String, OSStatus)
     case defaultOutputFailed(OSStatus)
     case balanceFailed(String, OSStatus)
@@ -17,6 +18,8 @@ enum RouterAudioDriverError: LocalizedError {
             return "The installed Nearfield audio driver is outdated and does not support private target routing. Reinstall the driver from Nearfield Settings."
         case .unsupportedThreeDisplayDriver:
             return "The installed Nearfield audio driver is outdated and does not support three-display output. Reinstall the driver from Nearfield Settings."
+        case .unsupportedReadinessDriver:
+            return "Update the audio driver in Nearfield Settings to enable reliable automatic output switching."
         case .configurationFailed(let setting, let status):
             return "Configuring router driver setting '\(setting)' failed with CoreAudio status \(status)."
         case .defaultOutputFailed(let status):
@@ -42,6 +45,7 @@ final class RouterAudioDriverManager {
         case driverCapabilities = 7
         case targetAggregateDevices = 8
         case targetAggregateMode = 9
+        case targetOutputReadiness = 10
     }
 
     private enum ActiveCondition: Int {
@@ -116,8 +120,47 @@ final class RouterAudioDriverManager {
             throw RouterAudioDriverError.notInstalled
         }
 
-        try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultOutputDevice)
-        try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        if defaultOutputDeviceID() != routerDeviceID {
+            try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultOutputDevice)
+        }
+        if defaultDeviceID(selector: kAudioHardwarePropertyDefaultSystemOutputDevice) != routerDeviceID {
+            try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        }
+    }
+
+    func targetOutputIsReady(deviceUIDs: [String], mode: NearfieldOutputMode) throws -> Bool {
+        guard let boxID = routerBoxID() else { return false }
+        let capabilities = try configurationValue(.driverCapabilities, boxID: boxID)
+        guard Self.capabilityTokens(in: capabilities).contains("targetOutputReadiness") else {
+            throw RouterAudioDriverError.unsupportedReadinessDriver
+        }
+        return Self.readinessMatches(
+            try configurationValue(.targetOutputReadiness, boxID: boxID),
+            deviceUIDs: deviceUIDs, mode: mode
+        )
+    }
+
+    static func readinessMatches(_ status: String?, deviceUIDs: [String], mode: NearfieldOutputMode) -> Bool {
+        guard (2...3).contains(deviceUIDs.count) else { return false }
+        return status == (["ready", mode.rawValue] + deviceUIDs).joined(separator: "\n")
+    }
+
+    func currentDefaultOutputUID() -> String? {
+        defaultOutputDeviceID().flatMap {
+            ProcessAudioPlayback.string(on: $0, selector: kAudioDevicePropertyDeviceUID)
+        }
+    }
+
+    func selectPreviousOutputForRecovery(uid: String, displayUIDs: [String]) throws {
+        // Display outputs are prepared at unity gain for the router. Never
+        // briefly make one of those full-volume endpoints the direct output.
+        guard !displayUIDs.contains(uid), !NearfieldAudioIdentifiers.virtualOutputUIDs.contains(uid),
+              uid != Self.driverTargetAggregateUID,
+              let device = audioObjectID(forUID: uid, selector: kAudioHardwarePropertyTranslateUIDToDevice),
+              CoreAudioProperty.read(from: device, selector: kAudioDevicePropertyDeviceIsAlive, as: UInt32.self) == 1 else {
+            throw RouterConnectionHandoff.Failure.playbackDidNotFollow
+        }
+        try setDefaultDevice(device, selector: kAudioHardwarePropertyDefaultOutputDevice)
     }
 
     func isRouterDefaultOutput() -> Bool {

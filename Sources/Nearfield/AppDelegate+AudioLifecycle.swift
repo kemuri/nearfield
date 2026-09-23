@@ -41,23 +41,26 @@ extension AppDelegate {
         try routerDriverManager.setPublished(true)
         lastAppliedRouterRouteRules = routingState.rules
         if activate {
-            let capturedDisplayState = try prepareDisplaysForVirtualOutputActivation()
-            let capturedDisplayVolume = averageCapturedDisplayVolume(capturedDisplayState)
-            if let activationVolume = routerVolumeContinuity.activationVolume(
-                currentRouterVolume: currentRouterVolume,
-                capturedDisplayVolume: capturedDisplayVolume
-            ) {
-                try routerDriverManager.setBalancedVolume(activationVolume, balance: currentBalance())
-                routerVolumeContinuity.observe(activationVolume)
-            } else {
-                try routerDriverManager.setBalance(currentBalance())
-            }
-            try routerDriverManager.selectRouterAsDefaultOutput()
+            try activateConfiguredRouterOutput(currentRouterVolume: currentRouterVolume)
         } else {
             try routerDriverManager.setBalance(currentBalance())
             try restoreDisplaysAfterProxyDeactivation()
         }
         updateDynamicRoutingRulesLifecycle()
+    }
+
+    func activateConfiguredRouterOutput(currentRouterVolume: Float32?) throws {
+        let capturedDisplayState = try prepareDisplaysForVirtualOutputActivation()
+        if let volume = routerVolumeContinuity.activationVolume(
+            currentRouterVolume: currentRouterVolume,
+            capturedDisplayVolume: averageCapturedDisplayVolume(capturedDisplayState)
+        ) {
+            try routerDriverManager.setBalancedVolume(volume, balance: currentBalance())
+            routerVolumeContinuity.observe(volume)
+        } else {
+            try routerDriverManager.setBalance(currentBalance())
+        }
+        try routerDriverManager.selectRouterAsDefaultOutput()
     }
 
     func currentRouterVolumeForContinuity() -> Float32? {
@@ -92,35 +95,49 @@ extension AppDelegate {
         let hasSufficientDisplays = NearfieldRouterPolicy.shouldPublishRouter(
             studioDisplayCount: state.detectedDisplays.count
         )
-        let justReconnectedDisplays = !hadSufficientStudioDisplays && hasSufficientDisplays
+        let displaysJustConnected = !hadSufficientStudioDisplays && hasSufficientDisplays
         defer {
             hadSufficientStudioDisplays = hasSufficientDisplays
         }
 
         do {
             if hasSufficientDisplays {
-                try handleStudioDisplaysAvailable(state: state, activateVirtualOutput: justReconnectedDisplays)
+                try handleStudioDisplaysAvailable(state: state, displaysJustConnected: displaysJustConnected)
             } else {
                 try handleStudioDisplaysUnavailable(state: state)
             }
-            clearRecoverableError()
+            if let connectionHandoffFailure {
+                recordRecoverableError(connectionHandoffFailure, context: "Automatic output switching failed")
+            } else {
+                clearRecoverableError()
+            }
         } catch {
             recordRecoverableError(error, context: "Audio device refresh failed")
         }
         refreshStatus()
     }
 
-    func handleStudioDisplaysAvailable(state: NearfieldState, activateVirtualOutput: Bool) throws {
+    func handleStudioDisplaysAvailable(state: NearfieldState, displaysJustConnected: Bool) throws {
+        if displaysJustConnected {
+            try startConnectionHandoff()
+            return
+        }
+        if connectionHandoff?.isSwitchingOutput == true {
+            // The asynchronous handoff owns activation and any recovery switch.
+            return
+        }
         let shouldActivateVirtualOutput = NearfieldRouterPolicy.shouldActivateRouter(
             defaultOutputIsNearfield: nearfieldVirtualOutputIsDefaultOutput(state: state),
-            displaysJustReconnected: activateVirtualOutput,
-            shouldReactivateAfterReconnect: shouldReactivateVirtualOutputAfterDisplayReconnect
+            displaysJustConnected: displaysJustConnected,
+            connectionActivationPending: connectionActivationPending
         )
-        shouldReactivateVirtualOutputAfterDisplayReconnect = false
 
         try performSynchronizedAudioUpdate {
             if routerDriverManager.isInstalled {
                 try configureRouterDriver(activate: shouldActivateVirtualOutput)
+                // Keep the connection request through temporary setup failures.
+                // Once selected, later notifications respect manual output changes.
+                connectionActivationPending = false
             } else {
                 try cleanupNearfieldTargetsIfNeeded(state: state, scope: .allManaged)
                 try restoreDisplaysAfterProxyDeactivation()
@@ -129,19 +146,17 @@ extension AppDelegate {
     }
 
     func handleStudioDisplaysUnavailable(state: NearfieldState) throws {
+        cancelConnectionHandoff()
         dynamicRoutingRulesTask?.cancel()
         dynamicRoutingRulesTask = nil
         lastAppliedRouterRouteRules = nil
         _ = currentRouterVolumeForContinuity()
 
-        if nearfieldVirtualOutputIsDefaultOutput(state: state) {
-            shouldReactivateVirtualOutputAfterDisplayReconnect = true
-        }
-
         let shouldMoveToFallback = nearfieldVirtualOutputIsAnyDefault(state: state)
         if shouldMoveToFallback {
             try audioManager.selectFallbackOutputAsDefault()
         }
+        observeConnectionDefaultOutput()
         if routerDriverManager.isInstalled {
             try routerDriverManager.setPublished(false)
         }
@@ -246,6 +261,7 @@ extension AppDelegate {
     }
 
     func rebuildForConfigurationChange() {
+        cancelConnectionHandoff()
         do {
             try performSynchronizedAudioUpdate {
                 try restoreDisplaysAfterProxyDeactivation()

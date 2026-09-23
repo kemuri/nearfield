@@ -4835,6 +4835,7 @@ int ProxyAudioDevice::devicesListenerProc(AudioObjectID inObjectID,
 #pragma unused(inNumberAddresses)
 #pragma unused(inAddresses)
     DebugMsg("ProxyAudio: devicesListenerProc current devices changed");
+    readyTargetConfigurationRevision.store(0);
     // Core Audio invokes this callback while it is processing a device-list
     // change. Re-entering the HAL synchronously from here (the aggregate
     // rebuild calls AudioHardwareCreateAggregateDevice) can deadlock the
@@ -4999,17 +5000,24 @@ void ProxyAudioDevice::initializeOutputDevice() {
                        // in a separate thread from the rest of the driver. Otherwise we'll get
                        // deadlocks!
                        DebugMsg("ProxyAudio: initializeOutputDevice running in separate thread");
+                       UInt64 revision;
+                       {
+                           CAMutex::Locker stateLocker(stateMutex);
+                           revision = targetConfigurationRevision;
+                       }
                        if (!outputDeviceUID) {
                            outputDeviceUID = copyDefaultProxyOutputDeviceUID();
                        }
                        
                        rebuildDriverOwnedTargetAggregate(false);
                        setupTargetOutputDevice();
+                       appliedTargetConfigurationRevision.store(revision);
                        setupAudioDevicesListener();
                    });
 }
 
 void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
+    readyTargetConfigurationRevision.store(0);
     DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock");
     if (outputDevice.isValid()) {
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock stopping device");
@@ -5943,7 +5951,16 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
             return routeRulesString ? CFStringCreateCopy(NULL, routeRulesString) : CFStringCreateCopy(NULL, CFSTR(""));
 
         case ConfigType::driverCapabilities:
-            return CFStringCreateCopy(NULL, CFSTR("driverOwnedTargetAggregate,threeDisplayTargetAggregate"));
+            return CFStringCreateCopy(NULL, CFSTR("driverOwnedTargetAggregate,threeDisplayTargetAggregate,targetOutputReadiness"));
+
+        case ConfigType::targetOutputReadiness:
+            if (readyTargetConfigurationRevision.load() != targetConfigurationRevision ||
+                appliedTargetConfigurationRevision.load() != targetConfigurationRevision || !targetAggregateDevicesString) {
+                return CFStringCreateCopy(NULL, CFSTR("pending"));
+            }
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("ready\n%@\n%@"),
+                                            targetAggregateStereo ? CFSTR("stereo") : CFSTR("mono"),
+                                            targetAggregateDevicesString);
 
         case ConfigType::targetAggregateDevices:
             return targetAggregateDevicesString ? CFStringCreateCopy(NULL, targetAggregateDevicesString) : CFStringCreateCopy(NULL, CFSTR(""));
@@ -6294,17 +6311,21 @@ void ProxyAudioDevice::setTargetAggregateDevices(CFStringRef deviceUIDs) {
     }
 
     Boolean devicesChanged = false;
+    UInt64 revision;
     {
         CAMutex::Locker locker(&stateMutex);
         devicesChanged = !targetAggregateDevicesString ||
             CFStringCompare(targetAggregateDevicesString, deviceUIDs, 0) != kCFCompareEqualTo;
         if (devicesChanged) {
+            ++targetConfigurationRevision;
+            readyTargetConfigurationRevision.store(0);
             if (targetAggregateDevicesString) {
                 CFRelease(targetAggregateDevicesString);
             }
             targetAggregateDevicesString = CFStringCreateCopy(NULL, deviceUIDs);
             gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateDevices"), targetAggregateDevicesString);
         }
+        revision = targetConfigurationRevision;
     }
 
     // Only force a teardown when the target devices actually changed. The
@@ -6316,6 +6337,7 @@ void ProxyAudioDevice::setTargetAggregateDevices(CFStringRef deviceUIDs) {
     ExecuteInAudioOutputThread(^{
         rebuildDriverOwnedTargetAggregate(devicesChanged);
         setupTargetOutputDevice();
+        appliedTargetConfigurationRevision.store(revision);
     });
 }
 
@@ -6327,6 +6349,7 @@ void ProxyAudioDevice::setTargetAggregateMode(CFStringRef mode) {
     std::string normalizedMode = lowercaseString(trimString(CFStringToStdString(mode)));
     Boolean newStereo = normalizedMode != "mono";
     Boolean shouldRebuild = false;
+    UInt64 revision;
     {
         CAMutex::Locker locker(&stateMutex);
         if (targetAggregateStereo == newStereo) {
@@ -6334,6 +6357,9 @@ void ProxyAudioDevice::setTargetAggregateMode(CFStringRef mode) {
         }
 
         targetAggregateStereo = newStereo;
+        ++targetConfigurationRevision;
+        readyTargetConfigurationRevision.store(0);
+        revision = targetConfigurationRevision;
         gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateMode"), mode);
         shouldRebuild = true;
     }
@@ -6345,6 +6371,7 @@ void ProxyAudioDevice::setTargetAggregateMode(CFStringRef mode) {
     ExecuteInAudioOutputThread(^{
         rebuildDriverOwnedTargetAggregate(true);
         setupTargetOutputDevice();
+        appliedTargetConfigurationRevision.store(revision);
     });
 }
 
@@ -6353,14 +6380,21 @@ void ProxyAudioDevice::setOutputDevice(CFStringRef deviceUID) {
         return;
     }
     
+    UInt64 revision;
     {
         CAMutex::Locker locker(&stateMutex);
+
+        if (!outputDeviceUID || CFStringCompare(outputDeviceUID, deviceUID, 0) != kCFCompareEqualTo) {
+            ++targetConfigurationRevision;
+            readyTargetConfigurationRevision.store(0);
+        }
         
         if (outputDeviceUID) {
             CFRelease(outputDeviceUID);
         }
         
         outputDeviceUID = CFStringCreateCopy(NULL, deviceUID); 
+        revision = targetConfigurationRevision;
     }
     
     ExecuteInAudioOutputThread(^{
@@ -6370,6 +6404,7 @@ void ProxyAudioDevice::setOutputDevice(CFStringRef deviceUID) {
     
     ExecuteInAudioOutputThread(^{
         setupTargetOutputDevice();
+        appliedTargetConfigurationRevision.store(revision);
     });
 }
 
@@ -6513,6 +6548,74 @@ void ProxyAudioDevice::monitorUserActivity() {
     {
         CAMutex::Locker outputMutexLocker(outputDeviceMutex);
         updateOutputDeviceStartedState();
+    }
+    refreshTargetOutputReadiness();
+}
+
+void ProxyAudioDevice::refreshTargetOutputReadiness() {
+    // Run HAL queries on the output queue, never in a property callback. The
+    // configurator reads only the cached revision, avoiding HAL re-entry.
+    CAMutex::Locker outputLocker(outputDeviceMutex);
+    readyTargetConfigurationRevision.store(0);
+    if (!outputDeviceReady || !outputDevice.isValid() || !outputDevice.procId ||
+        outputDevice.id != targetAggregateID) {
+        return;
+    }
+
+    CFStringSmartRef devicesString;
+    UInt64 revision;
+    {
+        CAMutex::Locker stateLocker(stateMutex);
+        if (!outputDeviceUID || !CFEqual(outputDeviceUID, CFSTR(kDriverTargetAggregate_UID))) {
+            return;
+        }
+        devicesString = targetAggregateDevicesString ? CFStringCreateCopy(NULL, targetAggregateDevicesString) : nullptr;
+        revision = targetConfigurationRevision;
+    }
+    // A timer can run between a configuration write and its queued rebuild.
+    // Never acknowledge that newer configuration before the queued work ran.
+    if (appliedTargetConfigurationRevision.load() != revision) { return; }
+    const auto expected = splitTargetDeviceUIDs(devicesString);
+    if (expected.size() < 2 || expected.size() > 3) { return; }
+
+    UInt32 alive = 0;
+    if (outputDevice.getIntegerPropertyData(alive, kAudioDevicePropertyDeviceIsAlive,
+                                           kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain) != noErr || !alive) {
+        return;
+    }
+
+    AudioObjectPropertyAddress address = {kAudioAggregateDevicePropertyFullSubDeviceList,
+                                         kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    CFArrayRef fullList = nullptr;
+    UInt32 size = sizeof(fullList);
+    if (AudioObjectGetPropertyData(targetAggregateID, &address, 0, nullptr, &size, &fullList) != noErr || !fullList) {
+        return;
+    }
+    CFArraySmartRef fullListRef(fullList);
+    if (CFArrayGetCount(fullList) != expected.size()) { return; }
+    for (size_t index = 0; index < expected.size(); ++index) {
+        CFStringRef uid = static_cast<CFStringRef>(CFArrayGetValueAtIndex(fullList, index));
+        if (!uid || CFGetTypeID(uid) != CFStringGetTypeID() || CFStringToStdString(uid) != expected[index]) { return; }
+        AudioDevice device(AudioDevice::audioDeviceIDForDeviceUID(uid));
+        if (!device.isValid() || device.getIntegerPropertyData(alive, kAudioDevicePropertyDeviceIsAlive,
+                kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain) != noErr || !alive) { return; }
+    }
+
+    address.mSelector = kAudioAggregateDevicePropertyActiveSubDeviceList;
+    size = 0;
+    if (AudioObjectGetPropertyDataSize(targetAggregateID, &address, 0, nullptr, &size) != noErr ||
+        size != expected.size() * sizeof(AudioObjectID)) { return; }
+    std::vector<AudioObjectID> active(expected.size());
+    if (AudioObjectGetPropertyData(targetAggregateID, &address, 0, nullptr, &size, active.data()) != noErr ||
+        size != expected.size() * sizeof(AudioObjectID)) { return; }
+    for (auto deviceID : active) {
+        CFStringSmartRef uid(AudioDevice::copyDeviceUID(deviceID));
+        if (!uid || std::find(expected.begin(), expected.end(), CFStringToStdString(uid)) == expected.end()) { return; }
+    }
+
+    CAMutex::Locker stateLocker(stateMutex);
+    if (revision == targetConfigurationRevision) {
+        readyTargetConfigurationRevision.store(revision);
     }
 }
 

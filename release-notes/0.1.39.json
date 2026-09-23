@@ -1,0 +1,8 @@
+{
+  "version": "0.1.39",
+  "changes": [
+    "Kept Safari audio on its original display when another window opens or moves to a different display.",
+    "Added audio driver update prompts so existing installations receive fixes for audio going silent when another Safari window closes.",
+    "Automatically select Nearfield as the sound output when a second Studio Display connects, while respecting manual output changes afterward."
+  ]
+}

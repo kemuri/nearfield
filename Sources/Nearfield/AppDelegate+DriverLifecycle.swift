@@ -3,7 +3,14 @@ import os
 
 extension AppDelegate {
     func installAndActivateRouterDriver(_ request: DriverInstallRequest) {
-        guard !isInstallingDriver else { return }
+        guard !isInstallingDriver, !isRemovingDriver else { return }
+        let upgrade = request == .driverUpgrade ? DriverInstaller.availableDriverUpdate() : nil
+        if request == .driverUpgrade {
+            refreshDriverUpdateAvailability()
+            guard upgrade != nil else { refreshStatus(); return }
+            didPromptForDriverUpdate = true
+        }
+        let activateAfterInstall = request != .driverUpgrade || cachedRouterDefaultOutput
         let studioDisplayCount = cachedAudioState.detectedDisplays.count
         guard NearfieldRouterPolicy.shouldAttemptDriverInstall(
             studioDisplayCount: studioDisplayCount,
@@ -20,10 +27,16 @@ extension AppDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let isReinstall = cachedRouterDriverAvailability.isInstalled
         if request.requiresConfirmation {
-            guard confirmPrivilegedInstall(
-                title: isReinstall ? "Reinstall Nearfield Driver?" : "Install Nearfield Driver?",
-                message: "Nearfield will install NearfieldAudioDevice.driver into /Library/Audio/Plug-Ins/HAL. macOS should ask for an administrator password before installing it."
-            ) else {
+            let confirmed: Bool
+            if let upgrade {
+                confirmed = confirmDriverUpgrade(upgrade)
+            } else {
+                confirmed = confirmPrivilegedInstall(
+                    title: isReinstall ? "Reinstall Nearfield Driver?" : "Install Nearfield Driver?",
+                    message: "Nearfield will install NearfieldAudioDevice.driver into /Library/Audio/Plug-Ins/HAL. macOS should ask for an administrator password before installing it."
+                )
+            }
+            guard confirmed else {
                 finishDriverInstallAttempt(
                     disableAppRouting: request.disablesAppRoutingOnFailure,
                     state: .idle
@@ -32,6 +45,7 @@ extension AppDelegate {
             }
         }
         isInstallingDriver = true
+        cancelConnectionHandoff()
         driverInstallState = .installing(.preparation)
         clearRecoverableError()
         refreshStatus()
@@ -42,7 +56,10 @@ extension AppDelegate {
             let driverPath: String
             do {
                 driverPath = try await Task.detached(priority: .userInitiated) {
-                    try DriverInstaller().buildRouterDriver()
+                    // Install the exact bundled version offered by the upgrade
+                    // prompt, including in development builds.
+                    if let upgrade { return upgrade.bundledDriverURL.path }
+                    return try DriverInstaller().buildRouterDriver()
                 }.value
             } catch {
                 self.failDriverInstallAttempt(error, stage: .preparation, request: request)
@@ -79,12 +96,20 @@ extension AppDelegate {
                 )
                 return
             }
+            if let upgrade {
+                do {
+                    try DriverInstaller.verifyInstalledDriverVersion(upgrade.availableVersion)
+                } catch {
+                    self.failDriverInstallAttempt(error, stage: .installation, request: request)
+                    return
+                }
+            }
 
             self.driverInstallState = .installing(.activation)
             self.refreshStatus()
             self.invalidateCoreAudioReadiness()
             self.audioManager.invalidateCachedDevices()
-            if NearfieldRouterPolicy.shouldCompleteDriverInstallWithoutActivation(
+            if request != .driverUpgrade, NearfieldRouterPolicy.shouldCompleteDriverInstallWithoutActivation(
                 currentDriverIsInstalledOnDisk: currentDriverIsInstalledOnDisk,
                 allowsMissingStudioDisplays: request.allowsMissingStudioDisplays
             ) {
@@ -109,7 +134,8 @@ extension AppDelegate {
             self.refreshStatus()
             do {
                 try await self.configureRouterDriverAfterInstall(
-                    allowsMissingStudioDisplays: request.allowsMissingStudioDisplays
+                    allowsMissingStudioDisplays: request.allowsMissingStudioDisplays,
+                    activate: activateAfterInstall
                 )
                 _ = await self.refreshCachedAudioState()
             } catch {
@@ -158,6 +184,7 @@ extension AppDelegate {
         }
         driverInstallState = state
         isInstallingDriver = false
+        refreshDriverUpdateAvailability()
         updateDynamicRoutingRulesLifecycle()
         refreshStatus()
     }
@@ -167,7 +194,8 @@ extension AppDelegate {
     }
 
     func configureRouterDriverAfterInstall(
-        allowsMissingStudioDisplays: Bool
+        allowsMissingStudioDisplays: Bool,
+        activate: Bool = true
     ) async throws {
         let studioDisplayCount: Int
         if allowsMissingStudioDisplays {
@@ -184,7 +212,7 @@ extension AppDelegate {
         }
         try performSynchronizedAudioUpdate {
             try restoreDisplaysAfterProxyDeactivation()
-            try configureRouterDriver()
+            try configureRouterDriver(activate: activate)
         }
     }
 

@@ -20,6 +20,18 @@ Apple Studio Displays into one volume-controllable stereo output.
   both displays, or mute.
 - Includes an optional Wave Lab visualization and can launch at login.
 
+Connecting the second Studio Display automatically selects Nearfield as the
+Mac's sound output. You can select another output afterward; Nearfield switches
+back automatically when the display pair is disconnected and reconnected.
+Automatic selection waits for the driver's display route to be ready. On macOS
+14.2 or later, Nearfield also checks active audio processes without an app allowlist
+and attempts one output re-selection per connection if playback stays on the
+previous device. Monitoring includes apps that start playback later, even when
+another app has already switched successfully. Apps with their own explicit output
+setting keep that setting; recovery only changes the Mac's default output.
+Choosing another output cancels the handoff. This requires audio driver 1.0.9
+or later; older installations are offered the bundled driver update.
+
 Nearfield is an early-stage project. App and per-window routing are experimental,
 and macOS may expose several windows from one app as a single audio process. In
 that case, Nearfield cannot split those windows into separate audio streams.

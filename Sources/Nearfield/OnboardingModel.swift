@@ -250,6 +250,7 @@ final class OnboardingModel: ObservableObject {
     @Published var showMenubarApp = true
     @Published var balance: Double = 0
     @Published var driverInstalled = false
+    @Published var driverUpdateAvailable = false
     @Published var isInstallingDriver = false
     @Published var driverInstallState: DriverInstallState = .idle
     @Published var nearfieldDriverSelected = false
@@ -305,6 +306,7 @@ final class OnboardingModel: ObservableObject {
         driverInstallState = delegate.settingsDriverInstallState()
         if !installingDriver {
             driverInstalled = delegate.settingsDriverInstalled()
+            driverUpdateAvailable = delegate.settingsDriverUpdateAvailable()
             nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
             let liveDisplays = DisplayEndpointVisibility.visibleDevices(
                 from: delegate.settingsDevices(),
@@ -822,6 +824,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return "Installing"
         }
+        if driverUpdateAvailable { return "Update available" }
         return driverInstalled ? "Installed" : "Missing"
     }
 
@@ -829,6 +832,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return "arrow.triangle.2.circlepath"
         }
+        if driverUpdateAvailable { return "arrow.down.circle.fill" }
         return driverInstalled ? "checkmark.seal.fill" : "xmark.circle.fill"
     }
 
@@ -836,6 +840,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return .blue
         }
+        if driverUpdateAvailable { return .blue }
         return driverInstalled ? .green : .yellow
     }
 
@@ -843,6 +848,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return "Installing"
         }
+        if driverUpdateAvailable { return "Update" }
         return driverInstalled ? "Reinstall" : "Install"
     }
 

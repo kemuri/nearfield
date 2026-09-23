@@ -163,11 +163,36 @@ static void testClosingSilentSafariClientPreservesPlayingHelper() {
     assert(f.device.inputFinalFrameTime == -1);
 }
 
+static void testReadinessRequiresCurrentConfigurationAndInitializedOutput() {
+    DriverFixture f;
+    using Config = ProxyAudioDevice::ConfigType;
+    CFStringSmartRef initial(f.device.copyConfigurationValue(Config::targetOutputReadiness));
+    assert(initial && CFEqual(initial, CFSTR("pending")));
+
+    f.device.targetAggregateDevicesString = CFSTR("left\nright");
+    f.device.readyTargetConfigurationRevision.store(f.device.targetConfigurationRevision);
+    CFStringSmartRef queued(f.device.copyConfigurationValue(Config::targetOutputReadiness));
+    assert(queued && CFEqual(queued, CFSTR("pending")));
+    f.device.appliedTargetConfigurationRevision.store(f.device.targetConfigurationRevision);
+    CFStringSmartRef ready(f.device.copyConfigurationValue(Config::targetOutputReadiness));
+    assert(ready && CFEqual(ready, CFSTR("ready\nstereo\nleft\nright")));
+
+    ++f.device.targetConfigurationRevision;
+    CFStringSmartRef stale(f.device.copyConfigurationValue(Config::targetOutputReadiness));
+    assert(stale && CFEqual(stale, CFSTR("pending")));
+
+    f.device.readyTargetConfigurationRevision.store(f.device.targetConfigurationRevision);
+    f.device.refreshTargetOutputReadiness(); // No IOProc or live aggregate in the fixture.
+    CFStringSmartRef noOutput(f.device.copyConfigurationValue(Config::targetOutputReadiness));
+    assert(noOutput && CFEqual(noOutput, CFSTR("pending")));
+}
+
 int main() {
+    testReadinessRequiresCurrentConfigurationAndInitializedOutput();
     testOverlappingClientsPreservePlayback();
     testInvalidLifecycleCallsDoNotChangeAudio();
     testRoutedMixSurvivesClientStop();
     testRenderDoesNotWaitForConfigurationMutex();
     testClosingSilentSafariClientPreservesPlayingHelper();
-    std::cout << "5 driver regression tests passed\n";
+    std::cout << "6 driver regression tests passed\n";
 }

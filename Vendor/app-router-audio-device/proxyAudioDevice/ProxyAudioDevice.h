@@ -47,7 +47,8 @@ class ProxyAudioDevice {
         routeRules,
         driverCapabilities,
         targetAggregateDevices,
-        targetAggregateMode
+        targetAggregateMode,
+        targetOutputReadiness
     };
     enum class ActiveCondition { proxiedDeviceActive = 0, userActive = 1, always = 2 };
     enum class RouteDestination { pair, left, right, muted };
@@ -521,6 +522,7 @@ class ProxyAudioDevice {
                                     UInt32 *outNumberPropertiesChanged,
                                     AudioObjectPropertyAddress outChangedAddresses[2]);
     void monitorUserActivity();
+    void refreshTargetOutputReadiness();
     dispatch_queue_t AudioOutputDispatchQueue();
     void ExecuteInAudioOutputThread(void (^block)());
     
@@ -535,6 +537,9 @@ class ProxyAudioDevice {
     Byte *routeMixBuffer = NULL;
     AudioDevice outputDevice;
     bool outputDeviceReady = false;
+    UInt64 targetConfigurationRevision = 1; // Protected by stateMutex.
+    std::atomic<UInt64> appliedTargetConfigurationRevision{0};
+    std::atomic<UInt64> readyTargetConfigurationRevision{0};
     std::atomic_bool inputIOIsActive;
     std::shared_ptr<const RouteSnapshot> routeSnapshot;
     Float64 lastInputFrameTime = -1;

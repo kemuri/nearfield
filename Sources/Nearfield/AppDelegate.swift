@@ -53,6 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     #endif
     var isInstallingDriver = false
     var driverInstallState: DriverInstallState = .idle
+    var availableDriverUpdate = DriverInstaller.availableDriverUpdate()
+    var didPromptForDriverUpdate = false
     var audioStateSynchronizationDepth = 0
     var proxyPreparedDisplayState: [DisplayOutputState]?
     var routerVolumeContinuity = RouterVolumeContinuity()
@@ -63,7 +65,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var isDynamicRoutingSystemActive = true
     var lastAppliedRouterRouteRules: String?
     var hadSufficientStudioDisplays = false
-    var shouldReactivateVirtualOutputAfterDisplayReconnect = false
+    var connectionActivationPending = false
+    var connectionHandoff: RouterConnectionHandoff?
+    var connectionHandoffTask: Task<Void, Never>?
+    var connectionHandoffFailure: Error?
+    var lastNonNearfieldOutputUID: String?
     var lastRuntimeError: String?
     var applicationRemovalMonitor: DispatchSourceFileSystemObject?
     var didPromptForDriverUninstallAfterApplicationRemoval = false
@@ -185,7 +191,9 @@ extension AppDelegate {
         }
 
         LaunchDiagnostics.record("starting Core Audio services")
-        startCoreAudioServices()
+        startCoreAudioServices { [weak self] in
+            self?.promptForDriverUpdateIfNeeded()
+        }
         LaunchDiagnostics.record("finishLaunching completed")
     }
 
@@ -231,11 +239,15 @@ extension AppDelegate {
     func startAudioServices() {
         guard !didStartAudioServices else { return }
         didStartAudioServices = true
+        observeConnectionDefaultOutput()
         hadSufficientStudioDisplays = cachedAudioState.detectedDisplays.count >= 2
         preparePairOnLaunch()
         mediaKeyVolumeController.start()
         audioManager.startObserving { [weak self] in
-            Task { @MainActor in self?.scheduleAudioStateChange() }
+            Task { @MainActor in
+                self?.observeConnectionDefaultOutput()
+                self?.scheduleAudioStateChange()
+            }
         }
         handleAudioStateChange()
     }
@@ -243,6 +255,7 @@ extension AppDelegate {
     func currentRouterDriverAvailability(
         coreAudioIsReady: Bool = false
     ) -> RouterDriverAvailability {
+        refreshDriverUpdateAvailability()
         let currentDriverIsInstalled = DriverInstaller.routerDriverDiskState().isCurrent
         return RouterDriverAvailability(
             installedOnDisk: currentDriverIsInstalled,
@@ -293,6 +306,7 @@ extension AppDelegate {
         coreAudioStartupTask?.cancel()
         coreAudioReadinessGeneration += 1
         pendingAudioStateChangeTask?.cancel()
+        cancelConnectionHandoff()
         dynamicRoutingRulesTask?.cancel()
         dynamicRoutingNotificationObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         dynamicRoutingNotificationObservers.removeAll()

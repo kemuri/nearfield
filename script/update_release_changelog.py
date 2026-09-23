@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 SPARKLE = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+NOTES_DIRECTORY = Path(__file__).resolve().parents[1] / "release-notes"
 
 
 def version_key(version):
@@ -31,6 +32,21 @@ def validate_notes(notes, version):
     ):
         raise ValueError("Release notes must contain a nonempty list of change summaries")
     return [change.strip() for change in changes]
+
+
+def notes_path(version, explicit_path=None, required=False):
+    version_key(version)
+    if explicit_path is not None:
+        return explicit_path.resolve()
+    path = NOTES_DIRECTORY / f"{version}.json"
+    if path.is_file():
+        return path
+    if required:
+        raise ValueError(
+            f"Missing release notes for {version}; create {path} with version and changes, "
+            "or set NEARFIELD_RELEASE_NOTES_FILE to a matching JSON file"
+        )
+    return None
 
 
 def release_date(appcast, version):
@@ -72,7 +88,10 @@ def updated_releases(releases, version, published, notes=None):
             raise ValueError(f"Changelog for {version} already exists with different content; review it explicitly")
         return releases
     if changes is None:
-        raise ValueError(f"Missing changelog for {version}; set NEARFIELD_RELEASE_NOTES_FILE")
+        raise ValueError(
+            f"Missing changelog for {version}; add release-notes/{version}.json "
+            "or set NEARFIELD_RELEASE_NOTES_FILE"
+        )
     return sorted([*releases, {"version": version, "date": published, "changes": changes}],
                   key=lambda entry: version_key(entry["version"]), reverse=True)
 
@@ -82,7 +101,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     preflight = commands.add_parser("validate-notes")
     preflight.add_argument("--version", required=True)
-    preflight.add_argument("--notes", required=True, type=Path)
+    preflight.add_argument("--notes", type=Path)
     update = commands.add_parser("update")
     update.add_argument("--version", required=True)
     update.add_argument("--appcast", required=True, type=Path)
@@ -90,9 +109,11 @@ def main():
     update.add_argument("--notes", type=Path)
     args = parser.parse_args()
     try:
-        notes = json.loads(args.notes.read_text()) if args.notes else None
+        path = notes_path(args.version, args.notes, required=args.command == "validate-notes")
+        notes = json.loads(path.read_text()) if path else None
         if args.command == "validate-notes":
             validate_notes(notes, args.version)
+            print(path)
             return 0
         published = release_date(args.appcast, args.version)
         path = args.website / "src/data/releases.json"

@@ -12,6 +12,7 @@ BUILD_CONFIGURATION="${NEARFIELD_BUILD_CONFIGURATION:-debug}"
 LAUNCH_DIAGNOSTICS="${NEARFIELD_LAUNCH_DIAGNOSTICS:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/packaged_runtime_paths.sh"
 DIST_DIR="${NEARFIELD_DIST_DIR:-$ROOT_DIR/dist}"
 APP_BUNDLE="${NEARFIELD_APP_BUNDLE:-$DIST_DIR/$APP_NAME.app}"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -158,48 +159,6 @@ if [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
   /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$INFO_PLIST"
 fi
 
-validate_runtime_rpaths() {
-  local saw_framework_rpath=0
-  local rpath
-  while IFS= read -r rpath; do
-    case "$rpath" in
-      "/usr/lib/swift"|"@loader_path")
-        ;;
-      "@executable_path/../Frameworks")
-        saw_framework_rpath=1
-        ;;
-      *)
-        echo "unexpected runtime search path in packaged executable: $rpath" >&2
-        return 1
-        ;;
-    esac
-  done < <(
-    otool -l "$APP_BINARY" |
-      awk '$1 == "cmd" && $2 == "LC_RPATH" { wants_path = 1; next }
-           wants_path && $1 == "path" { print $2; wants_path = 0 }'
-  )
-
-  if [[ "$saw_framework_rpath" != "1" ]]; then
-    echo "packaged executable is missing @executable_path/../Frameworks" >&2
-    return 1
-  fi
-}
-
-remove_build_toolchain_rpaths() {
-  local rpath
-  while IFS= read -r rpath; do
-    case "$rpath" in
-      /Applications/Xcode.app/Contents/Developer/Toolchains/*/usr/lib/swift-*/macosx)
-        install_name_tool -delete_rpath "$rpath" "$APP_BINARY"
-        ;;
-    esac
-  done < <(
-    otool -l "$APP_BINARY" |
-      awk '$1 == "cmd" && $2 == "LC_RPATH" { wants_path = 1; next }
-           wants_path && $1 == "path" { print $2; wants_path = 0 }'
-  )
-}
-
 validate_packaged_app_layout() {
   local required_paths=(
     "$APP_BINARY"
@@ -233,7 +192,7 @@ validate_packaged_app_layout() {
       echo "packaged executable contains an absolute build-directory fallback" >&2
       return 1
     fi
-    validate_runtime_rpaths
+    validate_runtime_rpaths "$APP_BINARY"
   fi
 }
 
@@ -249,7 +208,7 @@ sign_path() {
   codesign "${args[@]}" "$path" >/dev/null
 }
 
-remove_build_toolchain_rpaths
+remove_build_toolchain_rpaths "$APP_BINARY"
 sign_path "$APP_FRAMEWORKS/Sparkle.framework"
 sign_path "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 sign_path "$APP_BUNDLE"

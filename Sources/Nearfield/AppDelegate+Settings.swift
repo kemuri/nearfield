@@ -76,6 +76,10 @@ extension AppDelegate: SettingsDelegate {
         cachedRouterDriverAvailability.isInstalled
     }
 
+    func settingsDriverUpdateAvailable() -> Bool {
+        availableDriverUpdate != nil
+    }
+
     func settingsIsInstallingDriver() -> Bool {
         isInstallingDriver
     }
@@ -100,6 +104,7 @@ extension AppDelegate: SettingsDelegate {
     }
 
     func settingsSetAppRoutingEnabled(_ enabled: Bool) {
+        cancelConnectionHandoff()
         if enabled {
             NearfieldPreferences.setAppRoutingEnabled(true)
             if routerDriverManager.isInstalled {
@@ -275,7 +280,10 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsInstallDriver(_ request: DriverInstallRequest) {
         guard !isInstallingDriver else { return }
-        installAndActivateRouterDriver(request)
+        refreshDriverUpdateAvailability()
+        installAndActivateRouterDriver(
+            request == .userInitiated && availableDriverUpdate != nil ? .driverUpgrade : request
+        )
         refreshStatus()
     }
 
@@ -292,6 +300,7 @@ extension AppDelegate: SettingsDelegate {
 
     @discardableResult
     func removeDriversAndTargets() async -> Bool {
+        cancelConnectionHandoff()
         dynamicRoutingRulesTask?.cancel()
         dynamicRoutingRulesTask = nil
         lastAppliedRouterRouteRules = nil

@@ -126,22 +126,32 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testRouterPolicyDoesNotReactivateForReconnectAlone() {
-        XCTAssertFalse(
+    func testRouterPolicySelectsNearfieldOnConnectionFromAnotherOutput() {
+        XCTAssertTrue(
             NearfieldRouterPolicy.shouldActivateRouter(
                 defaultOutputIsNearfield: false,
-                displaysJustReconnected: true,
-                shouldReactivateAfterReconnect: false
+                displaysJustConnected: true,
+                connectionActivationPending: false
             )
         )
     }
 
-    func testRouterPolicyReactivatesWhenNearfieldWasDefaultBeforeReconnect() {
+    func testRouterPolicyPreservesManualOutputChoiceWhileDisplaysRemainConnected() {
+        XCTAssertFalse(
+            NearfieldRouterPolicy.shouldActivateRouter(
+                defaultOutputIsNearfield: false,
+                displaysJustConnected: false,
+                connectionActivationPending: false
+            )
+        )
+    }
+
+    func testRouterPolicyRetriesPendingActivationWhenDriverBecomesReady() {
         XCTAssertTrue(
             NearfieldRouterPolicy.shouldActivateRouter(
                 defaultOutputIsNearfield: false,
-                displaysJustReconnected: true,
-                shouldReactivateAfterReconnect: true
+                displaysJustConnected: false,
+                connectionActivationPending: true
             )
         )
     }
@@ -150,8 +160,8 @@ final class NearfieldRegressionTests: XCTestCase {
         XCTAssertTrue(
             NearfieldRouterPolicy.shouldActivateRouter(
                 defaultOutputIsNearfield: true,
-                displaysJustReconnected: false,
-                shouldReactivateAfterReconnect: false
+                displaysJustConnected: false,
+                connectionActivationPending: false
             )
         )
     }

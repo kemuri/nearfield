@@ -19,6 +19,7 @@ enum DriverInstallerError: LocalizedError, Equatable {
     case invalidDriverBundle(String)
     case authorizationCancelled
     case installFailed(String)
+    case installedVersionMismatch(expected: String, actual: String?)
 
     var errorDescription: String? {
         switch self {
@@ -36,6 +37,8 @@ enum DriverInstallerError: LocalizedError, Equatable {
             return "Administrator approval was cancelled."
         case .installFailed(let output):
             return "Driver install failed.\n\n\(output)"
+        case .installedVersionMismatch(let expected, let actual):
+            return "The audio driver update could not be verified. Expected version \(expected), found \(actual ?? "an unknown version"). Try updating the driver again in Settings."
         }
     }
 }
@@ -205,6 +208,51 @@ final class DriverInstaller {
                 nanoseconds: UInt64(max(0, interval) * 1_000_000_000)
             )
         } while true
+    }
+
+    static var bundledRouterDriverURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Drivers/\(routerDriverBundleName)")
+    }
+
+    static func availableDriverUpdate(
+        in directoryURL: URL = URL(fileURLWithPath: halDriverDirectory, isDirectory: true),
+        bundledDriverURL: URL = bundledRouterDriverURL
+    ) -> RouterDriverUpdate? {
+        // Missing/invalid drivers belong to the existing installation flow.
+        guard routerDriverDiskState(in: directoryURL).isCurrent,
+              isExpectedRouterDriverBundle(at: bundledDriverURL, fileManager: .default),
+              let available = driverBuildVersion(at: bundledDriverURL),
+              let availableVersion = RouterDriverVersion(available) else { return nil }
+        let installed = driverBuildVersion(at: directoryURL.appendingPathComponent(routerDriverBundleName))
+        if let installed, let installedVersion = RouterDriverVersion(installed),
+           installedVersion >= availableVersion {
+            return nil
+        }
+        return RouterDriverUpdate(
+            installedVersion: installed,
+            availableVersion: available,
+            bundledDriverURL: bundledDriverURL
+        )
+    }
+
+    static func verifyInstalledDriverVersion(
+        _ expected: String,
+        in directoryURL: URL = URL(fileURLWithPath: halDriverDirectory, isDirectory: true)
+    ) throws {
+        let actual = driverBuildVersion(at: directoryURL.appendingPathComponent(routerDriverBundleName))
+        guard routerDriverDiskState(in: directoryURL).isCurrent,
+              let expectedVersion = RouterDriverVersion(expected),
+              let actual, RouterDriverVersion(actual) == expectedVersion else {
+            throw DriverInstallerError.installedVersionMismatch(expected: expected, actual: actual)
+        }
+    }
+
+    private static func driverBuildVersion(at bundleURL: URL) -> String? {
+        // Read disk directly; Bundle caches metadata after a driver replacement.
+        guard let data = try? Data(contentsOf: bundleURL.appendingPathComponent("Contents/Info.plist")),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        else { return nil }
+        return info["CFBundleVersion"] as? String
     }
 
     private func bundledRouterDriverPath() throws -> String? {
