@@ -944,13 +944,25 @@ struct SimulationResult {
     double minimumBufferedMilliseconds = 1e9;
     double maximumBufferedMilliseconds = 0;
     double finalCorrectionPPM = 0;
+    double finalBufferedMilliseconds = 0;
+    // After |settledAfterSeconds|.
+    double maximumSettledBufferedMilliseconds = 0;
+};
+
+struct SimulationOptions {
+    // The displays start this long after the first audio (a cold start).
+    double coldStartMilliseconds = 0;
+    // The audio is silent between these times, in seconds.
+    double silenceFrom = -1;
+    double silenceUntil = -1;
+    double settledAfterSeconds = 1e9;
 };
 
 // Runs the writer on the Nearfield clock (steered by the engine) and the
 // reader on an output clock that drifts by |driftPPM|, with scheduling
 // jitter, for |seconds| of simulated time.
 static SimulationResult simulateClocks(double driftPPM, bool reportDrift, nearfield::UnderrunStrategy strategy,
-                                       double seconds, double jitterMilliseconds) {
+                                       double seconds, double jitterMilliseconds, SimulationOptions options = {}) {
     nearfield::PlaybackEngine engine;
     engine.configure(kRate);
     engine.setOutputFormat(kRate, kFrames, 0);
@@ -964,10 +976,11 @@ static SimulationResult simulateClocks(double driftPPM, bool reportDrift, nearfi
     std::mt19937 random(7);
     std::uniform_real_distribution<double> jitter(0.0, jitterMilliseconds * 24000.0);
     std::vector<float> chunk(kFrames * 2, 0.25f);
+    std::vector<float> silence(kFrames * 2, 0.0f);
     std::vector<float> out(kFrames * 2);
 
     double writerNominal = 0;
-    double readerNominal = 30 * ticksPerFrame;
+    double readerNominal = 30 * ticksPerFrame + options.coldStartMilliseconds * kRate / 1000.0 * ticksPerFrame;
     double writerFrame = 0;
     const double end = seconds * kRate * ticksPerFrame;
     SimulationResult result;
@@ -977,7 +990,10 @@ static SimulationResult simulateClocks(double driftPPM, bool reportDrift, nearfi
         const double writerAt = writerNominal + jitter(random);
         const double readerAt = readerNominal + jitter(random);
         if (writerAt <= readerAt) {
-            engine.write(chunk.data(), kFrames, writerFrame, (uint64_t)writerAt, ticksPerFrame * engine.clockRatio());
+            const double writerSeconds = writerNominal / (kRate * ticksPerFrame);
+            const bool silent = writerSeconds >= options.silenceFrom && writerSeconds < options.silenceUntil;
+            engine.write((silent ? silence : chunk).data(), kFrames, writerFrame, (uint64_t)writerAt,
+                         ticksPerFrame * engine.clockRatio());
             writerFrame += kFrames;
             writerNominal += kFrames * ticksPerFrame * engine.clockRatio();
         } else {
@@ -992,6 +1008,10 @@ static SimulationResult simulateClocks(double driftPPM, bool reportDrift, nearfi
                 const double buffered = engine.lastBufferedMilliseconds();
                 result.minimumBufferedMilliseconds = std::min(result.minimumBufferedMilliseconds, buffered);
                 result.maximumBufferedMilliseconds = std::max(result.maximumBufferedMilliseconds, buffered);
+                if (simulatedSeconds > options.settledAfterSeconds) {
+                    result.maximumSettledBufferedMilliseconds = std::max(result.maximumSettledBufferedMilliseconds, buffered);
+                }
+                result.finalBufferedMilliseconds = buffered;
             }
         }
     }
@@ -1026,6 +1046,42 @@ static void testSimulatedClockDriftAndBufferFill() {
                 reported.minimumBufferedMilliseconds, reported.maximumBufferedMilliseconds,
                 steered.minimumBufferedMilliseconds, steered.maximumBufferedMilliseconds, steered.finalCorrectionPPM,
                 gapOnly.underruns);
+}
+
+// After a cold start, the extra delay goes away and stays away: trimmed
+// during silence, and steered down slowly while the audio never pauses.
+static void testColdStartDelayDoesNotComeBack() {
+    using Strategy = nearfield::UnderrunStrategy;
+    // Measured on hardware: the displays took 456 ms to start. A silent
+    // moment trimmed the delay, then steering rebuilt it at 300 ppm.
+    SimulationOptions pause;
+    pause.coldStartMilliseconds = 450;
+    pause.silenceFrom = 20;
+    pause.silenceUntil = 23;
+    pause.settledAfterSeconds = 30;
+    const SimulationResult trimmed = simulateClocks(0, true, Strategy::both, 600, 1.0, pause);
+
+    // The audio never pauses: steering drains the delay within the soak.
+    SimulationOptions continuous;
+    continuous.coldStartMilliseconds = 450;
+    continuous.settledAfterSeconds = 1800;
+    const SimulationResult drained = simulateClocks(0, true, Strategy::both, 2400, 1.0, continuous);
+    // The same with a drifting output clock and no rate report.
+    const SimulationResult drifting = simulateClocks(80, false, Strategy::both, 2400, 1.0, continuous);
+
+    std::printf("  cold start: after a pause %.1f ms (%llu underruns), continuous %.1f ms final %.1f ms (%llu, %.0f ppm), "
+                "drifting %.1f ms (%llu, %.0f ppm)\n",
+                trimmed.maximumSettledBufferedMilliseconds, trimmed.underruns, drained.maximumSettledBufferedMilliseconds,
+                drained.finalBufferedMilliseconds, drained.underruns, drained.finalCorrectionPPM,
+                drifting.maximumSettledBufferedMilliseconds, drifting.underruns, drifting.finalCorrectionPPM);
+    CHECK(trimmed.underruns == 0);
+    CHECK(trimmed.maximumSettledBufferedMilliseconds < 40);
+    CHECK(drained.underruns == 0);
+    // What trimming keeps (the 24 ms gap plus an output buffer), plus a chunk
+    // of scheduling phase; it started at 450 ms.
+    CHECK(drained.maximumSettledBufferedMilliseconds < 50);
+    CHECK(drifting.underruns == 0);
+    CHECK(drifting.maximumSettledBufferedMilliseconds < 60);
 }
 
 // MARK: Allocation guard
@@ -1299,6 +1355,7 @@ int main(int argc, char **argv) {
         {"ring buffer with two threads and resizing", testRingBufferWithConcurrentWriterReaderAndResize, true, false},
         {"device name reads and renames", testDeviceNameReadsDoNotRaceWithRenames, true, false},
         {"simulated clock drift and buffer fill", testSimulatedClockDriftAndBufferFill, false, false},
+        {"cold start delay does not come back", testColdStartDelayDoesNotComeBack, false, false},
         {"audio callbacks do not allocate", testAudioCallbacksDoNotAllocate, false, true},
         {"zero time stamps under contention", testZeroTimeStampsAreConsistentUnderContention, true, false},
         {"team identifier from the driver bundle", testTeamIdentifierComesFromTheDriverBundle, false, false},

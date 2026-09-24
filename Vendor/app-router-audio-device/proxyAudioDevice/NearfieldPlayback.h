@@ -342,8 +342,7 @@ class PlaybackEngine {
             if (available >= gap + frames || (streamEnded && available > 0)) {
                 state = State::playing;
                 fadeInRemaining = std::max(fadeInRemaining, fadeFrames(rate));
-                playingSinceFrames = 0;
-                steeringReferenceValid = false;
+                relaxSteering();
             }
         }
         if (state == State::playing) {
@@ -359,7 +358,6 @@ class PlaybackEngine {
             }
             readPosition += count;
             produced = count;
-            playingSinceFrames += count;
             if (fadeInRemaining > 0 && produced > 0) {
                 applyFadeIn(out, produced, fadeFrames(rate));
             }
@@ -388,7 +386,7 @@ class PlaybackEngine {
         bufferedMilliseconds.store(remaining * 1000.0 / rate, std::memory_order_relaxed);
         if (state == State::playing && produced == frames) {
             trimExcessDelay(ring, out, frames, end, gap, rate);
-            updateSteering(end - readPosition, frames, rate);
+            updateSteering(end - readPosition, frames, rate, gap);
             decaySafetyGap();
         } else {
             relaxSteering();
@@ -541,7 +539,7 @@ class PlaybackEngine {
         state = State::idle;
         fadeInRemaining = 0;
         drainedSignalled = false;
-        steeringReferenceValid = false;
+        relaxSteering();
         latencyAverageValid = false;
     }
 
@@ -576,7 +574,7 @@ class PlaybackEngine {
     void noteUnderrun(uint32_t missing, int64_t available, int64_t gap, double rate, uint64_t latenessTicks) noexcept {
         stats.underruns.fetch_add(1, std::memory_order_relaxed);
         fadeInRemaining = fadeFrames(rate);
-        steeringReferenceValid = false;
+        relaxSteering();
         if (adaptiveGapEnabled.load(std::memory_order_relaxed)) {
             extraSafetyGapMilliseconds =
                 std::min(kMaxExtraSafetyGapMilliseconds, extraSafetyGapMilliseconds + kSafetyGapStepMilliseconds);
@@ -612,9 +610,7 @@ class PlaybackEngine {
     void trimExcessDelay(RingStorage *ring, const float *rendered, uint32_t frames, int64_t end, int64_t gap,
                          double rate) noexcept {
         const int64_t excess = (end - readPosition) - gap;
-        const int64_t minimum = std::max<int64_t>(outputBufferFrames.load(std::memory_order_relaxed),
-                                                  static_cast<int64_t>(kMinimumTrimMilliseconds * rate / 1000.0));
-        if (excess <= minimum || !isSilent(rendered, frames)) {
+        if (excess <= trimToleranceFrames(rate) || !isSilent(rendered, frames)) {
             return;
         }
         const uint32_t skippable = silentFrames(ring, readPosition, static_cast<uint32_t>(excess));
@@ -623,7 +619,7 @@ class PlaybackEngine {
         }
         readPosition += skippable;
         stats.trimmedFrames.fetch_add(skippable, std::memory_order_relaxed);
-        steeringReferenceValid = false;
+        restartSteeringReference();
         latencyAverageValid = false;
         recordDiagnostic(kDiagnosticTrim, static_cast<int32_t>(skippable), 0, 0, static_cast<double>(excess));
         raise(kSignalLatency | kSignalCounters);
@@ -631,7 +627,10 @@ class PlaybackEngine {
 
     void updateRateEstimate(double rateScalar, uint32_t frames, double rate) noexcept {
         if (rateEstimateReset.exchange(false, std::memory_order_acq_rel)) {
+            // A new output device: its clock differs in its own way.
             rateEstimateValid = false;
+            steeringIntegral = 0;
+            relaxSteering();
         }
         if (!(rateScalar > 0.98 && rateScalar < 1.02)) {
             return;
@@ -647,9 +646,18 @@ class PlaybackEngine {
         publishClockRatio();
     }
 
+    // Delay trimming leaves in place: at least an output buffer.
+    int64_t trimToleranceFrames(double rate) const noexcept {
+        return std::max<int64_t>(outputBufferFrames.load(std::memory_order_relaxed),
+                                 static_cast<int64_t>(kMinimumTrimMilliseconds * rate / 1000.0));
+    }
+
     // Keeps the buffered amount steady by nudging the Nearfield device's
-    // clock when the output clock drifts relative to it.
-    void updateSteering(int64_t buffered, uint32_t frames, double rate) noexcept {
+    // clock when the output clock drifts relative to it. The target is the
+    // amount buffered once playback settles, but never more than trimming
+    // keeps, so extra delay (from a cold start) also drains while the audio
+    // never pauses, at most 300 ppm (inaudible).
+    void updateSteering(int64_t buffered, uint32_t frames, double rate, int64_t gap) noexcept {
         if (!steeringEnabled.load(std::memory_order_relaxed)) {
             relaxSteering();
             return;
@@ -661,19 +669,29 @@ class PlaybackEngine {
         } else {
             fillAverage += alpha * (static_cast<double>(buffered) - fillAverage);
         }
+        steeringSettleFrames += frames;
+        const double ceiling = static_cast<double>(gap + trimToleranceFrames(rate));
         if (!steeringReferenceValid) {
-            if (playingSinceFrames < static_cast<uint64_t>(kSteeringSettleSeconds * rate)) {
+            if (steeringSettleFrames < static_cast<uint64_t>(kSteeringSettleSeconds * rate)) {
                 return;
             }
             steeringReference = fillAverage;
-            steeringIntegral = 0;
             steeringReferenceValid = true;
         }
+        // The gap shrinks again some time after an underrun widened it.
+        steeringReference = std::min(steeringReference, ceiling);
         const double seconds = frames / rate;
         const double error = fillAverage - steeringReference;  // frames
-        steeringIntegral = std::max(-2000.0, std::min(2000.0, steeringIntegral + (error * seconds)));
-        // 100 frames of error -> 20 ppm now, and another 20 ppm after it has persisted for 10 s.
-        double ppm = (0.2 * error) + (0.02 * steeringIntegral);
+        // 100 frames of error -> 20 ppm now, and another 20 ppm after it has
+        // persisted for 10 s. The integral (the clocks' lasting difference)
+        // only grows while the correction is below its limit, so draining a
+        // large delay does not overshoot below the target afterwards.
+        const double proportional = 0.2 * error;
+        const double integral = std::max(-2000.0, std::min(2000.0, steeringIntegral + (error * seconds)));
+        if (std::abs(proportional + (0.02 * integral)) < kMaxSteeringPPM) {
+            steeringIntegral = integral;
+        }
+        double ppm = proportional + (0.02 * steeringIntegral);
         ppm = std::max(-kMaxSteeringPPM, std::min(kMaxSteeringPPM, ppm));
         steeringPPMValue.store(ppm, std::memory_order_relaxed);
         publishClockRatio();
@@ -682,6 +700,16 @@ class PlaybackEngine {
     void relaxSteering() noexcept {
         fillAverageValid = false;
         steeringReferenceValid = false;
+        steeringSettleFrames = 0;
+    }
+
+    // The buffered amount changed on purpose (trimmed): measure it again
+    // before steering towards it. The clocks' lasting difference is kept.
+    void restartSteeringReference() noexcept {
+        relaxSteering();
+        steeringPPMValue.store(std::max(-kMaxSteeringPPM, std::min(kMaxSteeringPPM, 0.02 * steeringIntegral)),
+                               std::memory_order_relaxed);
+        publishClockRatio();
     }
 
     void publishClockRatio() noexcept {
@@ -837,7 +865,6 @@ class PlaybackEngine {
     int64_t readPosition = 0;
     uint32_t fadeInRemaining = 0;
     bool drainedSignalled = false;
-    uint64_t playingSinceFrames = 0;
     double extraSafetyGapMilliseconds = 0;
     uint64_t lastUnderrunHostTime = 0;
     double rateEstimate = 1.0;
@@ -847,6 +874,7 @@ class PlaybackEngine {
     double steeringReference = 0;
     double steeringIntegral = 0;
     bool steeringReferenceValid = false;
+    uint64_t steeringSettleFrames = 0;
     double latencyAverage = 0;
     bool latencyAverageValid = false;
     double lastSignalledLatency = -1e9;
