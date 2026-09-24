@@ -22,7 +22,10 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cerrno>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -53,6 +56,10 @@ constexpr int kSettingsVersion = 1;
 constexpr uint32_t kDefaultOutputBufferFrameSize = 512;
 constexpr uint32_t kMinimumOutputBufferFrameSize = 32;
 constexpr uint32_t kMaximumOutputBufferFrameSize = 4096;
+constexpr int64_t kMaximumProcessID = std::numeric_limits<pid_t>::max();
+// The output device's active condition, 0 to 2 (2 keeps it running).
+constexpr int64_t kMaximumActiveCondition = 2;
+constexpr double kMaximumSampleRate = 1536000;
 
 enum class UnderrunStrategy { both, steer, gap };
 
@@ -147,8 +154,9 @@ inline ParsedRouteRules parseRouteRules(const std::string &rules) {
         const std::string normalizedKey = lowercased(key);
         if (normalizedKey.rfind("pid:", 0) == 0) {
             char *end = nullptr;
+            errno = 0;
             const long processID = std::strtol(normalizedKey.c_str() + 4, &end, 10);
-            if (end && *end == '\0' && processID > 0) {
+            if (end && *end == '\0' && errno == 0 && processID > 0 && processID <= kMaximumProcessID) {
                 parsed.processRoutes[static_cast<pid_t>(processID)] = route;
             }
             continue;
@@ -209,8 +217,10 @@ inline bool booleanFromCF(CFTypeRef value, bool &result) {
         return true;
     }
     if (CFGetTypeID(value) == CFNumberGetTypeID()) {
-        int number = 0;
-        CFNumberGetValue(static_cast<CFNumberRef>(value), kCFNumberIntType, &number);
+        double number = 0;
+        if (!CFNumberGetValue(static_cast<CFNumberRef>(value), kCFNumberDoubleType, &number) || !std::isfinite(number)) {
+            return false;
+        }
         result = number != 0;
         return true;
     }
@@ -236,6 +246,28 @@ inline bool doubleFromCF(CFTypeRef value, double &result) {
         return !text.empty() && end && *end == '\0';
     }
     return false;
+}
+
+// A finite number within [minimum, maximum]. NaN, infinities and values out
+// of range are rejected, never converted.
+inline bool finiteNumberFromCF(CFTypeRef value, double minimum, double maximum, double &result) {
+    double number = 0;
+    if (!doubleFromCF(value, number) || !std::isfinite(number) || number < minimum || number > maximum) {
+        return false;
+    }
+    result = number;
+    return true;
+}
+
+// A whole number within [minimum, maximum].
+inline bool integerFromCF(CFTypeRef value, int64_t minimum, int64_t maximum, int64_t &result) {
+    double number = 0;
+    if (!finiteNumberFromCF(value, static_cast<double>(minimum), static_cast<double>(maximum), number) ||
+        number != std::floor(number)) {
+        return false;
+    }
+    result = static_cast<int64_t>(number);
+    return true;
 }
 
 inline bool stringFromCFValue(CFTypeRef value, std::string &result) {
@@ -315,10 +347,10 @@ inline bool parseSettingsUpdate(CFDictionaryRef dictionary, SettingsUpdate &upda
         if (count > 0) CFDictionaryGetKeysAndValues(routes, keys.data(), values.data());
         std::map<pid_t, Route> processRoutes;
         for (CFIndex index = 0; index < count; ++index) {
-            double processID = 0;
+            int64_t processID = 0;
             Route route = Route::pair;
             std::string destination;
-            if (!doubleFromCF(static_cast<CFTypeRef>(keys[static_cast<size_t>(index)]), processID) || processID <= 0 ||
+            if (!integerFromCF(static_cast<CFTypeRef>(keys[static_cast<size_t>(index)]), 1, kMaximumProcessID, processID) ||
                 !stringFromCFValue(static_cast<CFTypeRef>(values[static_cast<size_t>(index)]), destination) ||
                 !routeFromString(destination, route)) {
                 return false;
@@ -329,7 +361,7 @@ inline bool parseSettingsUpdate(CFDictionaryRef dictionary, SettingsUpdate &upda
     }
     if ((value = CFDictionaryGetValue(dictionary, kSettingsOutputBufferFrameSizeKey))) {
         double frames = 0;
-        if (!doubleFromCF(value, frames)) return false;
+        if (!doubleFromCF(value, frames) || !std::isfinite(frames)) return false;
         update.outputBufferFrameSize = static_cast<uint32_t>(std::clamp(frames, double(kMinimumOutputBufferFrameSize),
                                                                         double(kMaximumOutputBufferFrameSize)));
     }
@@ -343,7 +375,7 @@ inline bool parseSettingsUpdate(CFDictionaryRef dictionary, SettingsUpdate &upda
     }
     if ((value = CFDictionaryGetValue(dictionary, kSettingsSafetyGapKey))) {
         double milliseconds = 0;
-        if (!doubleFromCF(value, milliseconds) || milliseconds < 0 || milliseconds > 100) return false;
+        if (!finiteNumberFromCF(value, 0, 100, milliseconds)) return false;
         update.safetyGapMilliseconds = milliseconds;
     }
     if ((value = CFDictionaryGetValue(dictionary, kSettingsDiagnosticsKey))) {
@@ -356,8 +388,8 @@ inline bool parseSettingsUpdate(CFDictionaryRef dictionary, SettingsUpdate &upda
         update.outputDeviceUID = trimmed(text);
     }
     if ((value = CFDictionaryGetValue(dictionary, kSettingsActiveConditionKey))) {
-        double condition = 0;
-        if (!doubleFromCF(value, condition)) return false;
+        int64_t condition = 0;
+        if (!integerFromCF(value, 0, kMaximumActiveCondition, condition)) return false;
         update.activeCondition = static_cast<int>(condition);
     }
     return true;
@@ -529,7 +561,7 @@ inline bool loadPersistentSettings(CFPropertyListRef propertyList, DriverSetting
     std::map<pid_t, Route> ignoredProcessRoutes;
     applySettingsUpdate(settings, ignoredProcessRoutes, update);
     double rate = 0;
-    if (doubleFromCF(CFDictionaryGetValue(dictionary, kSettingsSampleRateKey), rate) && rate > 0) {
+    if (finiteNumberFromCF(CFDictionaryGetValue(dictionary, kSettingsSampleRateKey), 1, kMaximumSampleRate, rate)) {
         settings.sampleRate = rate;
     }
     CFTypeRef rates = CFDictionaryGetValue(dictionary, kSettingsAvailableSampleRatesKey);
@@ -537,7 +569,7 @@ inline bool loadPersistentSettings(CFPropertyListRef propertyList, DriverSetting
         std::vector<double> values;
         for (CFIndex index = 0; index < CFArrayGetCount(static_cast<CFArrayRef>(rates)); ++index) {
             double value = 0;
-            if (doubleFromCF(CFArrayGetValueAtIndex(static_cast<CFArrayRef>(rates), index), value) && value > 0) {
+            if (finiteNumberFromCF(CFArrayGetValueAtIndex(static_cast<CFArrayRef>(rates), index), 1, kMaximumSampleRate, value)) {
                 values.push_back(value);
             }
         }

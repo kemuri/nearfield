@@ -3,6 +3,7 @@
 #include <Security/Security.h>
 #include <algorithm>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <libproc.h>
 #include <string>
 #include <dispatch/dispatch.h>
@@ -586,6 +587,7 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     }
     gDevice_SampleRate = sampleRate;
     deviceClock.setHostTicksPerFrame(hostTicksPerSecond() / sampleRate);
+    deviceClock.reset(mach_absolute_time());
     engine.configure(sampleRate);
     {
         StateLocker locker(stateMutex);
@@ -826,7 +828,7 @@ OSStatus ProxyAudioDevice::PerformDeviceConfigurationChange(AudioServerPlugInDri
         persistSettingsIfChangedNoLock();
     }
     deviceClock.setHostTicksPerFrame(hostTicksPerSecond() / sampleRate);
-    deviceClock.requestReset();
+    deviceClock.reset(mach_absolute_time());
     // Buffered audio at the previous rate cannot be played at the new one.
     engine.configure(sampleRate);
     diagnostics.record(nearfield::kDiagnosticSampleRate, 0, 0, 0, sampleRate, 0);
@@ -4622,6 +4624,28 @@ void ProxyAudioDevice::publishOutputFormatToEngine() {
     engine.setOutputFormat(outputDevice.sampleRate, outputDevice.bufferFrameSize, outputDevice.latencyFrames);
 }
 
+// The output device is set up and usable as it is: same device, same buffer
+// size, and its IO callback exists. A failed callback creation is never
+// "current", so the next setup tries again.
+static bool outputSetupIsCurrent(bool currentIsValid,
+                                 AudioObjectID currentID,
+                                 UInt32 currentBufferFrameSize,
+                                 bool currentHasIOProc,
+                                 AudioObjectID wantedID,
+                                 UInt32 wantedBufferFrameSize) {
+    return currentIsValid && currentHasIOProc && currentID == wantedID && currentBufferFrameSize == wantedBufferFrameSize;
+}
+
+// Seconds before retry |attempt| (0-based) of a failed output setup, or a
+// negative value once retries are used up (until the displays change).
+static double outputSetupRetryDelay(int attempt) {
+    constexpr int kMaximumAttempts = 12;
+    if (attempt < 0 || attempt >= kMaximumAttempts) {
+        return -1;
+    }
+    return std::min(4.0, 0.25 * (double)(1u << std::min(attempt, 4)));
+}
+
 void ProxyAudioDevice::setupTargetOutputDevice() {
     if (!manageOutputDevice) {
         return;
@@ -4633,7 +4657,8 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
         bufferFrameSize = settings.outputBufferFrameSize;
     }
 
-    if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id && outputDevice.bufferFrameSize == bufferFrameSize) {
+    if (outputSetupIsCurrent(outputDevice.isValid(), outputDevice.id, outputDevice.bufferFrameSize,
+                             outputDevice.procId != nullptr, newOutputDevice.id, bufferFrameSize)) {
         return;
     }
 
@@ -4641,6 +4666,10 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     if (!newOutputDevice.isValid()) {
         syslog(LOG_WARNING, "NearfieldAudioDevice: no output device is available yet");
         return;
+    }
+    if (newOutputDevice.id != outputSetupRetryDeviceID) {
+        outputSetupRetryDeviceID = newOutputDevice.id;
+        outputSetupRetryCount = 0;
     }
 
     outputDevice = newOutputDevice;
@@ -4651,6 +4680,12 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     outputDevice.setBufferFrameSize(bufferFrameSize);
     outputDevice.updateStreamInfo();
     outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
+    if (outputDevice.procId == nullptr) {
+        scheduleOutputSetupRetry();
+    } else {
+        outputSetupRetryCount = 0;
+        ++outputSetupRetryToken;
+    }
     for (AudioObjectPropertySelector selector : kOutputDeviceListenedSelectors) {
         if (outputIsAggregate || !isAggregateOnlySelector(selector)) {
             outputDevice.addPropertyListener(selector, scopeForListenedSelector(selector), kAudioObjectPropertyElementMain,
@@ -4672,6 +4707,27 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     applyRequestedSampleRateToOutput(gDevice_SampleRate.load());
     matchOutputDeviceSampleRate();
     notifyLatencyChanged();
+}
+
+// Creating the IO callback can fail transiently, for example while Core Audio
+// is still building the displays' aggregate.
+void ProxyAudioDevice::scheduleOutputSetupRetry() {
+    const double delay = outputSetupRetryDelay(outputSetupRetryCount);
+    if (delay < 0) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: could not set up output device %u; waiting for a device change",
+               outputSetupRetryDeviceID);
+        return;
+    }
+    syslog(LOG_WARNING, "NearfieldAudioDevice: output setup failed; retrying in %.2f s", delay);
+    ++outputSetupRetryCount;
+    const UInt64 token = ++outputSetupRetryToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), AudioOutputDispatchQueue(), ^{
+        if (token != outputSetupRetryToken) {
+            return;
+        }
+        setupTargetOutputDevice();
+        updateOutputDeviceStartedState();
+    });
 }
 
 void ProxyAudioDevice::initializeOutputDevice() {
@@ -5227,7 +5283,7 @@ OSStatus ProxyAudioDevice::StartIO(AudioServerPlugInDriverRef inDriver,
         firstClient = gDevice_IOIsRunning == 0;
         clients = ++gDevice_IOIsRunning;
         if (firstClient) {
-            deviceClock.requestReset();
+            deviceClock.reset(mach_absolute_time());
             engine.beginClientSession();
         }
     }
@@ -5511,14 +5567,39 @@ void ProxyAudioDevice::calculateVolumeFactors(Float32 volumeL,
 // driver accepts any writer. When the check cannot run (for example because
 // the driver service's sandbox blocks it), writes are allowed and the status
 // reports it.
-static CFStringRef copyOwnTeamIdentifier() {
-    SecCodeRef selfCode = NULL;
-    if (SecCodeCopySelf(kSecCSDefaultFlags, &selfCode) != errSecSuccess || !selfCode) {
+//
+// The team comes from the driver bundle's own signature. The process the
+// driver runs in is Apple's audio service, which has no Team ID, so asking
+// for the running process's signature would treat every driver as unsigned.
+
+// "/…/NearfieldAudioDevice.driver/Contents/MacOS/NearfieldAudioDevice" names
+// its bundle; any other path is used as it is.
+static std::string codePathForImage(const std::string &imagePath) {
+    const std::string::size_type contents = imagePath.rfind("/Contents/MacOS/");
+    return contents == std::string::npos || contents == 0 ? imagePath : imagePath.substr(0, contents);
+}
+
+// The bundle (or binary) this code was loaded from.
+static std::string driverCodePath() {
+    Dl_info info;
+    if (dladdr(reinterpret_cast<const void *>(&driverCodePath), &info) == 0 || !info.dli_fname) {
+        return std::string();
+    }
+    return codePathForImage(info.dli_fname);
+}
+
+static CFStringRef copyTeamIdentifier(const std::string &codePath) {
+    if (codePath.empty()) {
+        return NULL;
+    }
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, reinterpret_cast<const UInt8 *>(codePath.c_str()),
+                                                           (CFIndex)codePath.size(), false);
+    if (!url) {
         return NULL;
     }
     SecStaticCodeRef staticCode = NULL;
-    OSStatus status = SecCodeCopyStaticCode(selfCode, kSecCSDefaultFlags, &staticCode);
-    CFRelease(selfCode);
+    OSStatus status = SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &staticCode);
+    CFRelease(url);
     if (status != errSecSuccess || !staticCode) {
         return NULL;
     }
@@ -5532,6 +5613,10 @@ static CFStringRef copyOwnTeamIdentifier() {
     CFStringRef result = (team && CFGetTypeID(team) == CFStringGetTypeID()) ? (CFStringRef)CFRetain(team) : NULL;
     CFRelease(information);
     return result;
+}
+
+static CFStringRef copyOwnTeamIdentifier() {
+    return copyTeamIdentifier(driverCodePath());
 }
 
 void ProxyAudioDevice::loadOwnTeamIdentifier() {

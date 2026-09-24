@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mach/mach_time.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include "NearfieldDiagnostics.h"
@@ -861,24 +862,44 @@ class PlaybackEngine {
 };
 
 // Zero time stamps for the Nearfield device, derived from host time and the
-// playback engine's clock ratio. Called on the HAL's IO thread; a concurrent
-// caller gets the last published stamp instead of waiting.
+// playback engine's clock ratio. Any thread may ask. One thread at a time
+// advances the timeline; a thread that finds it busy gets the latest
+// published stamp instead. Stamps are published as one 16-byte atomic value,
+// so every caller gets a matching sample time and host time, never older than
+// one it saw before.
 class DeviceClock {
   public:
+    struct Stamp {
+        double sampleTime;
+        uint64_t hostTime;
+    };
+    static_assert(std::atomic<Stamp>::is_always_lock_free, "zero time stamps must be published without locks");
+
     void setHostTicksPerFrame(double ticks) { nominalTicksPerFrame.store(ticks, std::memory_order_relaxed); }
     double hostTicksPerFrame() const { return nominalTicksPerFrame.load(std::memory_order_relaxed); }
 
-    // The next stamp starts a new timeline at the current host time.
-    void requestReset() { resetRequests.fetch_add(1, std::memory_order_acq_rel); }
+    // Starts a new timeline at |now|, when IO starts or the sample rate
+    // changes. Not for audio threads: it waits for a thread advancing the
+    // clock, which takes well under a microsecond.
+    void reset(uint64_t now) noexcept {
+        while (busy.test_and_set(std::memory_order_acquire)) {
+            sched_yield();
+        }
+        anchorHostTime = now;
+        periods = 0;
+        elapsedTicks = 0;
+        published.store(Stamp{0, now}, std::memory_order_release);
+        busy.clear(std::memory_order_release);
+    }
 
     void get(uint32_t period, double ratio, uint64_t now, double &outSampleTime, uint64_t &outHostTime) noexcept {
         if (busy.test_and_set(std::memory_order_acquire)) {
-            loadPublished(outSampleTime, outHostTime);
+            const Stamp stamp = published.load(std::memory_order_acquire);
+            outSampleTime = stamp.sampleTime;
+            outHostTime = stamp.hostTime;
             return;
         }
-        const uint64_t request = resetRequests.load(std::memory_order_acquire);
-        if (request != seenResetRequest || anchorHostTime == 0) {
-            seenResetRequest = request;
+        if (anchorHostTime == 0) {
             anchorHostTime = now;
             periods = 0;
             elapsedTicks = 0;
@@ -893,40 +914,18 @@ class DeviceClock {
                 periods += static_cast<uint64_t>(steps);
             }
         }
-        outSampleTime = static_cast<double>(periods) * period;
-        outHostTime = anchorHostTime + static_cast<uint64_t>(elapsedTicks);
-        const uint32_t sequence = publishedSequence.load(std::memory_order_relaxed);
-        publishedSequence.store(sequence + 1, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_release);
-        publishedSampleTime.store(outSampleTime, std::memory_order_relaxed);
-        publishedHostTime.store(outHostTime, std::memory_order_relaxed);
-        publishedSequence.store(sequence + 2, std::memory_order_release);
+        const Stamp stamp{static_cast<double>(periods) * period, anchorHostTime + static_cast<uint64_t>(elapsedTicks)};
+        published.store(stamp, std::memory_order_release);
         busy.clear(std::memory_order_release);
+        outSampleTime = stamp.sampleTime;
+        outHostTime = stamp.hostTime;
     }
 
   private:
-    void loadPublished(double &sampleTime, uint64_t &hostTime) const noexcept {
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            const uint32_t before = publishedSequence.load(std::memory_order_acquire);
-            if (before & 1u) {
-                continue;
-            }
-            sampleTime = publishedSampleTime.load(std::memory_order_relaxed);
-            hostTime = publishedHostTime.load(std::memory_order_relaxed);
-            std::atomic_thread_fence(std::memory_order_acquire);
-            if (publishedSequence.load(std::memory_order_relaxed) == before) {
-                return;
-            }
-        }
-    }
-
     std::atomic<double> nominalTicksPerFrame{0};
-    std::atomic<uint64_t> resetRequests{0};
     std::atomic_flag busy = ATOMIC_FLAG_INIT;
-    std::atomic<uint32_t> publishedSequence{0};
-    std::atomic<double> publishedSampleTime{0};
-    std::atomic<uint64_t> publishedHostTime{0};
-    uint64_t seenResetRequest = 0;
+    std::atomic<Stamp> published{Stamp{0, 0}};
+    // Only touched by the thread holding |busy|.
     uint64_t anchorHostTime = 0;
     uint64_t periods = 0;
     double elapsedTicks = 0;

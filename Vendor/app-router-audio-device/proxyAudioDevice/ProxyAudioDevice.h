@@ -105,6 +105,7 @@ class ProxyAudioDevice {
     void scheduleOutputStop(double seconds);
     void matchOutputDeviceSampleRate();
     void scheduleSampleRateRetry();
+    void scheduleOutputSetupRetry();
     void applyRequestedSampleRateToOutput(Float64 sampleRate);
     void refreshAvailableSampleRates();
     void refreshTargetOutputReadiness();
@@ -568,6 +569,9 @@ class ProxyAudioDevice {
     UInt64 hideToken = 0;
     int sampleRateRetryCount = 0;
     UInt64 sampleRateRetryToken = 0;
+    int outputSetupRetryCount = 0;
+    UInt64 outputSetupRetryToken = 0;
+    AudioObjectID outputSetupRetryDeviceID = kAudioObjectUnknown;
     Float64 requestedOutputSampleRate = 0;
     bool devicesListenerInstalled = false;
     UInt64 initializedHostTime = 0;

@@ -12,6 +12,7 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <pthread.h>
 #include <random>
@@ -1099,6 +1100,169 @@ static void testAudioCallbacksDoNotAllocate() {
     CHECK(allocations == 0);
 }
 
+// MARK: Review regressions
+
+static void testZeroTimeStampsAreConsistentUnderContention() {
+    nearfield::DeviceClock clock;
+    const uint32_t period = 16384;
+    const double ticksPerFrame = 1000;
+    const uint64_t anchor = 1000000000;
+    // Host time advances by 1/50 of a period per call, so the timeline moves
+    // while several threads ask at once.
+    const uint64_t step = (uint64_t)(ticksPerFrame * period / 50);
+    clock.setHostTicksPerFrame(ticksPerFrame);
+    clock.reset(anchor);
+    std::atomic<uint64_t> now{anchor};
+    std::atomic<long> unset{0};
+    std::atomic<long> inconsistent{0};
+    std::atomic<long> backwards{0};
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < 6; ++thread) {
+        threads.emplace_back([&] {
+            double lastSampleTime = -1;
+            for (int call = 0; call < 100000; ++call) {
+                double sampleTime = std::numeric_limits<double>::quiet_NaN();
+                uint64_t hostTime = UINT64_MAX;
+                clock.get(period, 1.0, now.fetch_add(step, std::memory_order_relaxed), sampleTime, hostTime);
+                if (std::isnan(sampleTime) || hostTime == UINT64_MAX || hostTime == 0) {
+                    ++unset;
+                    continue;
+                }
+                // Sample time and host time belong to the same stamp.
+                if (std::fmod(sampleTime, period) != 0 || (double)hostTime != (double)anchor + sampleTime * ticksPerFrame) {
+                    ++inconsistent;
+                }
+                if (sampleTime < lastSampleTime) {
+                    ++backwards;
+                }
+                lastSampleTime = sampleTime;
+            }
+        });
+    }
+    for (std::thread &thread : threads) {
+        thread.join();
+    }
+    CHECK(unset.load() == 0);
+    CHECK(inconsistent.load() == 0);
+    CHECK(backwards.load() == 0);
+
+    // A reset starts the new timeline at once.
+    clock.reset(anchor * 4);
+    double sampleTime = -1;
+    uint64_t hostTime = 0;
+    clock.get(period, 1.0, anchor * 4 + 10, sampleTime, hostTime);
+    CHECK(sampleTime == 0);
+    CHECK(hostTime == anchor * 4);
+}
+
+static void testTeamIdentifierComesFromTheDriverBundle() {
+    CHECK(codePathForImage("/Library/Audio/Plug-Ins/HAL/NearfieldAudioDevice.driver/Contents/MacOS/NearfieldAudioDevice") ==
+          "/Library/Audio/Plug-Ins/HAL/NearfieldAudioDevice.driver");
+    CHECK(codePathForImage("/tmp/driver-tests") == "/tmp/driver-tests");
+    // This code was loaded from the test binary, which has no Team ID.
+    const std::string ownPath = driverCodePath();
+    CHECK(!ownPath.empty());
+    CHECK(copyTeamIdentifier(ownPath) == NULL);
+    // Neither does the audio service that hosts the driver, which is why the
+    // driver's own bundle must be checked rather than the running process.
+    CHECK(copyTeamIdentifier("/usr/sbin/coreaudiod") == NULL);
+
+    const std::string bundled = "/Applications/Nearfield.app/Contents/Resources/Drivers/NearfieldAudioDevice.driver";
+    if (access(bundled.c_str(), R_OK) != 0) {
+        std::printf("  no Developer ID signed Nearfield.app installed; bundle check skipped\n");
+        return;
+    }
+    CFStringRef team = copyTeamIdentifier(bundled);
+    CFStringRef teamFromExecutable = copyTeamIdentifier(codePathForImage(bundled + "/Contents/MacOS/NearfieldAudioDevice"));
+    CHECK(team != NULL);
+    CHECK(teamFromExecutable != NULL && CFEqual(team, teamFromExecutable));
+    CFRelease(team);
+    CFRelease(teamFromExecutable);
+}
+
+static void testMalformedNumbersAreRejected() {
+    const auto parses = [](CFDictionaryRef values, nearfield::SettingsUpdate &update) {
+        update = nearfield::SettingsUpdate();
+        return nearfield::parseSettingsUpdate(values, update);
+    };
+    const auto rejects = [&](CFStringRef key, CFTypeRef value) {
+        CFDictionarySmartRef values(dictionary({{key, value}}));
+        nearfield::SettingsUpdate update;
+        return !parses(values, update);
+    };
+    const auto rejectsProcessRoute = [&](CFTypeRef processID) {
+        const void *keys[] = {processID};
+        const void *routes[] = {CFSTR("left")};
+        CFDictionarySmartRef processRoutes(
+            CFDictionaryCreate(NULL, keys, routes, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+        return rejects(nearfield::kSettingsProcessRoutesKey, processRoutes);
+    };
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double infinity = std::numeric_limits<double>::infinity();
+    CFNumberSmartRef nanNumber(CFNumberCreate(NULL, kCFNumberDoubleType, &nan));
+    CFNumberSmartRef infinityNumber(CFNumberCreate(NULL, kCFNumberDoubleType, &infinity));
+    const CFTypeRef notFinite[] = {CFSTR("nan"), CFSTR("inf"), CFSTR("-inf"), nanNumber.ref(), infinityNumber.ref()};
+    for (CFTypeRef value : notFinite) {
+        CHECK(rejects(nearfield::kSettingsOutputBufferFrameSizeKey, value));
+        CHECK(rejects(nearfield::kSettingsSafetyGapKey, value));
+        CHECK(rejects(nearfield::kSettingsActiveConditionKey, value));
+        CHECK(rejectsProcessRoute(value));
+    }
+    CHECK(rejects(nearfield::kSettingsRoutingEnabledKey, nanNumber.ref()));
+    CHECK(rejects(nearfield::kSettingsActiveConditionKey, CFSTR("3")));
+    CHECK(rejects(nearfield::kSettingsActiveConditionKey, CFSTR("1.5")));
+    CHECK(rejects(nearfield::kSettingsSafetyGapKey, CFSTR("101")));
+    for (CFStringRef processID : {CFSTR("0"), CFSTR("-3"), CFSTR("1.5"), CFSTR("1e20"), CFSTR("4294967297")}) {
+        CHECK(rejectsProcessRoute(processID));
+    }
+
+    // Valid values still parse; frame sizes are clamped as before.
+    CFDictionarySmartRef routes(dictionary({{CFSTR("101"), CFSTR("left")}}));
+    CFDictionarySmartRef valid(dictionary({
+        {nearfield::kSettingsOutputBufferFrameSizeKey, CFSTR("100000")},
+        {nearfield::kSettingsActiveConditionKey, CFSTR("2")},
+        {nearfield::kSettingsSafetyGapKey, CFSTR("4.5")},
+        {nearfield::kSettingsProcessRoutesKey, routes},
+    }));
+    nearfield::SettingsUpdate update;
+    CHECK(parses(valid, update));
+    CHECK(update.outputBufferFrameSize && *update.outputBufferFrameSize == nearfield::kMaximumOutputBufferFrameSize);
+    CHECK(update.activeCondition && *update.activeCondition == 2);
+    CHECK(update.safetyGapMilliseconds && *update.safetyGapMilliseconds == 4.5);
+    CHECK(update.processRoutes && update.processRoutes->size() == 1 && update.processRoutes->count(101) == 1);
+
+    // Process rules in the legacy rules string that overflow a pid are ignored, not truncated.
+    const nearfield::ParsedRouteRules rules = nearfield::parseRouteRules("pid:4294967338=left; pid:42=right");
+    CHECK(rules.processRoutes.size() == 1 && rules.processRoutes.count(42) == 1);
+
+    // Saved settings with impossible sample rates keep the defaults.
+    CFNumberSmartRef rate(CFNumberCreate(NULL, kCFNumberDoubleType, &infinity));
+    CFArraySmartRef rates(CFArrayCreate(NULL, (const void *[]){nanNumber.ref(), rate.ref()}, 2, &kCFTypeArrayCallBacks));
+    CFDictionarySmartRef saved(dictionary({
+        {nearfield::kSettingsSampleRateKey, rate},
+        {nearfield::kSettingsAvailableSampleRatesKey, rates},
+    }));
+    nearfield::DriverSettings settings;
+    CHECK(nearfield::loadPersistentSettings(saved, settings));
+    CHECK(settings.sampleRate == 0);
+    CHECK(settings.availableSampleRates.empty());
+}
+
+static void testFailedOutputCallbackIsRetried() {
+    // A device whose IO callback could not be created is never "set up".
+    CHECK(!outputSetupIsCurrent(true, 50, 512, false, 50, 512));
+    CHECK(outputSetupIsCurrent(true, 50, 512, true, 50, 512));
+    CHECK(!outputSetupIsCurrent(true, 50, 512, true, 51, 512));
+    CHECK(!outputSetupIsCurrent(true, 50, 512, true, 50, 256));
+    CHECK(!outputSetupIsCurrent(false, 50, 512, true, 50, 512));
+    // Retries back off to four seconds and stop after twelve attempts.
+    const double delays[] = {0.25, 0.5, 1, 2, 4, 4, 4, 4, 4, 4, 4, 4};
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        CHECK(outputSetupRetryDelay(attempt) == delays[attempt]);
+    }
+    CHECK(outputSetupRetryDelay(12) < 0);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     const std::string suite = argc > 1 ? argv[1] : "all";
@@ -1132,6 +1296,10 @@ int main(int argc, char **argv) {
         {"device name reads and renames", testDeviceNameReadsDoNotRaceWithRenames, true, false},
         {"simulated clock drift and buffer fill", testSimulatedClockDriftAndBufferFill, false, false},
         {"audio callbacks do not allocate", testAudioCallbacksDoNotAllocate, false, true},
+        {"zero time stamps under contention", testZeroTimeStampsAreConsistentUnderContention, true, false},
+        {"team identifier from the driver bundle", testTeamIdentifierComesFromTheDriverBundle, false, false},
+        {"malformed numbers are rejected", testMalformedNumbersAreRejected, false, false},
+        {"failed output callback is retried", testFailedOutputCallbackIsRetried, false, false},
     };
     int run = 0;
     for (const Test &test : tests) {
