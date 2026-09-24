@@ -121,7 +121,8 @@ Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
 | Access control (`--probe-write`) | Other processes rejected; the signed app configures the driver |
 | App CPU, no window, Nearfield playing | 0.09% |
 | App CPU, Settings open | 0.47% (about 12% for the first minutes after launch) |
-| App memory | Not yet measured without a window since launch; 39 MB with Settings open; leaks 2.9 KB |
+| App memory, no window (after Settings was open and closed) | 43.0 MB (0.1.39: 45 MB; target ~20 MB not met). Live heap 13.6 MB, down from 26 MB while Settings was open; leaks under 3 KB |
+| App CPU, no window, idle | 0.12% |
 | End-to-end latency (`measure_latency.swift`) | Not yet run (needs microphone access from Terminal) |
 | Soaks at 88.2 and 96 kHz | Not yet run |
 
