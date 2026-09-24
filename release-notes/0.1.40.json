@@ -1,8 +1,0 @@
-{
-  "version": "0.1.40",
-  "changes": [
-    "Wait for the Studio Display audio route to be ready before automatically selecting Nearfield.",
-    "Attempt one recovery for apps that keep the previous sound output after displays connect, including playback started later.",
-    "Preserve manual output choices during connection and recovery. Includes audio driver 1.0.9."
-  ]
-}

@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "changes": [
+    "Includes audio driver 1.1.0 with a rebuilt audio path: volume, balance, and app route changes fade smoothly, and Nearfield reports its output latency to macOS.",
+    "Sound follows a routed window to the other display within two seconds, and right away when playback starts, an app comes to the front, or the Space changes.",
+    "Select Nearfield automatically when a second Studio Display connects and its audio route is ready, with one recovery for apps still playing on the previous output. Manual output choices are respected.",
+    "Hide the Nearfield output when fewer than two Studio Displays are connected, even while the app is not running.",
+    "When the displays disconnect, return sound to the previous output or the built-in speakers.",
+    "Nearfield now requires a Mac with Apple silicon."
+  ]
+}

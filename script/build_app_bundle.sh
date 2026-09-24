@@ -55,6 +55,11 @@ fi
 swift "${SWIFT_BUILD_ARGUMENTS[@]}"
 BUILD_BIN_DIR="$(swift "${SWIFT_BUILD_ARGUMENTS[@]}" --show-bin-path)"
 BUILD_BINARY="$BUILD_BIN_DIR/$PRODUCT_NAME"
+# Nearfield supports Apple silicon only; its driver is built for arm64 only.
+if [[ "$(lipo -archs "$BUILD_BINARY")" != "arm64" ]]; then
+  echo "Nearfield must be built for arm64 only; got: $(lipo -archs "$BUILD_BINARY")" >&2
+  exit 1
+fi
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_FRAMEWORKS" "$APP_RESOURCES" "$APP_DRIVERS"

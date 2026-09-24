@@ -10,6 +10,18 @@ LEGACY_PROXY_DEST="$HAL_DIR/ProxyAudioDevice.driver"
 TEMP_DRIVER_DEST="$DRIVER_DEST.nearfield-installing"
 DRIVER_SERVICE_HELPER="com.apple.audio.Core-Audio-Driver-Service.helper"
 
+# ProxyAudioDevice.driver is also the name of the open-source driver Nearfield
+# started from; remove it only when it is Nearfield's (same rule as the app).
+is_nearfield_legacy_driver() {
+  local bundle="$1" identifier executable
+  [[ -d "$bundle" ]] || return 1
+  identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  [[ "$identifier" == com.kemuri.* ]] && return 0
+  executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  [[ -n "$executable" && "$executable" != */* && "$executable" != "." && "$executable" != ".." ]] || return 1
+  grep -qaE 'com\.kemuri\.|StudioPair|NearfieldAudio' "$bundle/Contents/MacOS/$executable" 2>/dev/null
+}
+
 if [[ ! -d "$DRIVER_SOURCE" ]]; then
   echo "Router driver build did not produce $DRIVER_SOURCE" >&2
   exit 1
@@ -30,7 +42,9 @@ sudo codesign --force --deep --sign - "$TEMP_DRIVER_DEST" >/dev/null
 sudo xattr -cr "$TEMP_DRIVER_DEST" || true
 sudo rm -rf "$DRIVER_DEST"
 sudo rm -rf "$LEGACY_ROUTER_DEST"
-sudo rm -rf "$LEGACY_PROXY_DEST"
+if is_nearfield_legacy_driver "$LEGACY_PROXY_DEST"; then
+  sudo rm -rf "$LEGACY_PROXY_DEST"
+fi
 sudo mv "$TEMP_DRIVER_DEST" "$DRIVER_DEST"
 sudo xattr -cr "$DRIVER_DEST" || true
 sudo killall coreaudiod || true

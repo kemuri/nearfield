@@ -29,6 +29,9 @@ Local saves it after the app passes verification; Local DMG saves it after DMG
 verification; Full saves it after appcast generation, before publishing.
 `NEARFIELD_BUMP_VERSION=0` rebuilds without advancing the version.
 `MARKETING_VERSION` sets an exact version without changing the version counter.
+For a minor release such as 0.2.0, build with `MARKETING_VERSION=0.2.0`, then
+write `0.2.0` to `.local-release/VERSION` after publishing so the next patch
+release is 0.2.1.
 The existing signing and notarization environment overrides remain available.
 The mode controls `NEARFIELD_PUBLISH_WEBSITE` and `NEARFIELD_GENERATE_APPCAST`;
 conflicting legacy overrides stop the script before it builds anything.
