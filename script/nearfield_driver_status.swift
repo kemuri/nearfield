@@ -226,6 +226,9 @@ func watch(_ box: AudioObjectID) -> Never {
     dispatchMain()
 }
 
+/// Kept for the life of the process; see soak().
+var stopSignalSources: [DispatchSourceSignal] = []
+
 func soak(_ box: AudioObjectID, minutes: Double, interval: TimeInterval, sampleRate: Double?, toneDecibels: Double?) -> Never {
     let device = translate(uid: deviceUID, selector: kAudioHardwarePropertyTranslateUIDToDevice)
     let previousRate = device.map(nominalSampleRate)
@@ -269,10 +272,15 @@ func soak(_ box: AudioObjectID, minutes: Double, interval: TimeInterval, sampleR
         exit(underruns > 0 ? 1 : 0)
     }
 
-    signal(SIGINT, SIG_IGN)
-    let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    interrupt.setEventHandler { finish() }
-    interrupt.resume()
+    // Ends the soak (and restores the sample rate) when interrupted,
+    // terminated, or when its terminal goes away.
+    stopSignalSources = [SIGINT, SIGTERM, SIGHUP].map { number -> DispatchSourceSignal in
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+        source.setEventHandler { finish() }
+        source.resume()
+        return source
+    }
 
     let timer = DispatchSource.makeTimerSource(queue: .main)
     timer.schedule(deadline: .now() + interval, repeating: interval)
