@@ -107,6 +107,29 @@ automated tests cover their logic. One path is new: before macOS 14.2 Nearfield
 cannot tell which app plays on a display, so it raises the displays only once
 nothing is running on them (after about 5 seconds of silence).
 
-## 5. Rollback
+## 5. Results so far
+
+Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
+(Developer ID signed) and a local build of the app:
+
+| Check | Result |
+| --- | --- |
+| 2-hour soak, 48 kHz, continuous -50 dBFS tone | Passed: 0 underruns, 0 overruns |
+| Latency after a cold start (the displays take ~440 ms to start) | Drained at 300 ppm in ~23 min, then flat at 55.3 ms for 91 min |
+| Clock correction once settled | Within about ±25 ppm |
+| Driver Core Audio requests while playing | 0 (only on device changes) |
+| Access control (`--probe-write`) | Other processes rejected; the signed app configures the driver |
+| App CPU, no window, Nearfield playing | 0.09% |
+| App CPU, Settings open | 0.47% (about 12% for the first minutes after launch) |
+| App memory | Not yet measured without a window since launch; 39 MB with Settings open; leaks 2.9 KB |
+| End-to-end latency (`measure_latency.swift`) | Not yet run (needs microphone access from Terminal) |
+| Soaks at 88.2 and 96 kHz | Not yet run |
+
+Found and fixed during these runs: steering rebuilt the cold-start delay
+after a trim (latency grew ~0.27 ms/s), the app counted the driver's own
+host process as another app playing on the displays, and the volume shift
+relied on conversions Core Audio does not pass to the driver.
+
+## 6. Rollback
 
 Ship 0.2.1 with driver 1.1.1. Never reuse a driver version for changed driver code.
