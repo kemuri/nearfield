@@ -136,7 +136,8 @@ Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
 | App CPU, no window, idle | 0.12% |
 | End-to-end latency (`measure_latency.swift`, from Terminal) | Nearfield measured 58.8 ms vs 56.2 ms reported (+2.6 ms); one display directly measured 23.3 ms vs 22.0 ms reported (+1.3 ms, the method's own offset). Nearfield under-reports by about 1.3 ms. With the cold-start skip and 2-minute keep-alive: 54.1 ms measured vs 52.3 ms reported (+1.8 ms, about 0.5 ms under) |
 | Driver update from a signed local build (19:23) | Installed with a verified Developer ID signature; settings and diagnostics kept; the signed app configures it; other processes are still rejected |
-| Soaks at 88.2 and 96 kHz | Not yet run |
+| 2-hour soak, 88.2 kHz, inaudible tone | Passed: 0 underruns, 0 overruns, 0 writer gaps; no cold-start drain (latency 38.2 ms from the start). Reported latency crept up 1 ms per ~16 min (+1.01 ppm, matching the clock correction); under investigation |
+| 2-hour soak, 96 kHz | Running |
 
 Found and fixed during these runs: steering rebuilt the cold-start delay
 after a trim (latency grew ~0.27 ms/s), the app counted the driver's own
