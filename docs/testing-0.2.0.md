@@ -123,7 +123,7 @@ Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
 | App CPU, Settings open | 0.47% (about 12% for the first minutes after launch) |
 | App memory, no window (after Settings was open and closed) | 43.0 MB (0.1.39: 45 MB; target ~20 MB not met). Live heap 13.6 MB, down from 26 MB while Settings was open; leaks under 3 KB |
 | App CPU, no window, idle | 0.12% |
-| End-to-end latency (`measure_latency.swift`) | Not yet run (needs microphone access from Terminal) |
+| End-to-end latency (`measure_latency.swift`, from Terminal) | Nearfield measured 58.8 ms vs 56.2 ms reported (+2.6 ms); one display directly measured 23.3 ms vs 22.0 ms reported (+1.3 ms, the method's own offset). Nearfield under-reports by about 1.3 ms |
 | Soaks at 88.2 and 96 kHz | Not yet run |
 
 Found and fixed during these runs: steering rebuilt the cold-start delay

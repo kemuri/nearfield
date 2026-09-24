@@ -6,6 +6,8 @@
 //
 //   swift script/measure_latency.swift
 //   swift script/measure_latency.swift --clicks 20 --input "Studio Display"
+//   swift script/measure_latency.swift --output "Studio Display Speakers" --click-level -44
+//       (control: one display directly, at the level Nearfield's volume gives)
 //
 // Keep the room quiet and the volume moderate. The measured value includes
 // the sound's travel time from speaker to microphone (about 1 ms at 34 cm).
@@ -30,6 +32,10 @@ func value(after flag: String) -> String? {
 let clickCount = value(after: "--clicks").flatMap(Int.init) ?? 12
 let inputNameHint = value(after: "--input") ?? "Studio Display"
 let allowAnyOutput = arguments.contains("--allow-any-output")
+// Plays on the named device instead of the default output (a control
+// measurement, for example one Studio Display directly).
+let outputNameHint = value(after: "--output")
+let clickDecibels = min(0, value(after: "--click-level").flatMap(Double.init) ?? -6)
 
 // MARK: Core Audio helpers
 
@@ -72,12 +78,21 @@ func latencyFrames(_ device: AudioObjectID, _ scope: AudioObjectPropertyScope) -
 }
 
 let system = AudioObjectID(kAudioObjectSystemObject)
-guard let outputDevice: AudioObjectID = read(system, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, 0),
+let namedOutput = outputNameHint.flatMap { hint in
+    objects(system, kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal).first { device in
+        !objects(device, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput).isEmpty &&
+            string(device, kAudioObjectPropertyName).localizedCaseInsensitiveContains(hint)
+    }
+}
+if let outputNameHint, namedOutput == nil {
+    fail("no output device named like \"\(outputNameHint)\"")
+}
+guard let outputDevice: AudioObjectID = namedOutput ?? read(system, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, 0),
       outputDevice != kAudioObjectUnknown else {
     fail("no default output device")
 }
 let outputUID = string(outputDevice, kAudioDevicePropertyDeviceUID)
-guard outputUID == nearfieldDeviceUID || allowAnyOutput else {
+guard outputUID == nearfieldDeviceUID || allowAnyOutput || namedOutput != nil else {
     fail("the default output is \(string(outputDevice, kAudioObjectPropertyName)), not Nearfield (pass --allow-any-output to measure it anyway)")
 }
 let inputDevice = objects(system, kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal).first { device in
@@ -173,6 +188,16 @@ if #available(macOS 27, *) {
 
 // MARK: Clicks
 
+/// A 2 ms, 3 kHz burst with a Hann window: a soft tick that the matched
+/// filter below finds well below the room's noise.
+func clickBurst(sampleRate: Double) -> [Double] {
+    let length = max(8, Int(sampleRate * 0.002))
+    return (0..<length).map { index in
+        let window = 0.5 - 0.5 * cos(2 * Double.pi * Double(index) / Double(length - 1))
+        return window * sin(2 * Double.pi * 3000 * Double(index) / sampleRate)
+    }
+}
+
 final class ClickPlayer: @unchecked Sendable {
     let clickTimes: UnsafeMutablePointer<UInt64>
     let count: Int
@@ -181,15 +206,12 @@ final class ClickPlayer: @unchecked Sendable {
     private let interval: Int64
     private let burst: [Float]
 
-    init(count: Int, sampleRate: Double) {
+    init(count: Int, sampleRate: Double, decibels: Double) {
         self.count = count
         clickTimes = .allocate(capacity: count)
         interval = Int64(sampleRate * 0.6)
-        // 1 ms of 4 kHz at -20 dBFS: short and quiet, with a sharp onset.
-        let length = Int(sampleRate / 1000)
-        burst = (0..<length).map { index in
-            0.1 * Float(sin(2 * Double.pi * 4000 * Double(index) / sampleRate))
-        }
+        let peak = pow(10.0, decibels / 20.0)
+        burst = clickBurst(sampleRate: sampleRate).map { Float(peak * $0) }
     }
 
     func render(frames: Int, hostTime: UInt64, ticksPerFrame: Double, into buffers: UnsafeMutableAudioBufferListPointer) {
@@ -216,7 +238,7 @@ final class ClickPlayer: @unchecked Sendable {
 
 let outputEngine = AVAudioEngine()
 let outputFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 2)!
-let player = ClickPlayer(count: clickCount, sampleRate: outputRate)
+let player = ClickPlayer(count: clickCount, sampleRate: outputRate, decibels: clickDecibels)
 let ticksPerOutputFrame = ticksPerSecond / outputRate
 var missingHostTime = false
 let source = AVAudioSourceNode(format: outputFormat) { _, timestamp, frameCount, bufferList in
@@ -227,6 +249,21 @@ let source = AVAudioSourceNode(format: outputFormat) { _, timestamp, frameCount,
     player.render(frames: Int(frameCount), hostTime: timestamp.pointee.mHostTime,
                   ticksPerFrame: ticksPerOutputFrame, into: UnsafeMutableAudioBufferListPointer(bufferList))
     return noErr
+}
+if namedOutput != nil {
+    func selectOutput(_ unit: AudioUnit?) -> Bool {
+        guard let unit else { return false }
+        var deviceID = outputDevice
+        return AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                    &deviceID, UInt32(MemoryLayout<AudioObjectID>.size)) == noErr
+    }
+    let selected: Bool
+    if #available(macOS 27, *) {
+        selected = outputEngine.outputNode.withAudioUnit { unit in selectOutput(unit) }
+    } else {
+        selected = selectOutput(outputEngine.outputNode.audioUnit)
+    }
+    guard selected else { fail("could not play on \(string(outputDevice, kAudioObjectPropertyName))") }
 }
 outputEngine.attach(source)
 do {
@@ -252,21 +289,47 @@ guard !missingHostTime else { fail("the output did not provide host times") }
 // MARK: Analysis
 
 let ticksPerInputFrame = ticksPerSecond / inputRate
-let samples = recording.snapshot().flatMap { chunk in
-    chunk.samples.enumerated().map { (UInt64(Double(chunk.hostTime) + Double($0.offset) * ticksPerInputFrame), $0.element) }
+let chunks = recording.snapshot()
+guard let firstChunk = chunks.first else { fail("nothing was recorded") }
+// One continuous recording, timed from its first sample.
+let recorded = chunks.flatMap(\.samples)
+let recordingStart = Double(firstChunk.hostTime)
+let template = clickBurst(sampleRate: inputRate)
+let templateEnergy = sqrt(template.reduce(0) { $0 + $1 * $1 })
+let peakLevel = recorded.map { abs($0) }.max() ?? 0
+print(String(format: "recorded %.1f s, peak %.1f dBFS", Double(recorded.count) / inputRate, 20 * log10(max(Double(peakLevel), 1e-9))))
+
+/// Matched filter: where the recording best matches the click, and how far
+/// that match stands out from the rest of the window.
+func findClick(from start: Int, count: Int) -> (index: Int, snr: Double)? {
+    let end = min(recorded.count - template.count, start + count)
+    guard start >= 0, end > start else { return nil }
+    var scores = [Double](repeating: 0, count: end - start)
+    for offset in start..<end {
+        var sum = 0.0
+        for (index, value) in template.enumerated() {
+            sum += value * Double(recorded[offset + index])
+        }
+        scores[offset - start] = abs(sum) / templateEnergy
+    }
+    guard let best = scores.indices.max(by: { scores[$0] < scores[$1] }) else { return nil }
+    let typical = scores.sorted()[scores.count / 2]
+    return (start + best, typical > 0 ? scores[best] / typical : .infinity)
 }
+
 var delays: [Double] = []
 for index in 0..<player.emitted {
-    let clickTime = player.clickTimes[index]
-    let before = samples.filter { $0.0 < clickTime && $0.0 + UInt64(0.2 * ticksPerSecond) >= clickTime }
-    let noise = before.isEmpty ? 0 : sqrt(before.map { Double($0.1 * $0.1) }.reduce(0, +) / Double(before.count))
-    let threshold = max(noise * 10, 0.002)
-    let window = UInt64(0.5 * ticksPerSecond)
-    guard let onset = samples.first(where: { $0.0 >= clickTime && $0.0 < clickTime + window && Double(abs($0.1)) > threshold }) else {
+    let clickTime = Double(player.clickTimes[index])
+    let firstFrame = Int(((clickTime - recordingStart) / ticksPerInputFrame).rounded(.down))
+    guard let found = findClick(from: firstFrame, count: Int(inputRate * 0.5)) else { continue }
+    guard found.snr >= 8 else {
+        print(String(format: "click %d: not found (best match %.1fx the noise)", index + 1, found.snr))
         continue
     }
-    let arrival = Double(onset.0) / ticksPerSecond - inputLatencySeconds
-    delays.append(arrival - Double(clickTime) / ticksPerSecond)
+    let arrival = (recordingStart + Double(found.index) * ticksPerInputFrame) / ticksPerSecond - inputLatencySeconds
+    let delay = arrival - clickTime / ticksPerSecond
+    print(String(format: "click %d: %.1f ms (%.0fx the noise)", index + 1, delay * 1000, found.snr))
+    delays.append(delay)
 }
 
 guard !delays.isEmpty else {
@@ -276,5 +339,9 @@ let sorted = delays.sorted()
 let median = sorted[sorted.count / 2]
 print(String(format: "measured: median %.1f ms (min %.1f, max %.1f) from %d of %d clicks",
              median * 1000, sorted.first! * 1000, sorted.last! * 1000, delays.count, player.emitted))
-print(String(format: "reported: %.1f ms; difference %+.1f ms (includes speaker-to-microphone distance)",
-             reportedOutputSeconds * 1000, (median - reportedOutputSeconds) * 1000))
+// Nearfield's latency changes when it trims delay during silence, so compare
+// with what it reports while the clicks play, not only before.
+let reportedAfterSeconds = Double(latencyFrames(outputDevice, kAudioObjectPropertyScopeOutput)) / outputRate
+let reportedDuringSeconds = (reportedOutputSeconds + reportedAfterSeconds) / 2
+print(String(format: "reported: %.1f ms before, %.1f ms after; difference %+.1f ms (includes speaker-to-microphone distance)",
+             reportedOutputSeconds * 1000, reportedAfterSeconds * 1000, (median - reportedDuringSeconds) * 1000))
