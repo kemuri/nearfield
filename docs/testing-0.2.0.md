@@ -136,8 +136,9 @@ Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
 | App CPU, no window, idle | 0.12% |
 | End-to-end latency (`measure_latency.swift`, from Terminal) | Nearfield measured 58.8 ms vs 56.2 ms reported (+2.6 ms); one display directly measured 23.3 ms vs 22.0 ms reported (+1.3 ms, the method's own offset). Nearfield under-reports by about 1.3 ms. With the cold-start skip and 2-minute keep-alive: 54.1 ms measured vs 52.3 ms reported (+1.8 ms, about 0.5 ms under) |
 | Driver update from a signed local build (19:23) | Installed with a verified Developer ID signature; settings and diagnostics kept; the signed app configures it; other processes are still rejected |
-| 2-hour soak, 88.2 kHz, inaudible tone | Passed: 0 underruns, 0 overruns, 0 writer gaps; no cold-start drain (latency 38.2 ms from the start). Reported latency crept up 1 ms per ~16 min (+1.01 ppm, matching the clock correction); under investigation |
-| 2-hour soak, 96 kHz | Running |
+| 2-hour soak, 88.2 kHz, inaudible tone | Passed: 0 underruns, 0 overruns, 0 writer gaps; no cold-start drain (latency 38.2 ms from the start) |
+| 2-hour soak, 96 kHz, inaudible tone | Passed: 0 underruns, 0 overruns; the rate switches to and from 96 kHz restored 48 kHz afterwards |
+| Reported latency over long playback | Wanders within about 4 ms (38.2-42.2 ms at 88.2 kHz, 36.4-40.4 ms at 96 kHz), less than one output buffer, as the two clocks' buffer timing slides; it does not keep growing. Measured with clicks at 96 kHz 90 minutes apart: 41.0 and 40.3 ms against 40.4 and 38.4 ms reported, within about 1 ms after the method's offset |
 
 Found and fixed during these runs: steering rebuilt the cold-start delay
 after a trim (latency grew ~0.27 ms/s), the app counted the driver's own
