@@ -235,6 +235,11 @@ func soak(_ box: AudioObjectID, minutes: Double, interval: TimeInterval, sampleR
     if let sampleRate {
         guard let device else { fail("the Nearfield device is not available") }
         setNominalSampleRate(device, sampleRate)
+        // The driver applies the rate asynchronously, displays included.
+        let deadline = Date().addingTimeInterval(15)
+        while number(readStatus(box), "sampleRate") != sampleRate, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
     }
     let tone = toneDecibels.map { decibels -> Tone in
         guard let device else { fail("the Nearfield device is not available for the tone") }
