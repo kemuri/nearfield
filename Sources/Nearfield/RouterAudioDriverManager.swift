@@ -96,7 +96,9 @@ final class RouterAudioDriverManager {
             mode: mode,
             routingEnabled: routingEnabled,
             routeRules: split.rules,
-            processRoutes: split.processRoutes
+            processRoutes: split.processRoutes,
+            diagnostics: NearfieldPreferences.driverDiagnostics(),
+            underrunStrategy: NearfieldPreferences.driverUnderrunStrategy()
         ), legacyRouteRules: routeRules)
     }
 

@@ -62,6 +62,9 @@ struct RouterDriverSettings: Equatable {
     var routeRules: String
     /// Routes for individual processes (window following); never saved.
     var processRoutes: [Int32: String]
+    /// Testing switches (hidden preferences); nil leaves the driver's value.
+    var diagnostics: Bool? = nil
+    var underrunStrategy: String? = nil
 
     /// The settings-property keys and values that differ from |previous|,
     /// or everything when there is no previous state.
@@ -74,6 +77,10 @@ struct RouterDriverSettings: Equatable {
         if previous?.routeRules != routeRules { changes["routeRules"] = routeRules }
         if previous?.processRoutes != processRoutes {
             changes["processRoutes"] = Dictionary(uniqueKeysWithValues: processRoutes.map { (String($0.key), $0.value) })
+        }
+        if let diagnostics, previous?.diagnostics != diagnostics { changes["diagnostics"] = diagnostics }
+        if let underrunStrategy, previous?.underrunStrategy != underrunStrategy {
+            changes["underrunStrategy"] = underrunStrategy
         }
         return changes
     }

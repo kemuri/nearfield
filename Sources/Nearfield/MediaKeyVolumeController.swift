@@ -12,7 +12,10 @@ final class MediaKeyVolumeController {
     }
 
     func start() {
-        guard monitors.isEmpty else { return }
+        // To be removed once macOS volume keys and Control Center are
+        // confirmed to control Nearfield and keep its balance; the switch
+        // lets that be tested without a rebuild.
+        guard monitors.isEmpty, !NearfieldPreferences.systemHandlesVolumeKeys() else { return }
 
         let localMonitor = NSEvent.addLocalMonitorForEvents(matching: .systemDefined) { [weak self] event in
             self?.handle(event) == true ? nil : event
