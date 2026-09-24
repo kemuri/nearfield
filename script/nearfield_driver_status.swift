@@ -11,7 +11,8 @@
 //
 // --soak prints a line every --interval seconds (default 60) and a summary; it
 // exits with status 1 when any underrun happened. Play something through
-// Nearfield during the soak, or pass --tone for a quiet 440 Hz tone
+// Nearfield during the soak, or pass --tone for a quiet 440 Hz tone on Nearfield
+// itself, even when another output is the default
 // (--tone-level sets it in dBFS, default -30; the driver treats audio below
 // about -90 dBFS as silence).
 // --sample-rate sets Nearfield's sample rate for the soak and restores the
@@ -132,15 +133,20 @@ func setNominalSampleRate(_ device: AudioObjectID, _ rate: Double) {
 
 // MARK: Tone
 
+/// A quiet tone played on Nearfield itself, whatever the default output is.
 final class Tone {
     private let engine = AVAudioEngine()
     private let decibels: Double
+    private let device: AudioObjectID
+    private var configurationObserver: NSObjectProtocol?
 
-    init(decibels: Double) {
+    init(decibels: Double, device: AudioObjectID) {
         self.decibels = decibels
+        self.device = device
     }
 
     func start() {
+        selectDevice()
         let format = engine.outputNode.inputFormat(forBus: 0)
         let sampleRate = format.sampleRate
         var phase = 0.0
@@ -170,10 +176,39 @@ final class Tone {
         } catch {
             fail("could not play the tone: \(error)")
         }
+        // Core Audio stops the engine when the device is reconfigured.
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.selectDevice()
+            try? self.engine.start()
+            print("\(timestamp()) tone restarted after a device change")
+        }
     }
 
     func stop() {
+        configurationObserver.map(NotificationCenter.default.removeObserver)
         engine.stop()
+    }
+
+    private func selectDevice() {
+        var deviceID = device
+        let size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status: OSStatus
+        if #available(macOS 27, *) {
+            status = engine.outputNode.withAudioUnit { unit in
+                guard let unit else { return kAudioUnitErr_Uninitialized }
+                return AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &deviceID, size)
+            }
+        } else {
+            status = engine.outputNode.audioUnit.map {
+                AudioUnitSetProperty($0, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &deviceID, size)
+            } ?? kAudioUnitErr_Uninitialized
+        }
+        if status != noErr {
+            fail("could not play the tone on Nearfield (\(status))")
+        }
     }
 }
 
@@ -198,7 +233,10 @@ func soak(_ box: AudioObjectID, minutes: Double, interval: TimeInterval, sampleR
         guard let device else { fail("the Nearfield device is not available") }
         setNominalSampleRate(device, sampleRate)
     }
-    let tone = toneDecibels.map(Tone.init(decibels:))
+    let tone = toneDecibels.map { decibels -> Tone in
+        guard let device else { fail("the Nearfield device is not available for the tone") }
+        return Tone(decibels: decibels, device: device)
+    }
     tone?.start()
 
     let first = readStatus(box)
@@ -243,7 +281,11 @@ func soak(_ box: AudioObjectID, minutes: Double, interval: TimeInterval, sampleR
         maxLatency = max(maxLatency, number(status, "latencyMilliseconds"))
         maxGap = max(maxGap, number(status, "safetyGapMilliseconds"))
         let underruns = counter(status, "underruns")
-        print(summaryLine(status) + (underruns > lastUnderruns ? "  <- +\(underruns - lastUnderruns) underrun(s)" : ""))
+        let notes = [
+            underruns > lastUnderruns ? "+\(underruns - lastUnderruns) underrun(s)" : nil,
+            (status["outputRunning"] as? Bool ?? false) ? nil : "Nearfield is not playing",
+        ].compactMap { $0 }
+        print(summaryLine(status) + (notes.isEmpty ? "" : "  <- " + notes.joined(separator: ", ")))
         lastUnderruns = underruns
         if Date().timeIntervalSince(start) >= minutes * 60 {
             finish()
