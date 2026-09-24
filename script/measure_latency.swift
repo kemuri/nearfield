@@ -144,46 +144,32 @@ final class Recording: @unchecked Sendable {
 }
 
 let recording = Recording()
-let inputEngine = AVAudioEngine()
-func selectMicrophone(_ unit: AudioUnit?) -> Bool {
-    guard let unit else { return false }
-    var deviceID = inputDevice
-    return AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-                                &deviceID, UInt32(MemoryLayout<AudioObjectID>.size)) == noErr
-}
-let selectedMicrophone: Bool
-if #available(macOS 27, *) {
-    selectedMicrophone = inputEngine.inputNode.withAudioUnit { unit in selectMicrophone(unit) }
-} else {
-    selectedMicrophone = selectMicrophone(inputEngine.inputNode.audioUnit)
-}
-guard selectedMicrophone else { fail("could not select the microphone") }
-
-@Sendable func record(_ buffer: AVAudioPCMBuffer, _ time: AVAudioTime) {
-    guard time.isHostTimeValid, let channels = buffer.floatChannelData else { return }
-    let frames = Int(buffer.frameLength)
-    var samples = [Float](repeating: 0, count: frames)
-    // The loudest microphone of the array.
-    for channel in 0..<Int(buffer.format.channelCount) {
-        for frame in 0..<frames where abs(channels[channel][frame]) > abs(samples[frame]) {
-            samples[frame] = channels[channel][frame]
+// A plain IO callback on the microphone: it always runs in the device's own
+// format and sample rate (which follows the displays when Nearfield's rate
+// changes), and its input time is when the first frame was captured.
+var inputProc: AudioDeviceIOProcID?
+guard AudioDeviceCreateIOProcIDWithBlock(&inputProc, inputDevice, nil, { _, inputData, inputTime, _, _ in
+    guard inputTime.pointee.mFlags.contains(.hostTimeValid) else { return }
+    let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+    var samples: [Float] = []
+    for buffer in buffers {
+        guard let data = buffer.mData, buffer.mNumberChannels > 0 else { continue }
+        let channels = Int(buffer.mNumberChannels)
+        let frames = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * channels)
+        if samples.isEmpty { samples = [Float](repeating: 0, count: frames) }
+        let values = data.assumingMemoryBound(to: Float.self)
+        // The loudest microphone of the array.
+        for frame in 0..<min(frames, samples.count) {
+            for channel in 0..<channels where abs(values[frame * channels + channel]) > abs(samples[frame]) {
+                samples[frame] = values[frame * channels + channel]
+            }
         }
     }
-    recording.append(hostTime: time.hostTime, samples: samples)
-}
-let inputFormat = inputEngine.inputNode.outputFormat(forBus: 0)
-if #available(macOS 27, *) {
-    do {
-        try inputEngine.inputNode.installAudioTap(onBus: 0, bufferSize: 512, format: inputFormat) { buffer, time in
-            record(AVAudioPCMBuffer(copying: buffer), time)
-        }
-    } catch {
-        fail("could not record the microphone: \(error)")
+    if !samples.isEmpty {
+        recording.append(hostTime: inputTime.pointee.mHostTime, samples: samples)
     }
-} else {
-    inputEngine.inputNode.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { buffer, time in
-        record(buffer, time)
-    }
+}) == noErr, let inputProc else {
+    fail("could not record the microphone")
 }
 
 // MARK: Clicks
@@ -272,7 +258,7 @@ do {
     } else {
         outputEngine.connect(source, to: outputEngine.mainMixerNode, format: outputFormat)
     }
-    try inputEngine.start()
+    guard AudioDeviceStart(inputDevice, inputProc) == noErr else { fail("could not start the microphone") }
     try outputEngine.start()
 } catch {
     fail("could not start audio: \(error)")
@@ -283,7 +269,8 @@ print("input:  \(string(inputDevice, kAudioObjectPropertyName)) at \(Int(inputRa
 print("playing \(clickCount) clicks…")
 Thread.sleep(forTimeInterval: 0.6 * Double(clickCount + 2))
 outputEngine.stop()
-inputEngine.stop()
+AudioDeviceStop(inputDevice, inputProc)
+AudioDeviceDestroyIOProcID(inputDevice, inputProc)
 guard !missingHostTime else { fail("the output did not provide host times") }
 
 // MARK: Analysis
