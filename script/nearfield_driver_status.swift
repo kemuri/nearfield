@@ -11,7 +11,9 @@
 //
 // --soak prints a line every --interval seconds (default 60) and a summary; it
 // exits with status 1 when any underrun happened. Play something through
-// Nearfield during the soak, or pass --tone for a quiet 440 Hz tone.
+// Nearfield during the soak, or pass --tone for a quiet 440 Hz tone
+// (--tone-level sets it in dBFS, default -30; the driver treats audio below
+// about -90 dBFS as silence).
 // --sample-rate sets Nearfield's sample rate for the soak and restores the
 // previous rate afterwards.
 
@@ -132,13 +134,18 @@ func setNominalSampleRate(_ device: AudioObjectID, _ rate: Double) {
 
 final class Tone {
     private let engine = AVAudioEngine()
+    private let decibels: Double
+
+    init(decibels: Double) {
+        self.decibels = decibels
+    }
 
     func start() {
         let format = engine.outputNode.inputFormat(forBus: 0)
         let sampleRate = format.sampleRate
         var phase = 0.0
         let increment = 2 * Double.pi * 440 / sampleRate
-        let amplitude = Float(pow(10.0, -30.0 / 20.0))
+        let amplitude = Float(pow(10.0, decibels / 20.0))
         let source = AVAudioSourceNode { _, _, frameCount, bufferList in
             let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
             for frame in 0..<Int(frameCount) {
@@ -184,14 +191,14 @@ func watch(_ box: AudioObjectID) -> Never {
     dispatchMain()
 }
 
-func soak(_ box: AudioObjectID, minutes: Double, interval: TimeInterval, sampleRate: Double?, playTone: Bool) -> Never {
+func soak(_ box: AudioObjectID, minutes: Double, interval: TimeInterval, sampleRate: Double?, toneDecibels: Double?) -> Never {
     let device = translate(uid: deviceUID, selector: kAudioHardwarePropertyTranslateUIDToDevice)
     let previousRate = device.map(nominalSampleRate)
     if let sampleRate {
         guard let device else { fail("the Nearfield device is not available") }
         setNominalSampleRate(device, sampleRate)
     }
-    let tone = playTone ? Tone() : nil
+    let tone = toneDecibels.map(Tone.init(decibels:))
     tone?.start()
 
     let first = readStatus(box)
@@ -270,6 +277,9 @@ func probeWrite(_ box: AudioObjectID) -> Never {
 
 // MARK: Arguments
 
+// One line at a time, also when the output goes to a log file.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 var arguments = Array(CommandLine.arguments.dropFirst())
 func value(after flag: String) -> String? {
     guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { return nil }
@@ -287,10 +297,12 @@ if arguments.contains("--watch") {
         minutes: minutes,
         interval: value(after: "--interval").flatMap(Double.init) ?? 60,
         sampleRate: value(after: "--sample-rate").flatMap(Double.init),
-        playTone: arguments.contains("--tone")
+        toneDecibels: arguments.contains("--tone")
+            ? min(0, value(after: "--tone-level").flatMap(Double.init) ?? -30)
+            : nil
     )
 } else if arguments.isEmpty {
     printJSON(readStatus(box))
 } else {
-    fail("usage: nearfield_driver_status.swift [--watch | --probe-write | --soak MINUTES [--interval S] [--sample-rate HZ] [--tone]]")
+    fail("usage: nearfield_driver_status.swift [--watch | --probe-write | --soak MINUTES [--interval S] [--sample-rate HZ] [--tone [--tone-level DBFS]]]")
 }
