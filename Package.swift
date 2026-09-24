@@ -32,15 +32,18 @@ let package = Package(
                 .define("NEARFIELD_DISTRIBUTION", .when(configuration: .release)),
                 // SwiftPM otherwise adds the active Xcode toolchain as an
                 // absolute runtime search path to the executable.
-                .unsafeFlags(["-no-toolchain-stdlib-rpath"])
+                .unsafeFlags(["-no-toolchain-stdlib-rpath"]),
+                // A menu bar helper: optimize the release build for size.
+                .unsafeFlags(["-Osize"], .when(configuration: .release))
             ],
             linkerSettings: [
                 .linkedFramework("AVFAudio"),
                 .linkedFramework("AppKit"),
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("CoreGraphics"),
-                .linkedFramework("CoreMedia"),
-                .linkedFramework("ScreenCaptureKit"),
+                // Only Wave Lab (debug builds) captures system audio.
+                .linkedFramework("CoreMedia", .when(configuration: .debug)),
+                .linkedFramework("ScreenCaptureKit", .when(configuration: .debug)),
                 .linkedFramework("Security"),
                 .linkedFramework("ServiceManagement"),
                 .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])

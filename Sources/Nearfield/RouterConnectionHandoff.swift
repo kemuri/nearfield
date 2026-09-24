@@ -16,6 +16,16 @@ final class RouterConnectionHandoff {
         var playback: [Playback] = []
     }
 
+    /// Why the handoff waits before looking again.
+    enum Wait {
+        /// For the display route to become ready.
+        case readiness
+        /// For a stale-looking app to prove it really stayed behind (1 s).
+        case playbackConfirmation
+        /// For anything to change while every app plays where it should.
+        case playbackIdle
+    }
+
     struct Environment {
         var snapshot: () throws -> Snapshot
         var prepare: () throws -> Void
@@ -24,6 +34,9 @@ final class RouterConnectionHandoff {
         var supportsPlaybackVerification = true
         var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
         var sleep: (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+        /// Waits for a change notification. Without it the handoff polls:
+        /// readiness every 100 ms and playback every second.
+        var waitForChange: ((Wait) async throws -> Void)?
     }
 
     enum Failure: LocalizedError, Equatable {
@@ -112,7 +125,7 @@ final class RouterConnectionHandoff {
             // A healthy client does not prove that every other client followed.
             // Keep watching for apps that start playback later, until one retry
             // is used or a disconnect/manual output choice ends this handoff.
-            try await environment.sleep(1_000_000_000)
+            try await wait(staleProcesses.isEmpty ? .playbackIdle : .playbackConfirmation, environment)
         }
     }
 
@@ -121,7 +134,20 @@ final class RouterConnectionHandoff {
             let snapshot = try checkedSnapshot(environment)
             if snapshot.targetReady { return }
             guard environment.now() < deadline else { throw Failure.targetNotReady }
+            try await wait(.readiness, environment)
+        }
+    }
+
+    private func wait(_ reason: Wait, _ environment: Environment) async throws {
+        if let waitForChange = environment.waitForChange {
+            try await waitForChange(reason)
+            return
+        }
+        switch reason {
+        case .readiness:
             try await environment.sleep(100_000_000)
+        case .playbackConfirmation, .playbackIdle:
+            try await environment.sleep(1_000_000_000)
         }
     }
 

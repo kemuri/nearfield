@@ -1,14 +1,16 @@
 import AppKit
 import CoreGraphics
 
-@MainActor
+/// Resolves window-scoped app routes to the display each app's window is on.
+/// Not tied to a thread: the window follower uses one instance on its own
+/// queue with cached app and screen snapshots.
 final class WindowAudioRouteResolver {
-    struct DisplayTarget {
+    struct DisplayTarget: Equatable, Sendable {
         let route: String
         let bounds: CGRect
     }
 
-    struct RunningApplication {
+    struct RunningApplication: Equatable, Sendable {
         let bundleID: String
         let processID: pid_t
     }
@@ -298,10 +300,32 @@ final class WindowAudioRouteResolver {
 
     private func displayTargets() -> [DisplayTarget] {
         let displays = studioDisplays()
+        let leftDeviceUID = leftDeviceUID()
+        let displayOrderUIDs = displayOrderUIDs()
+        // Without an injected provider this resolver serves the Settings
+        // window on the main thread.
+        return MainActor.assumeIsolated {
+            Self.currentDisplayTargets(
+                displays: displays,
+                leftDeviceUID: leftDeviceUID,
+                displayOrderUIDs: displayOrderUIDs
+            )
+        }
+    }
+
+    /// Screen areas for each assigned route. Reads NSScreen and IOKit, so it
+    /// runs on the main thread; callers cache the result until the screens,
+    /// displays or their order change.
+    @MainActor
+    static func currentDisplayTargets(
+        displays: [AudioDevice],
+        leftDeviceUID: String?,
+        displayOrderUIDs: [String]
+    ) -> [DisplayTarget] {
         let assignedRoutes = Self.assignedRoutes(
             for: displays,
-            leftDeviceUID: leftDeviceUID(),
-            displayOrderUIDs: displayOrderUIDs()
+            leftDeviceUID: leftDeviceUID,
+            displayOrderUIDs: displayOrderUIDs
         )
         let assignedTargets: [DisplayTarget] = displays.prefix(3).compactMap { display in
             guard let route = assignedRoutes[display.uid] else { return nil }

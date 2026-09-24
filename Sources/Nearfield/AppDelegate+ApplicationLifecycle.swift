@@ -40,11 +40,7 @@ extension AppDelegate {
     }
 
     func isInApplicationsDirectory(_ bundleURL: URL) -> Bool {
-        let parentURL = bundleURL.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
-        let applicationsURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-        return parentURL.path == applicationsURL.path
+        ApplicationLocation.isInApplicationsFolder(bundleURL)
     }
 
     func relaunchFromApplications(at appURL: URL) throws {

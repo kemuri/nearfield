@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 enum RouterDriverDiskState: Equatable {
     case missing
@@ -20,6 +21,7 @@ enum DriverInstallerError: LocalizedError, Equatable {
     case authorizationCancelled
     case installFailed(String)
     case installedVersionMismatch(expected: String, actual: String?)
+    case untrustedDriverSignature(String)
 
     var errorDescription: String? {
         switch self {
@@ -39,6 +41,8 @@ enum DriverInstallerError: LocalizedError, Equatable {
             return "Driver install failed.\n\n\(output)"
         case .installedVersionMismatch(let expected, let actual):
             return "The audio driver update could not be verified. Expected version \(expected), found \(actual ?? "an unknown version"). Try updating the driver again in Settings."
+        case .untrustedDriverSignature(let path):
+            return "The audio driver at \(path) is not signed by Nearfield's developer. Download Nearfield again from trynearfield.com."
         }
     }
 }
@@ -52,15 +56,60 @@ final class DriverInstaller {
     private static let legacyProxyDriverBundleName = "ProxyAudioDevice.driver"
     private static let driverServiceHelperName = "com.apple.audio.Core-Audio-Driver-Service.helper"
 
-    private static var legacyRouterDriverBundleNames: [String] {
-        [
-            legacyRouterDriverBundleName,
-            legacyProxyDriverBundleName
-        ]
+    /// Admin tasks (install, update, uninstall) run one at a time, off the
+    /// main thread.
+    private static let privilegedQueue = DispatchQueue(
+        label: "com.kemuri.Nearfield.privileged-driver-tasks",
+        qos: .userInitiated
+    )
+
+    static func runPrivilegedTask(_ work: @escaping @Sendable () throws -> Void) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            privilegedQueue.async {
+                continuation.resume(with: Result { try work() })
+            }
+        }
     }
 
-    private static var routerDriverBundleNames: [String] {
-        [routerDriverBundleName] + legacyRouterDriverBundleNames
+    /// Legacy bundles in the HAL folder that belong to Nearfield. Another
+    /// product's ProxyAudioDevice.driver (the open-source project Nearfield's
+    /// driver started from) is left alone.
+    private static func legacyRouterDriverBundleNames(
+        in directoryURL: URL = URL(fileURLWithPath: halDriverDirectory, isDirectory: true)
+    ) -> [String] {
+        var names = [legacyRouterDriverBundleName]
+        if isNearfieldLegacyDriver(at: directoryURL.appendingPathComponent(legacyProxyDriverBundleName, isDirectory: true)) {
+            names.append(legacyProxyDriverBundleName)
+        }
+        return names
+    }
+
+    private static func routerDriverBundleNames(
+        in directoryURL: URL = URL(fileURLWithPath: halDriverDirectory, isDirectory: true)
+    ) -> [String] {
+        [routerDriverBundleName] + legacyRouterDriverBundleNames(in: directoryURL)
+    }
+
+    static func isNearfieldLegacyDriver(at bundleURL: URL, fileManager: FileManager = .default) -> Bool {
+        let infoURL = bundleURL.appendingPathComponent("Contents/Info.plist", isDirectory: false)
+        guard let data = fileManager.contents(atPath: infoURL.path),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+            return false
+        }
+        if let identifier = info["CFBundleIdentifier"] as? String, identifier.hasPrefix("com.kemuri.") {
+            return true
+        }
+        // Older builds kept the upstream identifier; their binary still names Nearfield.
+        guard let executable = info["CFBundleExecutable"] as? String,
+              isSafeBundleExecutableName(executable),
+              let binary = fileManager.contents(
+                atPath: bundleURL.appendingPathComponent("Contents/MacOS/\(executable)").path
+              ) else {
+            return false
+        }
+        return ["com.kemuri.", "StudioPair", "NearfieldAudio"].contains { marker in
+            binary.range(of: Data(marker.utf8)) != nil
+        }
     }
 
     func buildRouterDriver() throws -> String {
@@ -92,6 +141,16 @@ final class DriverInstaller {
         let destinationPath = "\(Self.halDriverDirectory)/\(Self.routerDriverBundleName)"
         let temporaryPath = "\(destinationPath).nearfield-installing"
         let cleanupPaths = installCleanupPaths(temporaryPath: temporaryPath)
+        // Distribution builds install the Developer ID signed driver as
+        // shipped, after checking its signature, and check the root-owned
+        // copy again before it goes live. Development builds sign ad hoc.
+        let requirement = BuildConfiguration.isDistribution ? try Self.bundledDriverRequirement() : nil
+        if let requirement {
+            try Self.verifySignature(atPath: sourcePath, requirement: requirement)
+        }
+        let signingCommand = requirement.map {
+            "/usr/bin/codesign --verify --deep --strict -R \(shellQuoted("=" + $0)) \(shellQuoted(temporaryPath))"
+        } ?? "/usr/bin/codesign --force --deep --sign - \(shellQuoted(temporaryPath))"
         let command = [
             "/bin/mkdir -p \(shellQuoted(Self.halDriverDirectory))",
             driverServiceRestartCommand(),
@@ -99,7 +158,7 @@ final class DriverInstaller {
             "/usr/bin/ditto \(shellQuoted(sourcePath)) \(shellQuoted(temporaryPath))",
             "/usr/bin/xattr -cr \(shellQuoted(temporaryPath)) || true",
             "/usr/sbin/chown -R root:wheel \(shellQuoted(temporaryPath))",
-            "/usr/bin/codesign --force --deep --sign - \(shellQuoted(temporaryPath))",
+            signingCommand,
             "/usr/bin/xattr -cr \(shellQuoted(temporaryPath)) || true",
             removeCommand(paths: installedRouterDriverPaths()),
             "/bin/mv \(shellQuoted(temporaryPath)) \(shellQuoted(destinationPath))",
@@ -107,6 +166,48 @@ final class DriverInstaller {
             coreAudioRestartCommand()
         ].joined(separator: "\n")
         try runPrivilegedShell(command)
+    }
+
+    /// The code requirement for the bundled driver: Nearfield's driver
+    /// identifier, signed with Developer ID by the same team as this app.
+    static func bundledDriverRequirement() throws -> String {
+        guard let team = currentTeamIdentifier() else {
+            throw DriverInstallerError.untrustedDriverSignature("Nearfield.app")
+        }
+        return driverRequirement(teamIdentifier: team)
+    }
+
+    static func driverRequirement(teamIdentifier: String) -> String {
+        "anchor apple generic and identifier \"\(routerDriverBundleIdentifier)\" and " +
+            "certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+    }
+
+    static func verifySignature(atPath path: String, requirement requirementText: String) throws {
+        var staticCode: SecStaticCode?
+        var requirement: SecRequirement?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &staticCode) == errSecSuccess,
+              let staticCode,
+              SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
+              let requirement else {
+            throw DriverInstallerError.untrustedDriverSignature(path)
+        }
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate | kSecCSCheckNestedCode)
+        guard SecStaticCodeCheckValidity(staticCode, flags, requirement) == errSecSuccess else {
+            throw DriverInstallerError.untrustedDriverSignature(path)
+        }
+    }
+
+    private static func currentTeamIdentifier() -> String? {
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        var information: CFDictionary?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let information = information as? [String: Any] else {
+            return nil
+        }
+        return information[kSecCodeInfoTeamIdentifier as String] as? String
     }
 
     func removeAllInstalledDriversAndRestartCoreAudio() throws {
@@ -146,15 +247,20 @@ final class DriverInstaller {
         return .installFailed(message)
     }
 
-    static func installedDriverRemovalPaths() -> [String] {
-        routerDriverBundleNames
-            .map { "\(halDriverDirectory)/\($0)" }
-            .flatMap { driverPath in
+    /// Nearfield's bundles in the HAL folder, plus the staging copies its
+    /// installers leave behind (those suffixes are only ever Nearfield's).
+    static func installedDriverRemovalPaths(
+        in directoryURL: URL = URL(fileURLWithPath: halDriverDirectory, isDirectory: true)
+    ) -> [String] {
+        let directory = directoryURL.path
+        let ownedNames = Set(routerDriverBundleNames(in: directoryURL))
+        return [routerDriverBundleName, legacyRouterDriverBundleName, legacyProxyDriverBundleName]
+            .map { bundleName in (bundleName, "\(directory)/\(bundleName)") }
+            .flatMap { bundleName, driverPath in
                 [
                     "\(driverPath).studiopair-installing",
-                    "\(driverPath).nearfield-installing",
-                    driverPath
-                ]
+                    "\(driverPath).nearfield-installing"
+                ] + (ownedNames.contains(bundleName) ? [driverPath] : [])
             }
     }
 
@@ -178,7 +284,7 @@ final class DriverInstaller {
             return .current
         }
 
-        let hasLegacyDriver = legacyRouterDriverBundleNames.contains { bundleName in
+        let hasLegacyDriver = legacyRouterDriverBundleNames(in: directoryURL).contains { bundleName in
             fileManager.fileExists(
                 atPath: directoryURL.appendingPathComponent(bundleName, isDirectory: true).path
             )
@@ -417,7 +523,7 @@ final class DriverInstaller {
     }
 
     private func installedRouterDriverPaths() -> [String] {
-        Self.routerDriverBundleNames.map(installedDriverPath(_:))
+        Self.routerDriverBundleNames().map(installedDriverPath(_:))
     }
 
     private func temporaryDriverPaths(for driverPath: String) -> [String] {

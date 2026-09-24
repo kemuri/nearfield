@@ -69,9 +69,9 @@ extension AppDelegate {
             self.driverInstallState = .installing(.authorizationAndInstallation)
             self.refreshStatus()
             do {
-                try await Task.detached(priority: .userInitiated) {
+                try await DriverInstaller.runPrivilegedTask {
                     try DriverInstaller().installBuiltRouterDriver(at: driverPath)
-                }.value
+                }
             } catch {
                 self.restorePrimaryWindowFocusAfterPrivilegedInstall()
                 let stage: DriverInstallFailureStage
@@ -88,6 +88,11 @@ extension AppDelegate {
 
             let currentDriverIsInstalledOnDisk =
                 await DriverInstaller.waitForCurrentRouterDriverOnDisk()
+            self.refreshDriverInstallState()
+            // Core Audio restarted with the new driver.
+            self.routerDriverManager.resetAppliedSettings()
+            self.preparedRouterDisplayUIDs = nil
+            self.lastAppliedRouterRouteRules = nil
             guard currentDriverIsInstalledOnDisk else {
                 self.failDriverInstallAttempt(
                     RouterAudioDriverError.notInstalled,
@@ -184,7 +189,8 @@ extension AppDelegate {
         }
         driverInstallState = state
         isInstallingDriver = false
-        refreshDriverUpdateAvailability()
+        refreshDriverInstallState()
+        observeRouterStatus()
         updateDynamicRoutingRulesLifecycle()
         refreshStatus()
     }

@@ -64,7 +64,9 @@ struct SettingsOnboardingView: View {
                                     ActionSettingRow(
                                         title: "Uninstall Nearfield",
                                         buttonTitle: "Uninstall",
-                                        destructive: true
+                                        destructive: true,
+                                        // Installing and uninstalling never overlap.
+                                        enabled: !model.isInstallingDriver && !model.isRemovingDriver
                                     ) {
                                         model.removeDrivers()
                                     }
@@ -758,7 +760,7 @@ private struct DriverStatusRow: View {
                 model.installDriver()
             }
             .controlSize(.small)
-            .disabled(model.isInstallingDriver)
+            .disabled(model.isInstallingDriver || model.isRemovingDriver)
         }
         .padding(.horizontal, 10)
         .frame(height: 42)

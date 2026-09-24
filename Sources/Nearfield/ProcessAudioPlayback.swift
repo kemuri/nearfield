@@ -26,6 +26,11 @@ enum ProcessAudioPlayback {
         return false
     }
 
+    @available(macOS 14.2, *)
+    static func processObjects() -> [AudioObjectID] {
+        objectIDs(on: AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyProcessObjectList)
+    }
+
     static func activeOutputs() -> [RouterConnectionHandoff.Playback] {
         guard #available(macOS 14.2, *) else { return [] }
         return activeOutputs(using: .coreAudio)

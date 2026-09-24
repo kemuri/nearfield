@@ -199,6 +199,34 @@ final class RouterConnectionHandoffTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(audio.activationTimes[0], 1)
     }
 
+    func testChangeNotificationsReplaceSecondlyPollingWhileIdle() async throws {
+        let session = AudioSession()
+        session.readyAt = 0.3
+        var waits: [RouterConnectionHandoff.Wait] = []
+        var environment = session.environment
+        environment.waitForChange = { reason in
+            waits.append(reason)
+            switch reason {
+            case .readiness:
+                session.now += 0.1
+            case .playbackIdle:
+                // The next notification: an app starts on the old output 8 minutes later.
+                session.now += 480
+                session.play(on: "macbook")
+            case .playbackConfirmation:
+                session.now += 1
+            }
+        }
+
+        try await session.handoff.run(environment)
+
+        XCTAssertEqual(waits.filter { $0 == .readiness }.count, 3)
+        XCTAssertEqual(waits.filter { $0 == .playbackIdle }.count, 1)
+        XCTAssertEqual(waits.filter { $0 == .playbackConfirmation }.count, 1)
+        XCTAssertEqual(session.selections, ["nearfield", "macbook", "nearfield"])
+        XCTAssertEqual(session.playback.map(\.outputUIDs), [["nearfield"]])
+    }
+
     func testReadinessRequiresExactTargetsOrderAndMode() {
         let status = "ready\nstereo\nleft\nright"
         XCTAssertTrue(RouterAudioDriverManager.readinessMatches(status, deviceUIDs: ["left", "right"], mode: .stereo))

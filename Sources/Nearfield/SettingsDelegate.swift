@@ -142,6 +142,7 @@ protocol SettingsDriverControlling: AnyObject {
     func settingsDriverInstalled() -> Bool
     func settingsDriverUpdateAvailable() -> Bool
     func settingsIsInstallingDriver() -> Bool
+    func settingsIsRemovingDriver() -> Bool
     func settingsDriverInstallState() -> DriverInstallState
     func settingsResetDriverInstallState()
     func settingsInstallDriver(_ request: DriverInstallRequest)
@@ -159,6 +160,8 @@ protocol SettingsRoutingControlling: AnyObject {
     func settingsSetAppRoutingEnabled(_ enabled: Bool)
     func settingsAppRoutingAppBundleIDs() -> [String]?
     func settingsSetAppRoutingAppBundleIDs(_ bundleIDs: [String])
+    /// The app and the helper apps that play its audio, once Nearfield found them.
+    func settingsRoutingBundleIdentifiers(for bundleID: String) -> [String]?
     func settingsSpatialRoutingChannels(for requests: [AppAudioRouteRequest]) -> [String: SpatialRoutingChannel]
     func settingsRoutingRules() -> String
     func settingsSetRoutingRules(_ rules: String)

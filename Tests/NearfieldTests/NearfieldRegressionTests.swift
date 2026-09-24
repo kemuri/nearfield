@@ -1106,16 +1106,99 @@ final class NearfieldRegressionTests: XCTestCase {
         )
     }
 
-    func testDriverRemovalPathsCoverCurrentAndLegacyBundlesOnce() {
-        let paths = DriverInstaller.installedDriverRemovalPaths()
+    func testDriverRemovalPathsCoverCurrentAndLegacyBundlesOnce() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldDriverRemovalTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let root = rootURL.path
 
+        var paths = DriverInstaller.installedDriverRemovalPaths(in: rootURL)
         XCTAssertEqual(paths.count, Set(paths).count)
-        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/NearfieldAudioDevice.driver"))
-        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/StudioPairRouterAudioDevice.driver"))
-        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver"))
-        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/NearfieldAudioDevice.driver.nearfield-installing"))
-        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/StudioPairRouterAudioDevice.driver.studiopair-installing"))
-        XCTAssertTrue(paths.contains("/Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver.nearfield-installing"))
+        XCTAssertTrue(paths.contains("\(root)/NearfieldAudioDevice.driver"))
+        XCTAssertTrue(paths.contains("\(root)/StudioPairRouterAudioDevice.driver"))
+        XCTAssertTrue(paths.contains("\(root)/NearfieldAudioDevice.driver.nearfield-installing"))
+        XCTAssertTrue(paths.contains("\(root)/StudioPairRouterAudioDevice.driver.studiopair-installing"))
+        XCTAssertTrue(paths.contains("\(root)/ProxyAudioDevice.driver.nearfield-installing"))
+        // Another product's ProxyAudioDevice.driver is not Nearfield's to remove.
+        try makeDriverBundle(at: rootURL, name: "ProxyAudioDevice.driver", bundleIdentifier: "com.example.ProxyAudioDevice")
+        paths = DriverInstaller.installedDriverRemovalPaths(in: rootURL)
+        XCTAssertFalse(paths.contains("\(root)/ProxyAudioDevice.driver"))
+
+        try fileManager.removeItem(at: rootURL.appendingPathComponent("ProxyAudioDevice.driver"))
+        try makeDriverBundle(at: rootURL, name: "ProxyAudioDevice.driver", bundleIdentifier: "com.kemuri.StudioPairRouterAudioDevice")
+        paths = DriverInstaller.installedDriverRemovalPaths(in: rootURL)
+        XCTAssertEqual(paths.count, Set(paths).count)
+        XCTAssertTrue(paths.contains("\(root)/ProxyAudioDevice.driver"))
+    }
+
+    func testLegacyProxyDriverIsNearfieldsOnlyWhenItNamesNearfield() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("NearfieldLegacyDriverTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: rootURL)
+        }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        let upstream = try makeDriverBundle(
+            at: rootURL,
+            name: "Upstream.driver",
+            bundleIdentifier: "com.example.ProxyAudioDevice",
+            binary: Data("proxy audio device".utf8)
+        )
+        XCTAssertFalse(DriverInstaller.isNearfieldLegacyDriver(at: upstream))
+
+        let renamedIdentifier = try makeDriverBundle(
+            at: rootURL,
+            name: "Nearfield.driver",
+            bundleIdentifier: "com.kemuri.StudioPairRouterAudioDevice"
+        )
+        XCTAssertTrue(DriverInstaller.isNearfieldLegacyDriver(at: renamedIdentifier))
+
+        let upstreamIdentifier = try makeDriverBundle(
+            at: rootURL,
+            name: "OldNearfield.driver",
+            bundleIdentifier: "com.example.ProxyAudioDevice",
+            binary: Data("...StudioPair router...".utf8)
+        )
+        XCTAssertTrue(DriverInstaller.isNearfieldLegacyDriver(at: upstreamIdentifier))
+
+        let unsafeExecutable = try makeDriverBundle(
+            at: rootURL,
+            name: "Unsafe.driver",
+            bundleIdentifier: "com.example.ProxyAudioDevice",
+            executable: "../../escape"
+        )
+        XCTAssertFalse(DriverInstaller.isNearfieldLegacyDriver(at: unsafeExecutable))
+        XCTAssertFalse(DriverInstaller.isNearfieldLegacyDriver(at: rootURL.appendingPathComponent("Missing.driver")))
+    }
+
+    @discardableResult
+    private func makeDriverBundle(
+        at rootURL: URL,
+        name: String,
+        bundleIdentifier: String,
+        executable: String = "Driver",
+        binary: Data = Data()
+    ) throws -> URL {
+        let bundleURL = rootURL.appendingPathComponent(name, isDirectory: true)
+        let contentsURL = bundleURL.appendingPathComponent("Contents", isDirectory: true)
+        let macOSURL = contentsURL.appendingPathComponent("MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: macOSURL, withIntermediateDirectories: true)
+        let info: [String: Any] = [
+            "CFBundleIdentifier": bundleIdentifier,
+            "CFBundleExecutable": executable
+        ]
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            .write(to: contentsURL.appendingPathComponent("Info.plist"))
+        if !executable.contains("/") {
+            try binary.write(to: macOSURL.appendingPathComponent(executable))
+        }
+        return bundleURL
     }
 
     func testDriverDiskStateRejectsLegacyAndMalformedCurrentDrivers() throws {
@@ -1129,11 +1212,20 @@ final class NearfieldRegressionTests: XCTestCase {
 
         XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .missing)
 
-        let legacyURL = rootURL.appendingPathComponent(
-            "ProxyAudioDevice.driver",
-            isDirectory: true
+        // An unrelated ProxyAudioDevice.driver does not count as Nearfield's.
+        let foreignURL = try makeDriverBundle(
+            at: rootURL,
+            name: "ProxyAudioDevice.driver",
+            bundleIdentifier: "com.example.ProxyAudioDevice"
         )
-        try fileManager.createDirectory(at: legacyURL, withIntermediateDirectories: true)
+        XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .missing)
+        try fileManager.removeItem(at: foreignURL)
+
+        try makeDriverBundle(
+            at: rootURL,
+            name: "ProxyAudioDevice.driver",
+            bundleIdentifier: "com.kemuri.StudioPairRouterAudioDevice"
+        )
         XCTAssertEqual(DriverInstaller.routerDriverDiskState(in: rootURL), .legacy)
 
         let currentURL = rootURL.appendingPathComponent(

@@ -36,6 +36,8 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
 
     private let model: OnboardingModel
     private weak var hostingView: NSView?
+    /// Called after the window closed, so its owner can release it.
+    var onClose: (() -> Void)?
 
     init(delegate: SettingsDelegate) {
         let model = OnboardingModel(delegate: delegate)
@@ -49,6 +51,8 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
             defer: false
         )
         window.title = ""
+        // The controller owns the window; releasing the controller releases it.
+        window.isReleasedWhenClosed = false
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         // Keep the title bar draggable, but let arrangement cards receive
@@ -191,6 +195,8 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         model.headerPaused = true
         model.setWindowVisible(false)
+        model.cancelInstallSimulation()
+        onClose?()
     }
 
     private func handleStepShortcut(_ event: NSEvent) -> Bool {

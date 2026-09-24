@@ -5793,6 +5793,9 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
         CFDictionarySetValue(status, CFSTR("driverVersion"), version);
     }
     setDictionaryInteger(status, CFSTR("protocolVersion"), kNearfieldProtocolVersion);
+    // Changes whenever the driver restarts (settings sent only to a previous
+    // instance, such as process routes, must be sent again).
+    setDictionaryInteger(status, CFSTR("instance"), (int64_t)(initializedHostTime & 0x7fffffffffffffffULL));
     setDictionaryStrings(status, CFSTR("capabilities"),
                          {"driverOwnedTargetAggregate", "threeDisplayTargetAggregate", "targetOutputReadiness",
                           "settingsDictionary", "statusNotifications", "processRoutes", "latencyReporting"});

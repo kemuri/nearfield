@@ -24,9 +24,20 @@ extension AppDelegate: SettingsDelegate {
     }
 
     func settingsRefreshAudioState() async -> Bool {
-        let isReady = await refreshCachedAudioState()
+        // The readiness probe process runs at launch and after installing or
+        // removing the driver; otherwise Core Audio is read directly.
+        guard coreAudioAvailability == .available else {
+            let isReady = await refreshCachedAudioState()
+            refreshStatus()
+            return isReady
+        }
+        audioManager.invalidateCachedDevices()
+        cachedAudioState = audioManager.currentState()
+        cachedRouterDriverAvailability = currentRouterDriverAvailability(coreAudioIsReady: true)
+        cachedRouterDefaultOutput = cachedRouterDriverAvailability.isLoaded &&
+            routerDriverManager.isRouterDefaultOutput()
         refreshStatus()
-        return isReady
+        return true
     }
 
     func settingsMode() -> NearfieldOutputMode {
@@ -84,6 +95,10 @@ extension AppDelegate: SettingsDelegate {
         isInstallingDriver
     }
 
+    func settingsIsRemovingDriver() -> Bool {
+        isRemovingDriver
+    }
+
     func settingsDriverInstallState() -> DriverInstallState {
         driverInstallState
     }
@@ -134,7 +149,50 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsSetAppRoutingAppBundleIDs(_ bundleIDs: [String]) {
         NearfieldPreferences.setAppRoutingAppBundleIDs(bundleIDs)
+        refreshRoutingAppCatalog()
         refreshStatus()
+    }
+
+    func settingsRoutingBundleIdentifiers(for bundleID: String) -> [String]? {
+        routingAppCatalog.routingBundleIdentifiers(for: bundleID)
+    }
+
+    /// Routed apps: the ones listed in Settings and those with window routes.
+    func routedPrimaryBundleIDs() -> [String] {
+        let windowRouted = AppRoutingRules.parse(currentRoutingRules())
+            .filter { rule in
+                let destination = rule.destination.trimmingCharacters(in: .whitespaces).lowercased()
+                return AppRoutingRules.isWindowScopedDestination(destination) && !destination.contains(":")
+            }
+            .map(\.bundleID)
+        return ((NearfieldPreferences.appRoutingAppBundleIDs() ?? []) + windowRouted).uniquePreservingOrder()
+    }
+
+    func refreshRoutingAppCatalog() {
+        routingAppCatalog.refresh(bundleIDs: routedPrimaryBundleIDs())
+    }
+
+    /// Adds rules for helper apps found since an app was routed, so their
+    /// audio follows the app's window too.
+    func reconcileRoutingAliases() {
+        let rawRules = currentRoutingRules()
+        let parsedRules = AppRoutingRules.parse(rawRules)
+        var nextRules = rawRules
+        for rule in parsedRules where AppRoutingRules.isWindowScopedDestination(rule.destination) {
+            guard !rule.destination.contains(":"),
+                  let identifiers = routingAppCatalog.routingBundleIdentifiers(for: rule.bundleID) else {
+                continue
+            }
+            nextRules = AppRoutingRules.settingApp(
+                primaryBundleID: rule.bundleID,
+                aliasBundleIDs: identifiers.filter { $0 != rule.bundleID },
+                enabled: true,
+                in: nextRules
+            )
+        }
+        if nextRules != rawRules {
+            settingsSetRoutingRules(nextRules)
+        }
     }
 
     func settingsSpatialRoutingChannels(for requests: [AppAudioRouteRequest]) -> [String: SpatialRoutingChannel] {
@@ -149,6 +207,8 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsSetRoutingRules(_ rules: String) {
         NearfieldPreferences.setAppRoutingRules(rules)
+        followedRouteRules = nil
+        refreshRoutingAppCatalog()
         do {
             if routerDriverManager.isInstalled {
                 try applyCurrentRouterRouteRulesIfNeeded(force: true)
@@ -208,10 +268,9 @@ extension AppDelegate: SettingsDelegate {
         NearfieldPreferences.setBalance(clamped)
         do {
             if routerDriverManager.isInstalled {
+                // Balance lives in Nearfield's channel volumes; the displays
+                // stay as they were prepared.
                 try routerDriverManager.setBalance(Float32(clamped))
-                if routerDriverManager.isRouterDefaultOutput() {
-                    _ = try prepareDisplaysForVirtualOutputActivation()
-                }
             } else {
                 let configuration = currentConfiguration()
                 try audioManager.setDisplayBalance(
@@ -288,7 +347,9 @@ extension AppDelegate: SettingsDelegate {
     }
 
     func settingsRemoveEverything() {
-        guard let scope = promptForUninstallScope() else { return }
+        // Installing and uninstalling never overlap.
+        guard !isInstallingDriver, !isRemovingDriver,
+              let scope = promptForUninstallScope() else { return }
         Task { @MainActor [weak self] in
             guard let self, await self.removeDriversAndTargets() else { return }
             if scope == .driversAndApp {
@@ -301,11 +362,11 @@ extension AppDelegate: SettingsDelegate {
     @discardableResult
     func removeDriversAndTargets() async -> Bool {
         cancelConnectionHandoff()
-        dynamicRoutingRulesTask?.cancel()
-        dynamicRoutingRulesTask = nil
+        stopDynamicRoutingRulesTask()
         lastAppliedRouterRouteRules = nil
         NearfieldPreferences.clearAppRoutingEnabled()
         isRemovingDriver = true
+        refreshStatus()
         coreAudioStartupTask?.cancel()
         pendingAudioStateChangeTask?.cancel()
         pendingAudioStateChangeTask = nil
@@ -322,9 +383,9 @@ extension AppDelegate: SettingsDelegate {
                     )
                 },
                 removeDriver: {
-                    try await Task.detached(priority: .userInitiated) {
+                    try await DriverInstaller.runPrivilegedTask {
                         try DriverInstaller().removeAllInstalledDriversAndRestartCoreAudio()
-                    }.value
+                    }
                 },
                 finish: { [self] in
                     await finishAudioCleanupAfterDriverRemoval(
@@ -334,6 +395,7 @@ extension AppDelegate: SettingsDelegate {
             )
         } catch {
             isRemovingDriver = false
+            refreshDriverInstallState()
             showError(error)
             refreshStatus()
             resumeCoreAudioServicesAfterDriverRemoval()
@@ -341,6 +403,8 @@ extension AppDelegate: SettingsDelegate {
         }
 
         isRemovingDriver = false
+        refreshDriverInstallState()
+        routerDriverManager.resetAppliedSettings()
         refreshStatus()
         resumeCoreAudioServicesAfterDriverRemoval()
         return true
@@ -363,7 +427,7 @@ extension AppDelegate: SettingsDelegate {
             try performSynchronizedAudioUpdate {
                 try restoreDisplaysAfterProxyDeactivation()
                 if shouldRestorePhysicalDefault {
-                    _ = try audioManager.selectFallbackOutputAsDefault()
+                    _ = try audioManager.selectFallbackOutputAsDefault(preferredUID: lastNonNearfieldOutputUID)
                 }
             }
         } catch {
@@ -459,7 +523,7 @@ extension AppDelegate: SettingsDelegate {
         repeat {
             audioManager.invalidateCachedDevices()
             do {
-                if try audioManager.selectFallbackOutputAsDefault() {
+                if try audioManager.selectFallbackOutputAsDefault(preferredUID: lastNonNearfieldOutputUID) {
                     return
                 }
             } catch {
