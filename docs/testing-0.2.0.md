@@ -98,9 +98,10 @@ above with the preference set.
 - Daily use for a few days with `driverDiagnostics` on.
 - 2-hour soaks at 48, 88.2, and 96 kHz (above).
 - Drag a playing window between displays: the sound moves within 2 seconds.
-- Play a YouTube video in Safari, pause it for more than 5 seconds (the displays
+- Play a YouTube video in Safari, pause it for more than 2 minutes (the displays
   stop), then resume: sound and picture stay in sync. Check `coldStartSkippedMilliseconds`
-  in the driver status grows by about 400 ms per resume.
+  in the driver status grows by about 400 ms per resume. After a shorter pause,
+  nothing is skipped (the displays keep running for 2 minutes after the last sound).
 - Set an app (for example Music, or a call app's speaker setting) to play on one
   Studio Display at about 20% volume, then connect the second display. That
   app must not get louder; Nearfield plays at a similar level. Once the app
@@ -115,7 +116,7 @@ above with the preference set.
 Three displays and macOS 14, 15, and 26 cannot be tested on this setup; the
 automated tests cover their logic. One path is new: before macOS 14.2 Nearfield
 cannot tell which app plays on a display, so it raises the displays only once
-nothing is running on them (after about 5 seconds of silence).
+nothing is running on them (about 2 minutes after the last sound).
 
 ## 5. Results so far
 
@@ -142,7 +143,8 @@ host process as another app playing on the displays, the volume shift
 relied on conversions Core Audio does not pass to the driver, and video in
 Safari fell out of sync after a pause: the audio written while the displays
 restarted (about 440 ms) was played late. The driver now skips it, as 1.0.8
-did, so the start of a sound after more than 5 seconds of quiet is cut.
+did, so the start of a sound after more than 2 minutes of quiet is cut (the
+displays now keep running 2 minutes after the last sound, instead of 5 seconds).
 
 ## 6. Rollback
 

@@ -47,9 +47,11 @@ constexpr AudioObjectPropertySelector kNearfieldPropertySettings = 'nfst';
 constexpr AudioObjectPropertySelector kNearfieldPropertyStatus = 'nfss';
 constexpr int kNearfieldProtocolVersion = 1;
 
-// Keep the displays running this long after the last sound so the next one
-// does not wait for another cold start.
-constexpr double kOutputKeepAliveSeconds = 5.0;
+// Keep the displays running this long after the last sound. Starting them
+// again takes about 440 ms, and the audio written meanwhile is skipped to
+// keep the latency (and video) in step, so the start of the next sound would
+// be cut. The driver's output costs about 0.3-0.5% CPU while it runs.
+constexpr double kOutputKeepAliveSeconds = 120.0;
 // Hide Nearfield once fewer than two displays have been active this long.
 constexpr double kDisplayLossHideSeconds = 1.0;
 // Core Audio enumerates USB displays some seconds after boot; do not hide
