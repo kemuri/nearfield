@@ -102,6 +102,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var waitingDisplayPlaybackMonitor: ProcessPlaybackMonitor?
     var waitingDisplayObservers: [CoreAudioPropertyObserver] = []
     var routerStatusNotificationsAvailable = false
+    /// Whether Nearfield opens at login, while the Settings window is open.
+    var cachedOpenAtLogin: Bool?
     var handoffChangeSignal: ChangeSignal?
     var handoffPlaybackMonitor: ProcessPlaybackMonitor?
     /// Only the active user's copy of Nearfield configures the driver.

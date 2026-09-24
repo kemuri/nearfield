@@ -281,6 +281,9 @@ final class OnboardingModel: ObservableObject {
     private var displayIdentificationTask: Task<Void, Never>?
     private var spatialRoutingActivityTask: Task<Void, Never>?
     private var isWindowVisible = false
+    /// Title and icon per bundle ID while this window exists: refreshes run
+    /// on every audio change, and routing rules also name helper apps.
+    private var spatialRoutingAppCache: [String: SpatialRoutingApp] = [:]
     private var installScenario: OnboardingInstallScenario = .smooth
     private var allowsMissingStudioDisplaysForLiveInstall = false
 
@@ -1242,6 +1245,18 @@ final class OnboardingModel: ObservableObject {
     }
 
     private func spatialRoutingApp(bundleIdentifier: String) -> SpatialRoutingApp {
+        if var cached = spatialRoutingAppCache[bundleIdentifier] {
+            cached.routingBundleIdentifiers = routingBundleIdentifiers(for: bundleIdentifier)
+            cached.isEnabled = true
+            cached.activeChannel = nil
+            return cached
+        }
+        let app = makeSpatialRoutingApp(bundleIdentifier: bundleIdentifier)
+        spatialRoutingAppCache[bundleIdentifier] = app
+        return app
+    }
+
+    private func makeSpatialRoutingApp(bundleIdentifier: String) -> SpatialRoutingApp {
         let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
         return SpatialRoutingApp(
             title: url.map { Self.appTitle(url: $0) } ?? bundleIdentifier,

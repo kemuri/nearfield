@@ -90,6 +90,8 @@ extension AppDelegate {
     /// header and the app icons are released. First-run onboarding keeps its
     /// window so it resumes at the same step.
     func makeOnboardingWindowController() -> OnboardingWindowController {
+        // It may have changed in System Settings while the window was closed.
+        cachedOpenAtLogin = nil
         let controller = OnboardingWindowController(delegate: self)
         controller.onClose = { [weak self, weak controller] in
             DispatchQueue.main.async {
@@ -128,6 +130,7 @@ extension AppDelegate {
     #endif
 
     func setOpenAtLogin(_ enabled: Bool) {
+        cachedOpenAtLogin = nil
         do {
             if enabled {
                 try SMAppService.mainApp.register()

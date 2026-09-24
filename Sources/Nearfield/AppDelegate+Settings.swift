@@ -52,8 +52,16 @@ extension AppDelegate: SettingsDelegate {
         NearfieldPreferences.displayOrderUIDs()
     }
 
+    /// Asking ServiceManagement is a round trip to another process, and the
+    /// Settings window refreshes on every audio change: read it when the
+    /// window opens and after changing it.
     func settingsOpenAtLogin() -> Bool {
-        SMAppService.mainApp.status == .enabled
+        if let cachedOpenAtLogin {
+            return cachedOpenAtLogin
+        }
+        let enabled = SMAppService.mainApp.status == .enabled
+        cachedOpenAtLogin = enabled
+        return enabled
     }
 
     func settingsSetOpenAtLogin(_ enabled: Bool) {
