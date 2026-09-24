@@ -280,13 +280,14 @@ final class ChangeSignalTests: XCTestCase {
     }
 }
 
+@MainActor
 final class WindowRouteFollowerTests: XCTestCase {
-    @MainActor final class Published {
+    final class Published {
         var rules: [String] = []
     }
 
     func testPublishesOnlyWhenResolvedRulesChange() async throws {
-        let published = await Published()
+        let published = Published()
         let follower = WindowRouteFollower { rules in published.rules.append(rules) }
         follower.update(runningApplications: [], displayTargets: [], rawRules: "com.apple.Safari=left")
         follower.start()
@@ -300,26 +301,166 @@ final class WindowRouteFollowerTests: XCTestCase {
         follower.stop()
         try await Task.sleep(nanoseconds: 100_000_000)
 
-        let rules = await published.rules
+        let rules = published.rules
         XCTAssertEqual(rules, ["com.apple.Safari=left", "com.apple.Safari=right"])
     }
 
     func testChecksNothingWhileStopped() async throws {
-        let published = await Published()
+        let published = Published()
         let follower = WindowRouteFollower { rules in published.rules.append(rules) }
         follower.update(runningApplications: [], displayTargets: [], rawRules: "com.apple.Safari=left")
         follower.checkNow()
         try await Task.sleep(nanoseconds: 100_000_000)
 
-        let rules = await published.rules
+        let rules = published.rules
         XCTAssertTrue(rules.isEmpty)
+    }
+
+    /// Removing the last window rule stops following; a result already on its
+    /// way to the main thread must not reinstall the old route.
+    func testStopDiscardsAResultAlreadyOnItsWay() async throws {
+        let published = Published()
+        let follower = WindowRouteFollower { rules in published.rules.append(rules) }
+        follower.update(runningApplications: [], displayTargets: [], rawRules: "com.apple.Safari=left")
+        follower.start()
+        try await waitForPublished(published, count: 1)
+
+        // The main thread is busy here, so the new result waits in its queue.
+        follower.update(runningApplications: [], displayTargets: [], rawRules: "com.apple.Safari=right")
+        follower.waitForQueuedWork()
+        follower.stop()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(published.rules, ["com.apple.Safari=left"])
+    }
+
+    func testResultForAnOlderConfigurationIsNotDelivered() async throws {
+        let published = Published()
+        let follower = WindowRouteFollower { rules in published.rules.append(rules) }
+        follower.update(runningApplications: [], displayTargets: [], rawRules: "com.apple.Safari=left")
+        follower.start()
+        try await waitForPublished(published, count: 1)
+
+        follower.update(runningApplications: [], displayTargets: [], rawRules: "com.apple.Safari=right")
+        follower.waitForQueuedWork()
+        follower.update(runningApplications: [], displayTargets: [], rawRules: "com.apple.Safari=muted")
+        follower.waitForQueuedWork()
+        try await waitForPublished(published, count: 2)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        follower.stop()
+
+        XCTAssertEqual(published.rules, ["com.apple.Safari=left", "com.apple.Safari=muted"])
     }
 
     private func waitForPublished(_ published: Published, count: Int) async throws {
         for _ in 0..<200 {
-            if await published.rules.count >= count { return }
+            if published.rules.count >= count { return }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Expected \(count) published rule sets.")
+    }
+}
+
+@MainActor
+final class RouterOutputActivationTests: XCTestCase {
+    @MainActor final class Displays {
+        var events: [String] = []
+        var isRaised = false
+        var routerIsDefault = false
+        var failing: String?
+
+        func step(_ name: String, _ work: () -> Void = {}) throws {
+            events.append(name)
+            if failing == name { throw NearfieldError.notEnoughStudioDisplays(1) }
+            work()
+        }
+
+        func makeActivation() -> RouterOutputActivation {
+            RouterOutputActivation(operations: .init(
+                currentRouterVolume: { 0.5 },
+                captureDisplays: { try self.step("capture"); return 0.4 },
+                setRouterVolume: { _, _ in try self.step("volume") },
+                selectRouter: { try self.step("select") { self.routerIsDefault = true } },
+                raiseDisplays: { try self.step("raise") { self.isRaised = true } },
+                restoreDisplays: { try self.step("restore") { self.isRaised = false } },
+                routerIsDefault: { self.routerIsDefault },
+                applyBalance: { try self.step("balance") }
+            ))
+        }
+    }
+
+    func testDisplaysAreRaisedOnlyAfterNearfieldIsSelected() throws {
+        let displays = Displays()
+        let activation = displays.makeActivation()
+
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        XCTAssertEqual(displays.events, ["capture", "volume", "select", "raise"])
+        XCTAssertEqual(activation.preparedDisplayUIDs, ["left", "right"])
+    }
+
+    func testFailedSelectionLeavesTheDisplaysAsTheyWere() {
+        let displays = Displays()
+        displays.failing = "select"
+        let activation = displays.makeActivation()
+
+        XCTAssertThrowsError(try activation.activate(displayUIDs: ["left", "right"]))
+
+        XCTAssertEqual(displays.events, ["capture", "volume", "select", "restore"])
+        XCTAssertFalse(displays.isRaised)
+        XCTAssertNil(activation.preparedDisplayUIDs)
+    }
+
+    func testFailedRaiseRestoresTheDisplays() {
+        let displays = Displays()
+        displays.failing = "raise"
+        let activation = displays.makeActivation()
+
+        XCTAssertThrowsError(try activation.activate(displayUIDs: ["left", "right"]))
+
+        XCTAssertEqual(displays.events.last, "restore")
+        XCTAssertNil(activation.preparedDisplayUIDs)
+    }
+
+    func testPreparedDisplaysOnlyGetTheBalance() throws {
+        let displays = Displays()
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+        displays.events = []
+
+        try activation.activateIfNeeded(displayUIDs: ["left", "right"])
+
+        XCTAssertEqual(displays.events, ["balance"])
+    }
+
+    /// Enabling app routing restores the displays, then configures Nearfield
+    /// again: the displays must be raised again, not skipped as prepared.
+    func testRestoredDisplaysArePreparedAgain() throws {
+        let displays = Displays()
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        try activation.restoreDisplays()
+        XCTAssertFalse(displays.isRaised)
+        displays.events = []
+        try activation.activateIfNeeded(displayUIDs: ["left", "right"])
+
+        XCTAssertEqual(displays.events, ["capture", "volume", "select", "raise"])
+        XCTAssertTrue(displays.isRaised)
+    }
+
+    func testOtherDisplaysOrAnotherOutputActivateAgain() throws {
+        let displays = Displays()
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+        displays.events = []
+
+        try activation.activateIfNeeded(displayUIDs: ["left", "center", "right"])
+        XCTAssertEqual(displays.events.last, "raise")
+
+        displays.events = []
+        displays.routerIsDefault = false
+        try activation.activateIfNeeded(displayUIDs: ["left", "center", "right"])
+        XCTAssertEqual(displays.events, ["capture", "volume", "select", "raise"])
     }
 }

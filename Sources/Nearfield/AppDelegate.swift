@@ -98,8 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
     var cachedRouterDriverAvailability = RouterDriverAvailability(installedOnDisk: false)
     var cachedRouterDefaultOutput = false
-    /// Displays last prepared for Nearfield; nil while Nearfield is not the output.
-    var preparedRouterDisplayUIDs: [String]?
+    lazy var routerOutputActivation = makeRouterOutputActivation()
     var routerStatusNotificationsAvailable = false
     var handoffChangeSignal: ChangeSignal?
     var handoffPlaybackMonitor: ProcessPlaybackMonitor?

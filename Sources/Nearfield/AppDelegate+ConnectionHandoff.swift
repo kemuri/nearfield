@@ -104,7 +104,7 @@ extension AppDelegate {
                     },
                     activate: {
                         try self.performSynchronizedAudioUpdate {
-                            try self.activateConfiguredRouterOutput(currentRouterVolume: self.currentRouterVolumeForContinuity())
+                            try self.activateConfiguredRouterOutput()
                         }
                         self.cachedRouterDefaultOutput = true
                         self.connectionActivationPending = false

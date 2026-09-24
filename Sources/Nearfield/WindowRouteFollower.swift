@@ -6,6 +6,10 @@ import Foundation
 /// and immediately when asked to (playback starts, an app comes to the front,
 /// the Space or the screens change). Window lists are read on its own queue
 /// against cached snapshots of the running apps and the screen-to-display map.
+///
+/// Results are delivered only while they are current: stopping or changing
+/// the configuration discards results computed before, even ones already on
+/// their way to the main thread.
 final class WindowRouteFollower: @unchecked Sendable {
     typealias RunningApplication = WindowAudioRouteResolver.RunningApplication
     typealias DisplayTarget = WindowAudioRouteResolver.DisplayTarget
@@ -13,23 +17,34 @@ final class WindowRouteFollower: @unchecked Sendable {
     static let checkInterval: TimeInterval = 2
     static let immediateCheckCoalescing: DispatchTimeInterval = .milliseconds(50)
 
+    private struct Configuration: Equatable {
+        var runningApplications: [RunningApplication] = []
+        var displayTargets: [DisplayTarget] = []
+        var rawRules = ""
+    }
+
     private let queue = DispatchQueue(label: "com.kemuri.Nearfield.window-routes", qos: .utility)
     private let publish: @MainActor (String) -> Void
 
+    // Shared between threads; protected by |lock|. The generation changes
+    // with the configuration and when following starts or stops.
+    private let lock = NSLock()
+    private var configuration = Configuration()
+    private var generation: UInt64 = 0
+    private var isActive = false
+
     // Confined to |queue|.
-    private var runningApplications: [RunningApplication] = []
-    private var displayTargets: [DisplayTarget] = []
-    private var rawRules = ""
+    private var checkedConfiguration = Configuration()
     private var timer: DispatchSourceTimer?
-    private var lastResolvedRules: String?
+    private var lastResult: (generation: UInt64, rules: String)?
     private var immediateCheckScheduled = false
     private lazy var resolver = WindowAudioRouteResolver(
-        runningApplications: { [unowned self] in self.runningApplications },
+        runningApplications: { [unowned self] in self.checkedConfiguration.runningApplications },
         windowList: {
             CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] ?? []
         },
-        displayTargets: { [unowned self] in self.displayTargets }
+        displayTargets: { [unowned self] in self.checkedConfiguration.displayTargets }
     )
 
     /// |publish| receives resolved rules on the main thread when they change.
@@ -42,23 +57,33 @@ final class WindowRouteFollower: @unchecked Sendable {
         displayTargets: [DisplayTarget],
         rawRules: String
     ) {
-        queue.async {
-            let changed = self.runningApplications != runningApplications ||
-                self.displayTargets != displayTargets ||
-                self.rawRules != rawRules
-            self.runningApplications = runningApplications
-            self.displayTargets = displayTargets
-            self.rawRules = rawRules
-            if changed, self.timer != nil {
-                self.check()
-            }
+        let next = Configuration(
+            runningApplications: runningApplications,
+            displayTargets: displayTargets,
+            rawRules: rawRules
+        )
+        let shouldCheck = lock.withLock {
+            guard configuration != next else { return false }
+            configuration = next
+            generation &+= 1
+            return isActive
+        }
+        if shouldCheck {
+            queue.async { self.check() }
         }
     }
 
     /// Starts the periodic check (and checks once right away).
     func start() {
+        let started = lock.withLock {
+            guard !isActive else { return false }
+            isActive = true
+            generation &+= 1
+            return true
+        }
+        guard started else { return }
         queue.async {
-            guard self.timer == nil else { return }
+            self.timer?.cancel()
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(
                 deadline: .now(),
@@ -73,10 +98,17 @@ final class WindowRouteFollower: @unchecked Sendable {
     }
 
     func stop() {
+        let stopped = lock.withLock {
+            guard isActive else { return false }
+            isActive = false
+            generation &+= 1
+            return true
+        }
+        guard stopped else { return }
         queue.async {
             self.timer?.cancel()
             self.timer = nil
-            self.lastResolvedRules = nil
+            self.lastResult = nil
         }
     }
 
@@ -88,19 +120,39 @@ final class WindowRouteFollower: @unchecked Sendable {
             self.immediateCheckScheduled = true
             self.queue.asyncAfter(deadline: .now() + Self.immediateCheckCoalescing) {
                 self.immediateCheckScheduled = false
-                guard self.timer != nil else { return }
                 self.check()
             }
         }
     }
 
+    /// Waits until work already queued has run. For tests.
+    func waitForQueuedWork() {
+        queue.sync {}
+    }
+
     private func check() {
-        let resolved = resolver.resolvedRules(from: rawRules)
-        guard resolved != lastResolvedRules else { return }
-        lastResolvedRules = resolved
+        let (configuration, generation, isActive) = lock.withLock {
+            (self.configuration, self.generation, self.isActive)
+        }
+        guard isActive else { return }
+        checkedConfiguration = configuration
+        let resolved = resolver.resolvedRules(from: configuration.rawRules)
+        // A new generation always delivers: the previous generation's result
+        // may have been discarded on its way.
+        if let lastResult, lastResult.generation == generation, lastResult.rules == resolved {
+            return
+        }
+        lastResult = (generation, resolved)
         let publish = self.publish
         DispatchQueue.main.async {
-            MainActor.assumeIsolated { publish(resolved) }
+            MainActor.assumeIsolated {
+                guard self.isCurrent(generation) else { return }
+                publish(resolved)
+            }
         }
+    }
+
+    private func isCurrent(_ generation: UInt64) -> Bool {
+        lock.withLock { isActive && self.generation == generation }
     }
 }

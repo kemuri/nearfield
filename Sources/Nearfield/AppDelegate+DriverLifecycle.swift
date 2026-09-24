@@ -91,7 +91,7 @@ extension AppDelegate {
             self.refreshDriverInstallState()
             // Core Audio restarted with the new driver.
             self.routerDriverManager.resetAppliedSettings()
-            self.preparedRouterDisplayUIDs = nil
+            self.routerOutputActivation.invalidate()
             self.lastAppliedRouterRouteRules = nil
             guard currentDriverIsInstalledOnDisk else {
                 self.failDriverInstallAttempt(

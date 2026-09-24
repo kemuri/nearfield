@@ -50,38 +50,44 @@ extension AppDelegate {
         try routerDriverManager.setPublished(true)
         lastAppliedRouterRouteRules = routingState.rules
         if activate {
-            try activateConfiguredRouterOutputIfNeeded(targetDeviceUIDs: targetDeviceUIDs)
+            try routerOutputActivation.activateIfNeeded(displayUIDs: targetDeviceUIDs)
         } else {
             try routerDriverManager.setBalance(currentBalance())
             try restoreDisplaysAfterProxyDeactivation()
-            preparedRouterDisplayUIDs = nil
         }
         updateDynamicRoutingRulesLifecycle()
     }
 
-    func activateConfiguredRouterOutputIfNeeded(targetDeviceUIDs: [String]) throws {
-        if preparedRouterDisplayUIDs == targetDeviceUIDs, routerDriverManager.isRouterDefaultOutput() {
-            // Already the output with these displays prepared.
-            try routerDriverManager.setBalance(currentBalance())
-            return
-        }
-        try activateConfiguredRouterOutput(currentRouterVolume: currentRouterVolumeForContinuity())
-        preparedRouterDisplayUIDs = targetDeviceUIDs
+    /// Selects Nearfield for the current displays; see RouterOutputActivation
+    /// for the order that keeps the volume safe.
+    func activateConfiguredRouterOutput() throws {
+        let displayUIDs = try audioManager.orderedStudioDisplayUIDs(configuration: currentConfiguration())
+        try routerOutputActivation.activate(displayUIDs: displayUIDs)
     }
 
-    func activateConfiguredRouterOutput(currentRouterVolume: Float32?) throws {
-        let capturedDisplayState = try prepareDisplaysForVirtualOutputActivation()
-        if let volume = routerVolumeContinuity.activationVolume(
-            currentRouterVolume: currentRouterVolume,
-            capturedDisplayVolume: averageCapturedDisplayVolume(capturedDisplayState)
-        ) {
-            try routerDriverManager.setBalancedVolume(volume, balance: currentBalance())
-            routerVolumeContinuity.observe(volume)
-        } else {
-            try routerDriverManager.setBalance(currentBalance())
-        }
-        try routerDriverManager.selectRouterAsDefaultOutput()
-        preparedRouterDisplayUIDs = try? audioManager.orderedStudioDisplayUIDs(configuration: currentConfiguration())
+    func makeRouterOutputActivation() -> RouterOutputActivation {
+        RouterOutputActivation(operations: .init(
+            currentRouterVolume: { [unowned self] in self.currentRouterVolumeForContinuity() },
+            captureDisplays: { [unowned self] in
+                self.averageCapturedDisplayVolume(try self.captureDisplaysForVirtualOutputActivation())
+            },
+            setRouterVolume: { [unowned self] currentRouterVolume, capturedDisplayVolume in
+                if let volume = self.routerVolumeContinuity.activationVolume(
+                    currentRouterVolume: currentRouterVolume,
+                    capturedDisplayVolume: capturedDisplayVolume
+                ) {
+                    try self.routerDriverManager.setBalancedVolume(volume, balance: self.currentBalance())
+                    self.routerVolumeContinuity.observe(volume)
+                } else {
+                    try self.routerDriverManager.setBalance(self.currentBalance())
+                }
+            },
+            selectRouter: { [unowned self] in try self.routerDriverManager.selectRouterAsDefaultOutput() },
+            raiseDisplays: { [unowned self] in try self.audioManager.prepareDisplaysForProxyOutput() },
+            restoreDisplays: { [unowned self] in try self.restorePhysicalDisplayState() },
+            routerIsDefault: { [unowned self] in self.routerDriverManager.isRouterDefaultOutput() },
+            applyBalance: { [unowned self] in try self.routerDriverManager.setBalance(self.currentBalance()) }
+        ))
     }
 
     func currentRouterVolumeForContinuity() -> Float32? {
@@ -119,7 +125,7 @@ extension AppDelegate {
         cachedRouterDefaultOutput = cachedRouterDriverAvailability.isLoaded &&
             routerDriverManager.isRouterDefaultOutput()
         if !cachedRouterDefaultOutput {
-            preparedRouterDisplayUIDs = nil
+            routerOutputActivation.invalidate()
         }
         observeRouterStatus()
         handoffChangeSignal?.fire()
@@ -234,7 +240,7 @@ extension AppDelegate {
         windowRouteFollower.stop()
         followedRouteRules = nil
         lastAppliedRouterRouteRules = nil
-        preparedRouterDisplayUIDs = nil
+        routerOutputActivation.invalidate()
         _ = currentRouterVolumeForContinuity()
 
         let shouldMoveToFallback = nearfieldVirtualOutputIsAnyDefault(state: state)
@@ -261,7 +267,9 @@ extension AppDelegate {
         }
     }
 
-    func prepareDisplaysForVirtualOutputActivation() throws -> [DisplayOutputState]? {
+    /// Records the displays' volume and mute before Nearfield takes them over.
+    /// Returns them when this is the first capture.
+    func captureDisplaysForVirtualOutputActivation() throws -> [DisplayOutputState]? {
         let currentDisplayState = try audioManager.captureDisplayOutputState()
         let existingDisplayState = proxyPreparedDisplayState ?? []
         let mergedDisplayState = DisplayOutputStateBaseline.merging(
@@ -273,7 +281,6 @@ extension AppDelegate {
             proxyPreparedDisplayState = mergedDisplayState
             saveProxyPreparedDisplayState(mergedDisplayState)
         }
-        try audioManager.prepareDisplaysForProxyOutput()
         return capturedDisplayState
     }
 
@@ -284,7 +291,13 @@ extension AppDelegate {
         return min(max(values.reduce(0, +) / Float32(values.count), 0), 1)
     }
 
+    /// Puts the displays' volume and mute back; Nearfield no longer counts
+    /// them as prepared.
     func restoreDisplaysAfterProxyDeactivation() throws {
+        try routerOutputActivation.restoreDisplays()
+    }
+
+    func restorePhysicalDisplayState() throws {
         guard let displayState = proxyPreparedDisplayState else { return }
         let pendingDisplayState = try audioManager.restoreDisplayOutputState(displayState)
         proxyPreparedDisplayState = pendingDisplayState.isEmpty ? nil : pendingDisplayState
@@ -351,7 +364,7 @@ extension AppDelegate {
     func rebuildForConfigurationChange() {
         cancelConnectionHandoff()
         displayTargetsCache = nil
-        preparedRouterDisplayUIDs = nil
+        routerOutputActivation.invalidate()
         do {
             try performSynchronizedAudioUpdate {
                 try restoreDisplaysAfterProxyDeactivation()
@@ -670,7 +683,7 @@ extension AppDelegate {
                     // Another session may have reconfigured the driver.
                     self.routerDriverManager.resetAppliedSettings()
                     self.lastAppliedRouterRouteRules = nil
-                    self.preparedRouterDisplayUIDs = nil
+                    self.routerOutputActivation.invalidate()
                     self.runningApplicationsCache = Self.currentRunningApplications()
                     self.scheduleAudioStateChange()
                 }
