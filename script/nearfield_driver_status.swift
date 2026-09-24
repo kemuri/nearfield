@@ -11,10 +11,10 @@
 //
 // --soak prints a line every --interval seconds (default 60) and a summary; it
 // exits with status 1 when any underrun happened. Play something through
-// Nearfield during the soak, or pass --tone for a quiet 440 Hz tone on Nearfield
-// itself, even when another output is the default
-// (--tone-level sets it in dBFS, default -30; the driver treats audio below
-// about -90 dBFS as silence).
+// Nearfield during the soak, or pass --tone for a tone on Nearfield itself, even
+// when another output is the default: 100 Hz at -80 dBFS, below the threshold
+// of hearing even at full volume, yet above the -90 dBFS the driver treats as
+// silence, so the audio never pauses (--tone-level sets it in dBFS).
 // --sample-rate sets Nearfield's sample rate for the soak and restores the
 // previous rate afterwards.
 
@@ -150,7 +150,7 @@ final class Tone {
         let format = engine.outputNode.inputFormat(forBus: 0)
         let sampleRate = format.sampleRate
         var phase = 0.0
-        let increment = 2 * Double.pi * 440 / sampleRate
+        let increment = 2 * Double.pi * 100 / sampleRate
         let amplitude = Float(pow(10.0, decibels / 20.0))
         let source = AVAudioSourceNode { _, _, frameCount, bufferList in
             let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
@@ -348,7 +348,7 @@ if arguments.contains("--watch") {
         interval: value(after: "--interval").flatMap(Double.init) ?? 60,
         sampleRate: value(after: "--sample-rate").flatMap(Double.init),
         toneDecibels: arguments.contains("--tone")
-            ? min(0, value(after: "--tone-level").flatMap(Double.init) ?? -30)
+            ? min(0, value(after: "--tone-level").flatMap(Double.init) ?? -80)
             : nil
     )
 } else if arguments.isEmpty {

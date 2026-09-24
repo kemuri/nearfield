@@ -33,12 +33,15 @@ measure each target:
 | Underruns in a 2-hour soak | 9 in 5 min | 0 | `swift script/nearfield_driver_status.swift --soak 120` |
 | Reported latency | 0 | measured value | `swift script/measure_latency.swift` (compare measured with reported) |
 
-Run the soak at each sample rate while music plays, or with `--tone`:
+Run the soak at each sample rate while music plays, or with `--tone` (100 Hz
+at -80 dBFS on Nearfield: inaudible even at full volume, yet never trimmed as
+silence). Ending a soak early (Ctrl-C, or closing the terminal) restores the
+previous sample rate.
 
 ```sh
-swift script/nearfield_driver_status.swift --soak 120 --sample-rate 48000
-swift script/nearfield_driver_status.swift --soak 120 --sample-rate 88200
-swift script/nearfield_driver_status.swift --soak 120 --sample-rate 96000
+swift script/nearfield_driver_status.swift --soak 120 --tone --sample-rate 48000
+swift script/nearfield_driver_status.swift --soak 120 --tone --sample-rate 88200
+swift script/nearfield_driver_status.swift --soak 120 --tone --sample-rate 96000
 ```
 
 ### Choosing the underrun fix
@@ -84,6 +87,10 @@ volume keys, mute key, and Control Center slider all change Nearfield's volume a
 keep the balance. If they do, remove `MediaKeyVolumeController` before release. If
 not, delete the preference and keep the handler.
 
+Decision for 0.2.0: the keys work with Nearfield's handler (checked 2026-09-24
+without the preference set), so the handler stays. Removing it needs the check
+above with the preference set.
+
 ## 4. Test list
 
 - Upgrade from 0.1.39 with driver 1.0.8, once choosing **Update Driver** and once
@@ -114,7 +121,7 @@ Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
 
 | Check | Result |
 | --- | --- |
-| 2-hour soak, 48 kHz, continuous -50 dBFS tone | Passed: 0 underruns, 0 overruns |
+| 2-hour soak, 48 kHz, continuous 440 Hz tone at -50 dBFS (audible at high volume; now 100 Hz at -80 dBFS) | Passed: 0 underruns, 0 overruns |
 | Latency after a cold start (the displays take ~440 ms to start) | Drained at 300 ppm in ~23 min, then flat at 55.3 ms for 91 min |
 | Clock correction once settled | Within about ±25 ppm |
 | Driver Core Audio requests while playing | 0 (only on device changes) |
