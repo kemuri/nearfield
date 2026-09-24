@@ -107,6 +107,8 @@ struct PlaybackCounters {
     std::atomic<uint64_t> trimmedFrames{0};
     std::atomic<uint64_t> writerGaps{0};
     std::atomic<uint64_t> lastColdStartBufferedFrames{0};
+    // Audio written while the displays started, skipped to keep the latency.
+    std::atomic<uint64_t> coldStartSkippedFrames{0};
     std::atomic<uint64_t> readerCallbacks{0};
     std::atomic<uint64_t> writerCallbacks{0};
 };
@@ -307,10 +309,21 @@ class PlaybackEngine {
                 readPosition = stamp.sessionBase;
             }
             if (end > readPosition) {
-                // Audio was written before the displays ran: play it from its
-                // first sample; the extra delay is trimmed during silence.
+                // Audio was written while the displays started (about 440 ms
+                // for Studio Displays). Playing it would make every sound
+                // after a pause that much late, and video players keep their
+                // picture in step with the latency reported when playback
+                // starts. Start at the newest audio instead, with the usual
+                // buffering, and fade in.
                 stats.coldStarts.fetch_add(1, std::memory_order_relaxed);
                 stats.lastColdStartBufferedFrames.store(static_cast<uint64_t>(end - readPosition), std::memory_order_relaxed);
+                const int64_t keep = targetGapFrames(rate) + frames;
+                if (end - readPosition > keep) {
+                    stats.coldStartSkippedFrames.fetch_add(static_cast<uint64_t>(end - keep - readPosition),
+                                                           std::memory_order_relaxed);
+                    readPosition = end - keep;
+                    fadeInRemaining = fadeFrames(rate);
+                }
             }
             raise(kSignalOutputStarted | kSignalCounters);
         }

@@ -490,7 +490,7 @@ static void testVolumeMuteAndBalanceAreSmoothed() {
     CHECK(allFrames(f.output, 0.5f, 0.5f));
 }
 
-static void testColdStartPlaysFromFirstSampleThenTrimsDuringSilence() {
+static void testColdStartSkipsToTheNewestAudio() {
     DriverFixture f;
     f.start(1);
     // The displays take a while to start; about 213 ms is written meanwhile.
@@ -502,19 +502,23 @@ static void testColdStartPlaysFromFirstSampleThenTrimsDuringSilence() {
     f.render();
     f.drain();
     CHECK(f.device.engine.counters().coldStarts.load() == 1);
-    // The first written sample is played (after a short fade-in).
-    CHECK(f.output[0] > 0.0f && f.output[0] < 0.75f);
-    CHECK(near(f.output[200 * 2], 0.75f));
-    const double buffered = f.device.engine.lastBufferedMilliseconds();
-    CHECK(buffered > 150);
+    // Playback starts at the newest audio with a short fade-in, not with the
+    // first sample written: every later sound would be that much late.
+    CHECK(f.output[0] > 0.0f && f.output[0] < 0.5f);
+    CHECK(near(f.output[200 * 2], 0.5f));
+    for (UInt32 sample = 0; sample < kFrames * 2; ++sample) {
+        CHECK(f.output[sample] <= 0.5f + 1e-4f);
+    }
+    // Buffered as after any start: the gap, not the displays' start-up time.
+    CHECK(f.device.engine.lastBufferedMilliseconds() < 40);
+    CHECK(f.device.engine.counters().coldStartSkippedFrames.load() * 1000.0 / kRate > 150);
+    CHECK(f.device.engine.counters().underruns.load() == 0);
 
-    // Once the audio is silent, the extra delay is dropped.
-    f.fill(0, 0);
+    // Playback carries on from there without gaps.
+    f.fill(0.5f, 0.5f);
     for (int cycle = 0; cycle < 40; ++cycle) {
         f.cycleOnce();
     }
-    CHECK(f.device.engine.counters().trimmedFrames.load() > 0);
-    CHECK(f.device.engine.lastBufferedMilliseconds() < 40);
     CHECK(f.device.engine.counters().underruns.load() == 0);
 }
 
@@ -1061,10 +1065,11 @@ static void testColdStartDelayDoesNotComeBack() {
     pause.settledAfterSeconds = 30;
     const SimulationResult trimmed = simulateClocks(0, true, Strategy::both, 600, 1.0, pause);
 
-    // The audio never pauses: steering drains the delay within the soak.
+    // The audio never pauses: the displays' start-up time is not added to
+    // the latency in the first place.
     SimulationOptions continuous;
     continuous.coldStartMilliseconds = 450;
-    continuous.settledAfterSeconds = 1800;
+    continuous.settledAfterSeconds = 6;
     const SimulationResult drained = simulateClocks(0, true, Strategy::both, 2400, 1.0, continuous);
     // The same with a drifting output clock and no rate report.
     const SimulationResult drifting = simulateClocks(80, false, Strategy::both, 2400, 1.0, continuous);
@@ -1077,8 +1082,8 @@ static void testColdStartDelayDoesNotComeBack() {
     CHECK(trimmed.underruns == 0);
     CHECK(trimmed.maximumSettledBufferedMilliseconds < 40);
     CHECK(drained.underruns == 0);
-    // What trimming keeps (the 24 ms gap plus an output buffer), plus a chunk
-    // of scheduling phase; it started at 450 ms.
+    // The gap (24 ms) plus scheduling phase, from the start; the displays
+    // took 450 ms to start.
     CHECK(drained.maximumSettledBufferedMilliseconds < 50);
     CHECK(drifting.underruns == 0);
     CHECK(drifting.maximumSettledBufferedMilliseconds < 60);
@@ -1342,7 +1347,7 @@ int main(int argc, char **argv) {
         {"route changes crossfade", testRouteChangesCrossfade, false, false},
         {"render never waits for the state mutex", testRenderDoesNotWaitForConfigurationMutex, true, false},
         {"volume, mute and balance are smoothed", testVolumeMuteAndBalanceAreSmoothed, false, false},
-        {"cold start plays from the first sample", testColdStartPlaysFromFirstSampleThenTrimsDuringSilence, false, false},
+        {"cold start skips to the newest audio", testColdStartSkipsToTheNewestAudio, false, false},
         {"underrun fades and widens the gap", testUnderrunFadesOutAndWidensTheSafetyGap, false, false},
         {"settings apply in one step", testSettingsApplyInOneStepAndSaveOnlyChanges, false, false},
         {"legacy driver settings migrate", testLegacyDriverSettingsAreMigrated, false, false},

@@ -5931,6 +5931,8 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
         setDictionaryNumber(counts, CFSTR("lastColdStartMilliseconds"), lastColdStartMilliseconds.load());
         setDictionaryNumber(counts, CFSTR("lastColdStartBufferedMilliseconds"),
                             counters.lastColdStartBufferedFrames.load() * 1000.0 / sampleRate);
+        setDictionaryNumber(counts, CFSTR("coldStartSkippedMilliseconds"),
+                            counters.coldStartSkippedFrames.load() * 1000.0 / sampleRate);
         setDictionaryNumber(counts, CFSTR("trimmedMilliseconds"), counters.trimmedFrames.load() * 1000.0 / sampleRate);
         setDictionaryInteger(counts, CFSTR("writerGaps"), (int64_t)counters.writerGaps.load());
         setDictionaryInteger(counts, CFSTR("halRequests"), (int64_t)halRequestCount().load());

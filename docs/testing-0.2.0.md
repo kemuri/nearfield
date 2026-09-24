@@ -98,6 +98,9 @@ above with the preference set.
 - Daily use for a few days with `driverDiagnostics` on.
 - 2-hour soaks at 48, 88.2, and 96 kHz (above).
 - Drag a playing window between displays: the sound moves within 2 seconds.
+- Play a YouTube video in Safari, pause it for more than 5 seconds (the displays
+  stop), then resume: sound and picture stay in sync. Check `coldStartSkippedMilliseconds`
+  in the driver status grows by about 400 ms per resume.
 - Set an app (for example Music, or a call app's speaker setting) to play on one
   Studio Display at about 20% volume, then connect the second display. That
   app must not get louder; Nearfield plays at a similar level. Once the app
@@ -135,8 +138,11 @@ Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
 
 Found and fixed during these runs: steering rebuilt the cold-start delay
 after a trim (latency grew ~0.27 ms/s), the app counted the driver's own
-host process as another app playing on the displays, and the volume shift
-relied on conversions Core Audio does not pass to the driver.
+host process as another app playing on the displays, the volume shift
+relied on conversions Core Audio does not pass to the driver, and video in
+Safari fell out of sync after a pause: the audio written while the displays
+restarted (about 440 ms) was played late. The driver now skips it, as 1.0.8
+did, so the start of a sound after more than 5 seconds of quiet is cut.
 
 ## 6. Rollback
 
