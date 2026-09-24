@@ -17,6 +17,8 @@ enum NearfieldPreferences {
     /// Testing switches for driver 1.1.0, forwarded when set.
     static let driverDiagnosticsKey = "driverDiagnostics"
     static let driverUnderrunStrategyKey = "driverUnderrunStrategy"
+    /// Decibels Nearfield's volume was raised by while the displays waited.
+    static let waitingDisplayCompensationKey = "waitingDisplayCompensation"
     static let latestOnboardingCompletionVersion = 1
     static let latestAggregateSchemaVersion = 12
 
@@ -34,7 +36,8 @@ enum NearfieldPreferences {
         appRoutingAppBundleIDsKey,
         systemHandlesVolumeKeysKey,
         driverDiagnosticsKey,
-        driverUnderrunStrategyKey
+        driverUnderrunStrategyKey,
+        waitingDisplayCompensationKey
     ]
 
     static func outputMode(in defaults: UserDefaults = .standard) -> NearfieldOutputMode {
@@ -161,6 +164,19 @@ enum NearfieldPreferences {
 
     static func systemHandlesVolumeKeys(in defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: systemHandlesVolumeKeysKey)
+    }
+
+    static func waitingDisplayCompensation(in defaults: UserDefaults = .standard) -> Float32 {
+        let value = Float32(defaults.double(forKey: waitingDisplayCompensationKey))
+        return value.isFinite ? value : 0
+    }
+
+    static func setWaitingDisplayCompensation(_ decibels: Float32, in defaults: UserDefaults = .standard) {
+        if decibels == 0 {
+            defaults.removeObject(forKey: waitingDisplayCompensationKey)
+        } else {
+            defaults.set(Double(decibels), forKey: waitingDisplayCompensationKey)
+        }
     }
 
     static func driverDiagnostics(in defaults: UserDefaults = .standard) -> Bool? {

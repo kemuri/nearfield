@@ -66,7 +66,7 @@ extension AppDelegate {
     }
 
     func makeRouterOutputActivation() -> RouterOutputActivation {
-        RouterOutputActivation(operations: .init(
+        let activation = RouterOutputActivation(operations: .init(
             currentRouterVolume: { [unowned self] in self.currentRouterVolumeForContinuity() },
             captureDisplays: { [unowned self] in
                 self.averageCapturedDisplayVolume(try self.captureDisplaysForVirtualOutputActivation())
@@ -83,11 +83,72 @@ extension AppDelegate {
                 }
             },
             selectRouter: { [unowned self] in try self.routerDriverManager.selectRouterAsDefaultOutput() },
+            displaysWithOtherPlayback: { [unowned self] uids in self.audioManager.displaysWithOtherPlayback(uids) },
+            displayRaiseDecibels: { [unowned self] uids in self.audioManager.fullVolumeRaiseDecibels(forUIDs: uids) },
+            shiftRouterVolume: { [unowned self] decibels in
+                try self.routerDriverManager.shiftBaseVolume(byDecibels: decibels, balance: self.currentBalance())
+            },
             raiseDisplays: { [unowned self] in try self.audioManager.prepareDisplaysForProxyOutput() },
             restoreDisplays: { [unowned self] in try self.restorePhysicalDisplayState() },
             routerIsDefault: { [unowned self] in self.routerDriverManager.isRouterDefaultOutput() },
-            applyBalance: { [unowned self] in try self.routerDriverManager.setBalance(self.currentBalance()) }
+            applyBalance: { [unowned self] in try self.routerDriverManager.setBalance(self.currentBalance()) },
+            saveWaitingCompensation: { NearfieldPreferences.setWaitingDisplayCompensation($0) }
         ))
+        activation.onWaitingChange = { [weak self] in
+            // Not from inside a Core Audio listener that may be removed.
+            Task { @MainActor in self?.updateWaitingDisplayMonitoring() }
+        }
+        return activation
+    }
+
+    /// While displays wait to be raised, watch for the other apps on them
+    /// stopping or moving away.
+    func updateWaitingDisplayMonitoring() {
+        guard let displayUIDs = routerOutputActivation.waitingDisplayUIDs else {
+            waitingDisplayPlaybackMonitor?.stop()
+            waitingDisplayPlaybackMonitor = nil
+            waitingDisplayObservers.forEach { $0.invalidate() }
+            waitingDisplayObservers = []
+            return
+        }
+        guard waitingDisplayObservers.isEmpty, waitingDisplayPlaybackMonitor == nil else { return }
+        logger.info("Waiting to raise the displays' volume until no other app plays on them")
+        let onChange: @MainActor () -> Void = { [weak self] in self?.raiseWaitingDisplaysIfFree() }
+        if #available(macOS 14.2, *) {
+            let monitor = ProcessPlaybackMonitor(onChange: onChange)
+            monitor.start()
+            waitingDisplayPlaybackMonitor = monitor
+        }
+        waitingDisplayObservers = displayUIDs.compactMap { uid in
+            audioManager.deviceID(forUID: uid).flatMap {
+                CoreAudioPropertyObserver(objectID: $0, selector: kAudioDevicePropertyDeviceIsRunningSomewhere, onChange: onChange)
+            }
+        }
+        raiseWaitingDisplaysIfFree()
+    }
+
+    /// Takes back volume added while displays waited when Nearfield last quit
+    /// or crashed, before anything else adjusts the volume.
+    func undoInterruptedDisplayWait() {
+        let compensation = NearfieldPreferences.waitingDisplayCompensation()
+        guard compensation != 0, cachedRouterDriverAvailability.isLoaded else { return }
+        do {
+            _ = try routerDriverManager.shiftBaseVolume(byDecibels: -compensation, balance: currentBalance())
+            NearfieldPreferences.setWaitingDisplayCompensation(0)
+        } catch {
+            recordRecoverableError(error, context: "Restoring Nearfield's volume failed")
+        }
+    }
+
+    func raiseWaitingDisplaysIfFree() {
+        guard routerOutputActivation.waitingDisplayUIDs != nil else { return }
+        do {
+            try performSynchronizedAudioUpdate {
+                try routerOutputActivation.raiseWaitingDisplaysIfFree()
+            }
+        } catch {
+            recordRecoverableError(error, context: "Preparing the Studio Displays failed")
+        }
     }
 
     func currentRouterVolumeForContinuity() -> Float32? {

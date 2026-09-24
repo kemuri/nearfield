@@ -99,6 +99,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var cachedRouterDriverAvailability = RouterDriverAvailability(installedOnDisk: false)
     var cachedRouterDefaultOutput = false
     lazy var routerOutputActivation = makeRouterOutputActivation()
+    var waitingDisplayPlaybackMonitor: ProcessPlaybackMonitor?
+    var waitingDisplayObservers: [CoreAudioPropertyObserver] = []
     var routerStatusNotificationsAvailable = false
     var handoffChangeSignal: ChangeSignal?
     var handoffPlaybackMonitor: ProcessPlaybackMonitor?
@@ -271,6 +273,7 @@ extension AppDelegate {
         observeRouterStatus()
         observeConnectionDefaultOutput()
         hadSufficientStudioDisplays = cachedAudioState.detectedDisplays.count >= 2
+        undoInterruptedDisplayWait()
         preparePairOnLaunch()
         mediaKeyVolumeController.start()
         audioManager.startObserving { [weak self] in
@@ -344,6 +347,8 @@ extension AppDelegate {
         pendingAudioStateChangeTask?.cancel()
         cancelConnectionHandoff()
         windowRouteFollower.stop()
+        // Takes back volume added while displays waited to be raised.
+        routerOutputActivation.invalidate()
         displayLossGraceTask?.cancel()
         dynamicRoutingNotificationObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         dynamicRoutingNotificationObservers.removeAll()

@@ -485,6 +485,92 @@ final class StudioDisplayAudioManager {
         }
     }
 
+    /// Target displays another process plays on directly rather than through
+    /// Nearfield. Raising their volume would make that playback louder too.
+    /// Before macOS 14.2 processes cannot be told apart, so any display that is
+    /// running counts.
+    func displaysWithOtherPlayback(_ uids: [String]) -> Set<String> {
+        let targets = Set(uids)
+        guard ProcessAudioPlayback.isSupported else {
+            return targets.filter { uid in
+                guard let device = device(matchingUID: uid) else { return false }
+                return CoreAudioProperty.read(
+                    from: device.id,
+                    selector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+                    as: UInt32.self
+                ) == 1
+            }
+        }
+        return Self.displaysWithOtherPlayback(targets, playback: ProcessAudioPlayback.activeOutputs())
+    }
+
+    static func displaysWithOtherPlayback(
+        _ targets: Set<String>,
+        playback: [RouterConnectionHandoff.Playback]
+    ) -> Set<String> {
+        let nearfieldUIDs = NearfieldAudioIdentifiers.virtualOutputUIDs.union(NearfieldAudioIdentifiers.managedAggregateUIDs)
+        return playback.reduce(into: Set<String>()) { busy, playback in
+            // Nearfield's own output reaches the displays through its aggregate.
+            guard playback.outputUIDs.isDisjoint(with: nearfieldUIDs) else { return }
+            busy.formUnion(playback.outputUIDs.intersection(targets))
+        }
+    }
+
+    /// How many decibels setting these displays to full volume adds, for the
+    /// display whose level rises most; muted displays add nothing audible.
+    /// A display that does not report decibels is read on Nearfield's own
+    /// 63.5 dB curve, which overestimates, so compensation errs on the quiet side.
+    func fullVolumeRaiseDecibels(forUIDs uids: [String]) -> Float32 {
+        uids.compactMap { device(matchingUID: $0) }.map { device -> Float32 in
+            if isMuted(device) == true {
+                return 0
+            }
+            if let current = decibels(for: device), let range = decibelRange(for: device) {
+                return max(0, Float32(range.mMaximum) - current)
+            }
+            let scalar = min(max(volume(for: device) ?? 0, 0), 1)
+            return (1 - scalar) * Self.fallbackVolumeRangeDecibels
+        }.max() ?? 0
+    }
+
+    private static let fallbackVolumeRangeDecibels: Float32 = 63.5
+
+    /// The display's level in decibels; for per-channel volume, the quietest channel.
+    private func decibels(for device: AudioDevice) -> Float32? {
+        if let master: Float32 = CoreAudioProperty.read(
+            from: device.id,
+            selector: kAudioDevicePropertyVolumeDecibels,
+            scope: kAudioDevicePropertyScopeOutput,
+            element: kAudioObjectPropertyElementMain
+        ) {
+            return master
+        }
+        return (1...max(1, device.outputChannelCount)).compactMap { channel -> Float32? in
+            CoreAudioProperty.read(
+                from: device.id,
+                selector: kAudioDevicePropertyVolumeDecibels,
+                scope: kAudioDevicePropertyScopeOutput,
+                element: channel,
+                as: Float32.self
+            )
+        }.min()
+    }
+
+    private func decibelRange(for device: AudioDevice) -> AudioValueRange? {
+        let elements = [kAudioObjectPropertyElementMain] + Array(1...max(1, device.outputChannelCount))
+        for element in elements {
+            if let range: AudioValueRange = CoreAudioProperty.read(
+                from: device.id,
+                selector: kAudioDevicePropertyVolumeRangeDecibels,
+                scope: kAudioDevicePropertyScopeOutput,
+                element: element
+            ) {
+                return range
+            }
+        }
+        return nil
+    }
+
     func captureDisplayOutputState() throws -> [DisplayOutputState] {
         let displays = Array(studioDisplayOutputs().prefix(3))
         guard displays.count >= 2 else {

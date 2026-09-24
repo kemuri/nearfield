@@ -411,6 +411,42 @@ final class RouterAudioDriverManager {
         try setVolumeControl(controls.right, value: volumes.right, channel: "right")
     }
 
+    /// Moves Nearfield's volume by |decibels| within its range, keeping
+    /// |balance|. Returns the change actually applied.
+    func shiftBaseVolume(byDecibels decibels: Float32, balance: Float32) throws -> Float32 {
+        guard decibels != 0 else { return 0 }
+        guard let controls = volumeControlIDs(), let base = currentBaseVolume() else {
+            throw RouterAudioDriverError.notInstalled
+        }
+        guard let current = convertLevel(base, on: controls.left, selector: kAudioLevelControlPropertyConvertScalarToDecibels),
+              let range: AudioValueRange = CoreAudioProperty.read(
+                from: controls.left,
+                selector: kAudioLevelControlPropertyDecibelRange
+              ) else {
+            throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnknownPropertyError)
+        }
+        let target = min(max(current + decibels, Float32(range.mMinimum)), Float32(range.mMaximum))
+        guard let scalar = convertLevel(target, on: controls.left, selector: kAudioLevelControlPropertyConvertDecibelsToScalar) else {
+            throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnknownPropertyError)
+        }
+        try setBalancedVolume(scalar, balance: balance)
+        return target - current
+    }
+
+    private func convertLevel(_ value: Float32, on control: AudioObjectID, selector: AudioObjectPropertySelector) -> Float32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var data = value
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(control, &address, 0, nil, &size, &data) == noErr, data.isFinite else {
+            return nil
+        }
+        return data
+    }
+
     func adjustVolume(by delta: Float32, balance: Float32) throws {
         guard let controls = volumeControlIDs() else {
             throw RouterAudioDriverError.notInstalled

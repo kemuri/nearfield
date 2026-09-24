@@ -363,16 +363,28 @@ final class WindowRouteFollowerTests: XCTestCase {
 
 @MainActor
 final class RouterOutputActivationTests: XCTestCase {
+    /// Two displays at -30 dB, with Nearfield's volume and the displays'
+    /// levels in decibels. Nearfield is heard at router + display level; an
+    /// app playing on a display directly is heard at the display level.
     @MainActor final class Displays {
         var events: [String] = []
-        var isRaised = false
+        var routerDecibels: Float32 = -40
+        var displayDecibels: Float32 = -30
         var routerIsDefault = false
+        var otherPlayback: Set<String> = []
         var failing: String?
+        var savedCompensation: Float32 = 0
+        private(set) var loudestNearfield: Float32 = -.infinity
+        private(set) var loudestDisplay: Float32 = -.infinity
+
+        var nearfieldLevel: Float32 { routerDecibels + displayDecibels }
 
         func step(_ name: String, _ work: () -> Void = {}) throws {
             events.append(name)
             if failing == name { throw NearfieldError.notEnoughStudioDisplays(1) }
             work()
+            if routerIsDefault { loudestNearfield = max(loudestNearfield, nearfieldLevel) }
+            loudestDisplay = max(loudestDisplay, displayDecibels)
         }
 
         func makeActivation() -> RouterOutputActivation {
@@ -381,10 +393,18 @@ final class RouterOutputActivationTests: XCTestCase {
                 captureDisplays: { try self.step("capture"); return 0.4 },
                 setRouterVolume: { _, _ in try self.step("volume") },
                 selectRouter: { try self.step("select") { self.routerIsDefault = true } },
-                raiseDisplays: { try self.step("raise") { self.isRaised = true } },
-                restoreDisplays: { try self.step("restore") { self.isRaised = false } },
+                displaysWithOtherPlayback: { uids in self.otherPlayback.intersection(uids) },
+                displayRaiseDecibels: { _ in -self.displayDecibels },
+                shiftRouterVolume: { decibels in
+                    let before = self.routerDecibels
+                    try self.step("shift") { self.routerDecibels = min(max(before + decibels, -63.5), 0) }
+                    return self.routerDecibels - before
+                },
+                raiseDisplays: { try self.step("raise") { self.displayDecibels = 0 } },
+                restoreDisplays: { try self.step("restore") { self.displayDecibels = -30 } },
                 routerIsDefault: { self.routerIsDefault },
-                applyBalance: { try self.step("balance") }
+                applyBalance: { try self.step("balance") },
+                saveWaitingCompensation: { self.savedCompensation = $0 }
             ))
         }
     }
@@ -397,6 +417,7 @@ final class RouterOutputActivationTests: XCTestCase {
 
         XCTAssertEqual(displays.events, ["capture", "volume", "select", "raise"])
         XCTAssertEqual(activation.preparedDisplayUIDs, ["left", "right"])
+        XCTAssertNil(activation.waitingDisplayUIDs)
     }
 
     func testFailedSelectionLeavesTheDisplaysAsTheyWere() {
@@ -407,7 +428,7 @@ final class RouterOutputActivationTests: XCTestCase {
         XCTAssertThrowsError(try activation.activate(displayUIDs: ["left", "right"]))
 
         XCTAssertEqual(displays.events, ["capture", "volume", "select", "restore"])
-        XCTAssertFalse(displays.isRaised)
+        XCTAssertEqual(displays.displayDecibels, -30)
         XCTAssertNil(activation.preparedDisplayUIDs)
     }
 
@@ -441,12 +462,12 @@ final class RouterOutputActivationTests: XCTestCase {
         try activation.activate(displayUIDs: ["left", "right"])
 
         try activation.restoreDisplays()
-        XCTAssertFalse(displays.isRaised)
+        XCTAssertEqual(displays.displayDecibels, -30)
         displays.events = []
         try activation.activateIfNeeded(displayUIDs: ["left", "right"])
 
         XCTAssertEqual(displays.events, ["capture", "volume", "select", "raise"])
-        XCTAssertTrue(displays.isRaised)
+        XCTAssertEqual(displays.displayDecibels, 0)
     }
 
     func testOtherDisplaysOrAnotherOutputActivateAgain() throws {
@@ -462,5 +483,107 @@ final class RouterOutputActivationTests: XCTestCase {
         displays.routerIsDefault = false
         try activation.activateIfNeeded(displayUIDs: ["left", "center", "right"])
         XCTAssertEqual(displays.events, ["capture", "volume", "select", "raise"])
+    }
+
+    /// An app set to play on a display directly must not get louder when
+    /// Nearfield takes over; Nearfield makes up the difference instead.
+    func testDisplayWithAnotherAppIsNotRaised() throws {
+        let displays = Displays()
+        displays.otherPlayback = ["left"]
+        let activation = displays.makeActivation()
+
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        XCTAssertFalse(displays.events.contains("raise"))
+        XCTAssertEqual(displays.loudestDisplay, -30)
+        XCTAssertEqual(activation.waitingDisplayUIDs, ["left", "right"])
+        XCTAssertNil(activation.preparedDisplayUIDs)
+        // Heard as if the displays were raised: -40 dB.
+        XCTAssertEqual(displays.nearfieldLevel, -40)
+        XCTAssertEqual(displays.savedCompensation, 30)
+    }
+
+    func testWaitingDisplaysAreRaisedWithoutGettingLouderOnceFree() throws {
+        let displays = Displays()
+        displays.otherPlayback = ["left"]
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        // Still in use: nothing changes.
+        displays.events = []
+        try activation.raiseWaitingDisplaysIfFree()
+        try activation.activateIfNeeded(displayUIDs: ["left", "right"])
+        XCTAssertEqual(displays.events, ["balance"])
+
+        displays.otherPlayback = []
+        displays.events = []
+        try activation.raiseWaitingDisplaysIfFree()
+
+        XCTAssertEqual(displays.events, ["shift", "raise"])
+        XCTAssertEqual(displays.displayDecibels, 0)
+        XCTAssertEqual(displays.nearfieldLevel, -40)
+        XCTAssertLessThanOrEqual(displays.loudestNearfield, -40)
+        XCTAssertEqual(activation.preparedDisplayUIDs, ["left", "right"])
+        XCTAssertNil(activation.waitingDisplayUIDs)
+        XCTAssertEqual(displays.savedCompensation, 0)
+    }
+
+    func testStoppingTheWaitTakesBackTheAddedVolume() throws {
+        let displays = Displays()
+        displays.otherPlayback = ["right"]
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+        XCTAssertEqual(displays.routerDecibels, -10)
+
+        activation.invalidate()
+
+        XCTAssertEqual(displays.routerDecibels, -40)
+        XCTAssertNil(activation.waitingDisplayUIDs)
+        XCTAssertEqual(displays.savedCompensation, 0)
+    }
+
+    func testWaitEndsWhenNearfieldIsNoLongerTheOutput() throws {
+        let displays = Displays()
+        displays.otherPlayback = ["left"]
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        displays.routerIsDefault = false
+        displays.otherPlayback = []
+        try activation.raiseWaitingDisplaysIfFree()
+
+        XCTAssertFalse(displays.events.contains("raise"))
+        XCTAssertEqual(displays.routerDecibels, -40)
+        XCTAssertNil(activation.waitingDisplayUIDs)
+    }
+
+    func testOnlyOtherAppsPlayingDirectlyCountAsUsingADisplay() {
+        let targets: Set<String> = ["left", "right"]
+        let playback: [RouterConnectionHandoff.Playback] = [
+            .init(processID: 10, outputUIDs: ["left"]),
+            .init(processID: 11, outputUIDs: [NearfieldAudioIdentifiers.routerDeviceUID]),
+            .init(processID: 12, outputUIDs: [NearfieldAudioIdentifiers.driverTargetAggregateUID, "right"]),
+            .init(processID: 13, outputUIDs: ["BuiltInSpeakerDevice"])
+        ]
+
+        XCTAssertEqual(StudioDisplayAudioManager.displaysWithOtherPlayback(targets, playback: playback), ["left"])
+        XCTAssertTrue(StudioDisplayAudioManager.displaysWithOtherPlayback(targets, playback: Array(playback.dropFirst())).isEmpty)
+    }
+
+    /// Nearfield's volume cannot go above 0 dB, so it may wait quieter than
+    /// intended, and it stays on the quiet side after the raise.
+    func testLimitedCompensationStaysOnTheQuietSide() throws {
+        let displays = Displays()
+        displays.routerDecibels = -10
+        displays.otherPlayback = ["left"]
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+        XCTAssertEqual(displays.routerDecibels, 0)
+
+        displays.otherPlayback = []
+        try activation.raiseWaitingDisplaysIfFree()
+
+        XCTAssertLessThanOrEqual(displays.loudestNearfield, -10)
+        XCTAssertEqual(displays.nearfieldLevel, -30)
     }
 }
