@@ -6,6 +6,7 @@
     "Select Nearfield automatically when a second Studio Display connects and its audio route is ready, with one recovery for apps still playing on the previous output. Manual output choices are respected.",
     "Hide the Nearfield output when fewer than two Studio Displays are connected, even while the app is not running.",
     "When the displays disconnect, return sound to the previous output or the built-in speakers.",
+    "Never make an app playing directly on a Studio Display louder when Nearfield takes over; the display's volume changes once that app stops.",
     "Nearfield now requires a Mac with Apple silicon."
   ]
 }

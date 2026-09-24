@@ -65,9 +65,12 @@ swift script/nearfield_driver_status.swift --probe-write
 ```
 
 `rejected … writerVerification=enforced` means only Nearfield can change the
-driver's settings. If it is accepted, reports `unavailable`, or Nearfield itself is
-rejected, add a known limitation to the README: any process can change the
-driver's settings. Development drivers are unsigned and accept every process.
+driver's settings. Also confirm that the signed Nearfield still configures the
+driver (routing and display changes take effect): this is the first release
+that enforces the check. If the probe is accepted, reports `unavailable`, or
+Nearfield itself is rejected, add a known limitation to the README: any process
+can change the driver's settings. Development drivers are unsigned and accept
+every process; a development app cannot configure a Developer ID driver.
 
 **Volume keys.** Set the balance off-center, then turn off Nearfield's own
 volume key handling:
@@ -88,11 +91,21 @@ not, delete the preference and keep the handler.
 - Daily use for a few days with `driverDiagnostics` on.
 - 2-hour soaks at 48, 88.2, and 96 kHz (above).
 - Drag a playing window between displays: the sound moves within 2 seconds.
+- Set an app (for example Music, or a call app's speaker setting) to play on one
+  Studio Display at about 20% volume, then connect the second display. That
+  app must not get louder; Nearfield plays at a similar level. Once the app
+  stops or moves, the displays go to full volume without a jump in Nearfield's
+  loudness (Console: "Waiting to raise the displays' volume").
+- Play music through Nearfield on macOS 14.2 or later with no other app on the
+  displays: the displays are raised right away. If they keep waiting,
+  Nearfield's own output is being counted as another app.
 - Unplug and replug a display; sleep and wake; reboot with the app quit (Nearfield
   is hidden while fewer than two displays are connected); uninstall.
 
-Three displays and macOS 14, 15, and 26 cannot be tested on this setup. Those code
-paths are unchanged and covered by the automated tests.
+Three displays and macOS 14, 15, and 26 cannot be tested on this setup; the
+automated tests cover their logic. One path is new: before macOS 14.2 Nearfield
+cannot tell which app plays on a display, so it raises the displays only once
+nothing is running on them (after about 5 seconds of silence).
 
 ## 5. Rollback
 
