@@ -69,6 +69,7 @@ final class RouterDriverProtocolTests: XCTestCase {
             "sampleRate": 48_000.0,
             "latencyMilliseconds": 21.5,
             "writerVerification": "verified",
+            "hostProcessID": 4321,
             "counters": ["underruns": 3, "halRequests": 12]
         ]))
 
@@ -81,6 +82,7 @@ final class RouterDriverProtocolTests: XCTestCase {
         XCTAssertEqual(status.underruns, 3)
         XCTAssertEqual(status.halRequests, 12)
         XCTAssertEqual(status.writerVerification, "verified")
+        XCTAssertEqual(status.hostProcessID, 4321)
         XCTAssertTrue(status.isReady(deviceUIDs: ["left-display", "right-display"], mode: .stereo))
     }
 
@@ -559,15 +561,60 @@ final class RouterOutputActivationTests: XCTestCase {
 
     func testOnlyOtherAppsPlayingDirectlyCountAsUsingADisplay() {
         let targets: Set<String> = ["left", "right"]
+        let driverHost = StudioDisplayAudioManager.driverServiceBundleID
         let playback: [RouterConnectionHandoff.Playback] = [
-            .init(processID: 10, outputUIDs: ["left"]),
+            .init(processID: 10, outputUIDs: ["left"], bundleID: "com.apple.Music"),
             .init(processID: 11, outputUIDs: [NearfieldAudioIdentifiers.routerDeviceUID]),
-            .init(processID: 12, outputUIDs: [NearfieldAudioIdentifiers.driverTargetAggregateUID, "right"]),
+            // Nearfield's driver plays on the displays themselves.
+            .init(processID: 12, outputUIDs: ["left", "right"], bundleID: driverHost),
             .init(processID: 13, outputUIDs: ["BuiltInSpeakerDevice"])
         ]
 
-        XCTAssertEqual(StudioDisplayAudioManager.displaysWithOtherPlayback(targets, playback: playback), ["left"])
-        XCTAssertTrue(StudioDisplayAudioManager.displaysWithOtherPlayback(targets, playback: Array(playback.dropFirst())).isEmpty)
+        XCTAssertEqual(StudioDisplayAudioManager.displaysWithOtherPlayback(targets, playback: playback, driverProcessID: 12), ["left"])
+        XCTAssertTrue(StudioDisplayAudioManager.displaysWithOtherPlayback(
+            targets, playback: Array(playback.dropFirst()), driverProcessID: 12
+        ).isEmpty)
+        // Another driver's host playing on a display is another app.
+        let otherDriver = RouterConnectionHandoff.Playback(processID: 14, outputUIDs: ["right"], bundleID: driverHost)
+        XCTAssertEqual(StudioDisplayAudioManager.displaysWithOtherPlayback(
+            targets, playback: [playback[2], otherDriver], driverProcessID: 12
+        ), ["right"])
+        // Drivers before 1.1.0 do not report their process: driver hosts are skipped.
+        XCTAssertTrue(StudioDisplayAudioManager.displaysWithOtherPlayback(
+            targets, playback: [playback[2], otherDriver], driverProcessID: nil
+        ).isEmpty)
+    }
+
+    /// Turning Nearfield down while waiting can leave too little room to lower
+    /// it before raising the displays; then they keep waiting.
+    func testDisplaysKeepWaitingWhenNearfieldCannotGoLowEnough() throws {
+        let displays = Displays()
+        displays.otherPlayback = ["left"]
+        let activation = displays.makeActivation()
+        try activation.activate(displayUIDs: ["left", "right"])
+        displays.routerDecibels = -60
+
+        displays.otherPlayback = []
+        try activation.raiseWaitingDisplaysIfFree()
+
+        XCTAssertFalse(displays.events.contains("raise"))
+        XCTAssertEqual(displays.routerDecibels, -60)
+        XCTAssertEqual(displays.displayDecibels, -30)
+        XCTAssertEqual(activation.waitingDisplayUIDs, ["left", "right"])
+    }
+
+    func testFailedCompensationStillActivatesQuieter() throws {
+        let displays = Displays()
+        displays.otherPlayback = ["left"]
+        displays.failing = "shift"
+        let activation = displays.makeActivation()
+
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        XCTAssertTrue(displays.routerIsDefault)
+        XCTAssertEqual(activation.waitingDisplayUIDs, ["left", "right"])
+        XCTAssertLessThanOrEqual(displays.loudestNearfield, -40)
+        XCTAssertEqual(displays.displayDecibels, -30)
     }
 
     /// Nearfield's volume cannot go above 0 dB, so it may wait quieter than

@@ -8,6 +8,7 @@ enum ProcessAudioPlayback {
         var processID: (AudioObjectID) -> Int32?
         var outputDevices: (AudioObjectID) -> [AudioObjectID]
         var deviceUID: (AudioObjectID) -> String?
+        var bundleID: (AudioObjectID) -> String? = { _ in nil }
 
         @available(macOS 14.2, *)
         static var coreAudio: Properties {
@@ -16,7 +17,8 @@ enum ProcessAudioPlayback {
                 outputIsRunning: { CoreAudioProperty.read(from: $0, selector: kAudioProcessPropertyIsRunningOutput, as: UInt32.self) == 1 },
                 processID: { CoreAudioProperty.read(from: $0, selector: kAudioProcessPropertyPID, as: Int32.self) },
                 outputDevices: { objectIDs(on: $0, selector: kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput) },
-                deviceUID: { string(on: $0, selector: kAudioDevicePropertyDeviceUID) }
+                deviceUID: { string(on: $0, selector: kAudioDevicePropertyDeviceUID) },
+                bundleID: { string(on: $0, selector: kAudioProcessPropertyBundleID) }
             )
         }
     }
@@ -47,7 +49,7 @@ enum ProcessAudioPlayback {
             let devices = properties.outputDevices(process)
             let uids = devices.compactMap(properties.deviceUID)
             guard !uids.isEmpty, uids.count == devices.count else { return nil }
-            return RouterConnectionHandoff.Playback(processID: pid, outputUIDs: Set(uids))
+            return RouterConnectionHandoff.Playback(processID: pid, outputUIDs: Set(uids), bundleID: properties.bundleID(process))
         }
     }
 

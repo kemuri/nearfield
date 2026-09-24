@@ -487,9 +487,10 @@ final class StudioDisplayAudioManager {
 
     /// Target displays another process plays on directly rather than through
     /// Nearfield. Raising their volume would make that playback louder too.
-    /// Before macOS 14.2 processes cannot be told apart, so any display that is
-    /// running counts.
-    func displaysWithOtherPlayback(_ uids: [String]) -> Set<String> {
+    /// |driverProcessID| is the process hosting Nearfield's driver, which plays
+    /// Nearfield's audio on the displays. Before macOS 14.2 processes cannot be
+    /// told apart, so any display that is running counts.
+    func displaysWithOtherPlayback(_ uids: [String], driverProcessID: Int32?) -> Set<String> {
         let targets = Set(uids)
         guard ProcessAudioPlayback.isSupported else {
             return targets.filter { uid in
@@ -501,16 +502,30 @@ final class StudioDisplayAudioManager {
                 ) == 1
             }
         }
-        return Self.displaysWithOtherPlayback(targets, playback: ProcessAudioPlayback.activeOutputs())
+        return Self.displaysWithOtherPlayback(
+            targets,
+            playback: ProcessAudioPlayback.activeOutputs(),
+            driverProcessID: driverProcessID
+        )
     }
+
+    /// Apple's service that hosts audio drivers, one process per driver.
+    static let driverServiceBundleID = "com.apple.audio.Core-Audio-Driver-Service.helper"
 
     static func displaysWithOtherPlayback(
         _ targets: Set<String>,
-        playback: [RouterConnectionHandoff.Playback]
+        playback: [RouterConnectionHandoff.Playback],
+        driverProcessID: Int32?
     ) -> Set<String> {
         let nearfieldUIDs = NearfieldAudioIdentifiers.virtualOutputUIDs.union(NearfieldAudioIdentifiers.managedAggregateUIDs)
         return playback.reduce(into: Set<String>()) { busy, playback in
-            // Nearfield's own output reaches the displays through its aggregate.
+            if let driverProcessID {
+                guard playback.processID != driverProcessID else { return }
+            } else if playback.bundleID == driverServiceBundleID {
+                // Drivers before 1.1.0 do not report their process; skip every
+                // driver host rather than wait on Nearfield's own output.
+                return
+            }
             guard playback.outputUIDs.isDisjoint(with: nearfieldUIDs) else { return }
             busy.formUnion(playback.outputUIDs.intersection(targets))
         }

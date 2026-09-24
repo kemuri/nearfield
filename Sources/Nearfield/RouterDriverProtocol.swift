@@ -25,6 +25,8 @@ struct RouterDriverStatus: Equatable {
     var underruns: Int
     var halRequests: Int
     var writerVerification: String?
+    /// The process hosting the driver, which plays Nearfield's audio on the displays.
+    var hostProcessID: Int32?
 
     init?(dictionary: [String: Any]) {
         guard let version = dictionary["protocolVersion"] as? Int else { return nil }
@@ -43,6 +45,7 @@ struct RouterDriverStatus: Equatable {
         underruns = (counters["underruns"] as? NSNumber)?.intValue ?? 0
         halRequests = (counters["halRequests"] as? NSNumber)?.intValue ?? 0
         writerVerification = dictionary["writerVerification"] as? String
+        hostProcessID = (dictionary["hostProcessID"] as? NSNumber).map { Int32(truncatingIfNeeded: $0.int64Value) }
     }
 
     /// Ready for exactly these displays, in this order, in this mode.

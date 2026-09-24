@@ -80,6 +80,7 @@ final class RouterAudioDriverManager {
         appliedLegacyValues = [:]
         appliedLegacyBoxID = nil
         legacyCapabilities = nil
+        cachedControls = nil
     }
 
     func configureRouterOutput(
@@ -413,38 +414,40 @@ final class RouterAudioDriverManager {
 
     /// Moves Nearfield's volume by |decibels| within its range, keeping
     /// |balance|. Returns the change actually applied.
+    ///
+    /// Nearfield's driver maps its volume linearly in decibels across the
+    /// control's range. Core Audio does not pass the scalar/decibel conversion
+    /// properties through to the driver, so the mapping is computed here and
+    /// checked against the level the driver reports.
     func shiftBaseVolume(byDecibels decibels: Float32, balance: Float32) throws -> Float32 {
         guard decibels != 0 else { return 0 }
-        guard let controls = volumeControlIDs(), let base = currentBaseVolume() else {
+        guard let controls = volumeControlIDs(),
+              let left = volumeControlValue(controls.left),
+              let right = volumeControlValue(controls.right) else {
             throw RouterAudioDriverError.notInstalled
         }
-        guard let current = convertLevel(base, on: controls.left, selector: kAudioLevelControlPropertyConvertScalarToDecibels),
-              let range: AudioValueRange = CoreAudioProperty.read(
-                from: controls.left,
+        let louderControl = left >= right ? controls.left : controls.right
+        let base = max(left, right)
+        guard let range: AudioValueRange = CoreAudioProperty.read(
+                from: louderControl,
                 selector: kAudioLevelControlPropertyDecibelRange
+              ),
+              range.mMaximum > range.mMinimum,
+              let reported: Float32 = CoreAudioProperty.read(
+                from: louderControl,
+                selector: kAudioLevelControlPropertyDecibelValue
               ) else {
             throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnknownPropertyError)
         }
-        let target = min(max(current + decibels, Float32(range.mMinimum)), Float32(range.mMaximum))
-        guard let scalar = convertLevel(target, on: controls.left, selector: kAudioLevelControlPropertyConvertDecibelsToScalar) else {
-            throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnknownPropertyError)
+        let minimum = Float32(range.mMinimum)
+        let span = Float32(range.mMaximum - range.mMinimum)
+        let current = minimum + base * span
+        guard abs(current - reported) < 0.5 else {
+            throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnsupportedOperationError)
         }
-        try setBalancedVolume(scalar, balance: balance)
+        let target = min(max(current + decibels, minimum), minimum + span)
+        try setBalancedVolume((target - minimum) / span, balance: balance)
         return target - current
-    }
-
-    private func convertLevel(_ value: Float32, on control: AudioObjectID, selector: AudioObjectPropertySelector) -> Float32? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var data = value
-        var size = UInt32(MemoryLayout<Float32>.size)
-        guard AudioObjectGetPropertyData(control, &address, 0, nil, &size, &data) == noErr, data.isFinite else {
-            return nil
-        }
-        return data
     }
 
     func adjustVolume(by delta: Float32, balance: Float32) throws {
@@ -611,7 +614,11 @@ final class RouterAudioDriverManager {
 
     private func volumeControlIDs() -> (left: AudioObjectID, right: AudioObjectID)? {
         guard let deviceID = routerDeviceID() else { return nil }
-        if let cached = cachedControls, cached.deviceID == deviceID {
+        // Object IDs can be reused after Core Audio restarts; check that the
+        // cached control is still one of this device's volume controls.
+        if let cached = cachedControls, cached.deviceID == deviceID,
+           CoreAudioProperty.read(from: cached.left, selector: kAudioObjectPropertyOwner, as: AudioObjectID.self) == deviceID,
+           classID(for: cached.left) == kAudioVolumeControlClassID {
             return (cached.left, cached.right)
         }
         let controls = ownedObjectIDs(for: deviceID).filter { objectID in

@@ -83,7 +83,12 @@ extension AppDelegate {
                 }
             },
             selectRouter: { [unowned self] in try self.routerDriverManager.selectRouterAsDefaultOutput() },
-            displaysWithOtherPlayback: { [unowned self] uids in self.audioManager.displaysWithOtherPlayback(uids) },
+            displaysWithOtherPlayback: { [unowned self] uids in
+                self.audioManager.displaysWithOtherPlayback(
+                    uids,
+                    driverProcessID: self.routerDriverManager.status()?.hostProcessID
+                )
+            },
             displayRaiseDecibels: { [unowned self] uids in self.audioManager.fullVolumeRaiseDecibels(forUIDs: uids) },
             shiftRouterVolume: { [unowned self] decibels in
                 try self.routerDriverManager.shiftBaseVolume(byDecibels: decibels, balance: self.currentBalance())

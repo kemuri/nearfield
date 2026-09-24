@@ -65,6 +65,9 @@ final class RouterOutputActivation {
     /// Called when displays start or stop waiting.
     var onWaitingChange: (() -> Void)?
 
+    /// Decibels treated as no change in level.
+    static let levelTolerance: Float32 = 0.5
+
     init(operations: Operations) {
         self.operations = operations
     }
@@ -82,7 +85,9 @@ final class RouterOutputActivation {
                 preparedDisplayUIDs = displayUIDs
             } else {
                 waitingDisplayUIDs = displayUIDs
-                waitingCompensation = try operations.shiftRouterVolume(operations.displayRaiseDecibels(displayUIDs))
+                // Without the compensation Nearfield only plays quieter while
+                // the displays wait, so a failure here does not stop activation.
+                waitingCompensation = (try? operations.shiftRouterVolume(operations.displayRaiseDecibels(displayUIDs))) ?? 0
             }
         } catch {
             try? restoreDisplays()
@@ -94,7 +99,9 @@ final class RouterOutputActivation {
     /// prepared (or waiting), in which case only the balance is applied.
     func activateIfNeeded(displayUIDs: [String]) throws {
         if waitingDisplayUIDs == displayUIDs, operations.routerIsDefault() {
-            try raiseWaitingDisplaysIfFree()
+            // Waiting displays are raised when they are free; a failure to do
+            // so now only means they keep waiting.
+            try? raiseWaitingDisplaysIfFree()
             try operations.applyBalance()
             return
         }
@@ -106,7 +113,8 @@ final class RouterOutputActivation {
     }
 
     /// Raises waiting displays once no other app plays on them: Nearfield's
-    /// volume is lowered first by what raising the displays adds.
+    /// volume is lowered first by what raising the displays adds. When it
+    /// cannot go that low, the displays keep waiting.
     func raiseWaitingDisplaysIfFree() throws {
         guard let displayUIDs = waitingDisplayUIDs else { return }
         guard operations.routerIsDefault() else {
@@ -114,7 +122,12 @@ final class RouterOutputActivation {
             return
         }
         guard operations.displaysWithOtherPlayback(displayUIDs).isEmpty else { return }
-        _ = try operations.shiftRouterVolume(-operations.displayRaiseDecibels(displayUIDs))
+        let raise = operations.displayRaiseDecibels(displayUIDs)
+        let lowered = try operations.shiftRouterVolume(-raise)
+        guard -lowered >= raise - Self.levelTolerance else {
+            _ = try? operations.shiftRouterVolume(-lowered)
+            return
+        }
         waitingCompensation = 0
         waitingDisplayUIDs = nil
         // A failure leaves Nearfield quieter, never louder; the next

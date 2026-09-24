@@ -5878,6 +5878,9 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
         CFDictionarySetValue(status, CFSTR("driverVersion"), version);
     }
     setDictionaryInteger(status, CFSTR("protocolVersion"), kNearfieldProtocolVersion);
+    // The process hosting the driver plays Nearfield's audio on the displays;
+    // Nearfield must not count it as another app using them.
+    setDictionaryInteger(status, CFSTR("hostProcessID"), (int64_t)getpid());
     // Changes whenever the driver restarts (settings sent only to a previous
     // instance, such as process routes, must be sent again).
     setDictionaryInteger(status, CFSTR("instance"), (int64_t)(initializedHostTime & 0x7fffffffffffffffULL));

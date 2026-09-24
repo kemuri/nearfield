@@ -732,6 +732,10 @@ static void testStatusAndCustomProperties() {
 
     CFDictionarySmartRef status((CFDictionaryRef)f.copyBoxProperty(kNearfieldPropertyStatus));
     CHECK(status && CFGetTypeID(status) == CFDictionaryGetTypeID());
+    CFNumberRef hostProcessID = (CFNumberRef)CFDictionaryGetValue(status, CFSTR("hostProcessID"));
+    int64_t reportedProcessID = 0;
+    CHECK(hostProcessID && CFNumberGetValue(hostProcessID, kCFNumberSInt64Type, &reportedProcessID));
+    CHECK(reportedProcessID == getpid());
     CHECK(CFDictionaryGetValue(status, CFSTR("ready")) == kCFBooleanFalse);
     CFArrayRef capabilities = (CFArrayRef)CFDictionaryGetValue(status, CFSTR("capabilities"));
     CHECK(capabilities && CFArrayContainsValue(capabilities, CFRangeMake(0, CFArrayGetCount(capabilities)),

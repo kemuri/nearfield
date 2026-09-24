@@ -7,6 +7,7 @@ final class RouterConnectionHandoff {
     struct Playback: Equatable {
         let processID: Int32
         let outputUIDs: Set<String>
+        var bundleID: String? = nil
     }
 
     struct Snapshot {
