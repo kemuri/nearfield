@@ -106,8 +106,8 @@ Useful scripts:
 | `swift script/measure_latency.swift` | Measure end-to-end latency with a Studio Display microphone |
 | `./script/measure_app_footprint.sh` | Measure the app's memory and idle CPU |
 
-The Metal toolchain is optional. Without it, Wave Lab uses its SwiftUI
-fallback. Xcode can install it with:
+Building the app requires the Metal toolchain, for the Settings header and
+Wave Lab effects. Xcode can install it with:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain

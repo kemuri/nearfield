@@ -38,6 +38,17 @@ SWIFT_MODULE_CACHE_DIR="${NEARFIELD_SWIFT_MODULE_CACHE_DIR:-/private/tmp/nearfie
 SWIFT_BUILD_DIR="${NEARFIELD_SWIFT_BUILD_DIR:-$ROOT_DIR/.build/nearfield-bundle}"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-}"
 SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
+METAL_SRC="$ROOT_DIR/Sources/Nearfield/WaveLabEffects.metal"
+
+if [[ ! -f "$METAL_SRC" ]]; then
+  echo "error: required Metal source was not found: $METAL_SRC" >&2
+  exit 1
+fi
+if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+  echo "error: the Metal toolchain is required; Nearfield cannot be built with the SwiftUI fallback." >&2
+  echo "install it with: xcodebuild -downloadComponent MetalToolchain" >&2
+  exit 1
+fi
 
 mkdir -p "$SWIFT_MODULE_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_MODULE_CACHE_DIR"
@@ -117,20 +128,11 @@ fi
 rm -rf "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 cp -R "$ROUTER_DRIVER_SOURCE" "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 
-METAL_SRC="$ROOT_DIR/Sources/Nearfield/WaveLabEffects.metal"
-if [[ -f "$METAL_SRC" ]]; then
-  if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-    METAL_AIR="$(mktemp -t WaveLabEffects).air"
-    xcrun -sdk macosx metal -O -fmodules-cache-path="$SWIFT_MODULE_CACHE_DIR" -c "$METAL_SRC" -o "$METAL_AIR"
-    xcrun -sdk macosx metallib "$METAL_AIR" -o "$APP_RESOURCES/default.metallib"
-    rm -f "$METAL_AIR"
-    echo "compiled Metal effects -> $APP_RESOURCES/default.metallib"
-  else
-    echo "warning: Metal toolchain unavailable; Wave Lab effects will use the SwiftUI fallback." >&2
-    echo "         install it with: xcodebuild -downloadComponent MetalToolchain" >&2
-    rm -f "$APP_RESOURCES/default.metallib"
-  fi
-fi
+METAL_AIR="$(mktemp -t WaveLabEffects).air"
+xcrun -sdk macosx metal -O -fmodules-cache-path="$SWIFT_MODULE_CACHE_DIR" -c "$METAL_SRC" -o "$METAL_AIR"
+xcrun -sdk macosx metallib "$METAL_AIR" -o "$APP_RESOURCES/default.metallib"
+rm -f "$METAL_AIR"
+echo "compiled Metal effects -> $APP_RESOURCES/default.metallib"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -181,6 +183,7 @@ validate_packaged_app_layout() {
     "$APP_BINARY"
     "$INFO_PLIST"
     "$APP_RESOURCES/Nearfield.icns"
+    "$APP_RESOURCES/default.metallib"
     "$RESOURCE_BUNDLE_DESTINATION"
     "$PACKAGED_MENU_BAR_ICON"
     "$APP_FRAMEWORKS/Sparkle.framework"
