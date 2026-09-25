@@ -9,6 +9,8 @@ AudioDevice::AudioDevice(AudioObjectID inId, bool inIsOutput) {
     isOutput = inIsOutput;
     safetyOffset = 0;
     bufferFrameSize = 0;
+    latencyFrames = 0;
+    sampleRate = 0;
     procId = nullptr;
     isStarted = false;
 
@@ -68,6 +70,30 @@ OSStatus AudioDevice::updateStreamInfo() {
         return err;
     }
 
+    UInt32 deviceLatency = 0;
+    getIntegerPropertyData(deviceLatency,
+                           kAudioDevicePropertyLatency,
+                           isOutput ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput,
+                           kAudioObjectPropertyElementMain);
+    UInt32 streamLatency = 0;
+    AudioObjectPropertyAddress streamsAddress = {kAudioDevicePropertyStreams,
+                                                 isOutput ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput,
+                                                 kAudioObjectPropertyElementMain};
+    AudioObjectID firstStream = kAudioObjectUnknown;
+    UInt32 streamsSize = sizeof(firstStream);
+    nearfield::countHALRequest();
+    if (AudioObjectGetPropertyData(id, &streamsAddress, 0, NULL, &streamsSize, &firstStream) == noErr &&
+        streamsSize >= sizeof(firstStream) && firstStream != kAudioObjectUnknown) {
+        AudioObjectPropertyAddress latencyAddress = {
+            kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        UInt32 size = sizeof(streamLatency);
+        nearfield::countHALRequest();
+        if (AudioObjectGetPropertyData(firstStream, &latencyAddress, 0, NULL, &size, &streamLatency) != noErr) {
+            streamLatency = 0;
+        }
+    }
+    latencyFrames = deviceLatency + streamLatency;
+
     return noErr;
 }
 
@@ -77,6 +103,7 @@ void AudioDevice::addPropertyListener(AudioObjectPropertySelector selector,
                                       AudioObjectPropertyListenerProc proc,
                                       void *clientData) {
     AudioObjectPropertyAddress listenerPropertyAddress = {selector, scope, element};
+    nearfield::countHALRequest();
     OSStatus err = AudioObjectAddPropertyListener(id, &listenerPropertyAddress, proc, clientData);
 
     if (err != noErr) {
@@ -104,6 +131,7 @@ void AudioDevice::removePropertyListener(AudioObjectPropertySelector selector,
     }
 
     AudioObjectPropertyAddress listenerPropertyAddress = {selector, scope, element};
+    nearfield::countHALRequest();
     OSStatus err = AudioObjectRemovePropertyListener(id, &listenerPropertyAddress, proc, clientData);
 
     if (err != noErr) {
@@ -128,6 +156,7 @@ OSStatus AudioDevice::getIntegerPropertyData(UInt32 &outValue,
     AudioObjectPropertyAddress propertyAddress = {selector, scope, element};
     UInt32 size = sizeof(UInt32);
     UInt32 value = 0;
+    nearfield::countHALRequest();
     OSStatus err = AudioObjectGetPropertyData(id, &propertyAddress, 0, NULL, &size, &value);
 
     if (err != noErr) {
@@ -158,6 +187,7 @@ OSStatus AudioDevice::getDoublePropertyData(Float64 &outValue,
     AudioObjectPropertyAddress propertyAddress = {selector, scope, element};
     UInt32 size = sizeof(Float64);
     Float64 value = 0;
+    nearfield::countHALRequest();
     OSStatus err = AudioObjectGetPropertyData(id, &propertyAddress, 0, NULL, &size, &value);
 
     if (err != noErr) {
@@ -187,8 +217,9 @@ void AudioDevice::setBufferFrameSize(UInt32 newBufferFrameSize) {
                                                            : kAudioObjectPropertyScopeInput,
                                                   kAudioObjectPropertyElementMain};
 
+    nearfield::countHALRequest();
     OSStatus err =
-        AudioObjectSetPropertyData(id, &propertyAddress, 0, NULL, sizeof(bufferFrameSize), &newBufferFrameSize);
+        AudioObjectSetPropertyData(id, &propertyAddress, 0, NULL, sizeof(newBufferFrameSize), &newBufferFrameSize);
 
     if (err == noErr) {
         bufferFrameSize = newBufferFrameSize;
@@ -209,6 +240,7 @@ void AudioDevice::setupIOProc(AudioDeviceIOProc inProc, void *clientData) {
         return;
     }
 
+    nearfield::countHALRequest();
     OSStatus err = AudioDeviceCreateIOProcID(id, inProc, clientData, &procId);
 
     if (err != noErr) {
@@ -219,6 +251,7 @@ void AudioDevice::setupIOProc(AudioDeviceIOProc inProc, void *clientData) {
 
 void AudioDevice::destroyIOProc() {
     if (procId != nullptr) {
+        nearfield::countHALRequest();
         AudioDeviceDestroyIOProcID(id, procId);
         procId = nullptr;
     }
@@ -234,6 +267,7 @@ void AudioDevice::start() {
         return;
     }
 
+    nearfield::countHALRequest();
     OSStatus err = AudioDeviceStart(id, procId);
 
     if (err != noErr) {
@@ -253,6 +287,7 @@ void AudioDevice::stop() {
         return;
     }
 
+    nearfield::countHALRequest();
     OSStatus err = AudioDeviceStop(id, procId);
     isStarted = false;
 
@@ -266,6 +301,7 @@ std::vector<AudioObjectID> AudioDevice::allAudioDevices() {
         kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
 
     UInt32 devicesSize = 0;
+    nearfield::countHALRequest();
     AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &devicesSize);
     UInt32 deviceCount = devicesSize / sizeof(AudioObjectID);
 
@@ -274,6 +310,7 @@ std::vector<AudioObjectID> AudioDevice::allAudioDevices() {
     }
 
     std::vector<AudioObjectID> devices(deviceCount);
+    nearfield::countHALRequest();
     OSStatus error =
         AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &devicesSize, devices.data());
 
@@ -294,6 +331,7 @@ std::vector<AudioObjectID> AudioDevice::devicesWithOutputCapabilitiesThatAreNotP
                                                       kAudioObjectPropertyScopeOutput,
                                                       kAudioObjectPropertyElementMain};
         UInt32 size = sizeof(values);
+        nearfield::countHALRequest();
         OSStatus error = AudioObjectGetPropertyData(device, &propertyAddress, 0, NULL, &size, values);
 
         if (error != noErr || values[0] == values[1]) {
@@ -317,6 +355,7 @@ AudioObjectID AudioDevice::defaultOutputDevice() {
     UInt32 size = sizeof(result);
     AudioObjectPropertyAddress propertyAddress = {
         kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    nearfield::countHALRequest();
     OSStatus error = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &size, &result);
 
     return (error == noErr) ? result : kAudioObjectUnknown;
@@ -331,6 +370,7 @@ CFStringRef AudioDevice::copyDeviceUID(AudioObjectID device) {
         kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     CFStringRef uid = NULL;
     UInt32 size = sizeof(uid);
+    nearfield::countHALRequest();
     OSStatus error = AudioObjectGetPropertyData(device, &uidAddr, 0, NULL, &size, &uid);
 
     return (error == noErr) ? uid : nullptr;
@@ -345,6 +385,7 @@ CFStringRef AudioDevice::copyObjectName(AudioObjectID device) {
         kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     CFStringRef name = NULL;
     UInt32 size = sizeof(name);
+    nearfield::countHALRequest();
     OSStatus error = AudioObjectGetPropertyData(device, &nameAddr, 0, NULL, &size, &name);
 
     return (error == noErr) ? name : nullptr;
@@ -353,6 +394,7 @@ CFStringRef AudioDevice::copyObjectName(AudioObjectID device) {
 void AudioDevice::setObjectName(AudioObjectID object, CFStringRef newName) {
     AudioObjectPropertyAddress setNameAddr = {
         kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    nearfield::countHALRequest();
     AudioObjectSetPropertyData(object, &setNameAddr, 0, NULL, sizeof(newName), &newName);
 }
 
@@ -363,6 +405,7 @@ AudioDeviceID AudioDevice::audioDeviceIDForUID(CFStringRef uid, AudioObjectPrope
     AudioObjectID result;
     UInt32 resultSize = sizeof(result);
     UInt32 uidSize = sizeof(uid);
+    nearfield::countHALRequest();
     OSStatus error =
         AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, uidSize, &uid, &resultSize, &result);
 
@@ -390,6 +433,7 @@ AudioDeviceID AudioDevice::audioDeviceIDForDeviceUID(CFStringRef uid) {
         sizeof(outputDeviceID)
     };
     UInt32 translationSize = sizeof(translation);
+    nearfield::countHALRequest();
     OSStatus error = AudioObjectGetPropertyData(
         kAudioObjectSystemObject, &propertyAddress, 0, NULL, &translationSize, &translation);
     if (error != noErr) {
@@ -407,5 +451,6 @@ bool AudioDevice::setIdentifyValue(AudioDeviceID device, SInt32 value) {
     AudioObjectPropertyAddress setIdentifyAddr = {
         kAudioObjectPropertyIdentify, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
 
+    nearfield::countHALRequest();
     return AudioObjectSetPropertyData(device, &setIdentifyAddr, 0, NULL, sizeof(value), &value) == noErr;
 }

@@ -23,17 +23,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let audioManager = StudioDisplayAudioManager()
     let routerDriverManager = RouterAudioDriverManager()
+    /// Rule checks and the Settings window's live routes, on the main thread.
+    /// Uses the same cached app and screen snapshots as the follower.
     lazy var windowRouteResolver = WindowAudioRouteResolver(
-        studioDisplays: { [weak self] in
-            self?.audioManager.studioDisplayDevices() ?? []
+        runningApplications: { [weak self] in
+            MainActor.assumeIsolated { self?.runningApplicationsCache ?? [] }
         },
-        leftDeviceUID: {
-            NearfieldPreferences.leftDeviceUID()
-        },
-        displayOrderUIDs: {
-            NearfieldPreferences.displayOrderUIDs()
+        displayTargets: { [weak self] in
+            MainActor.assumeIsolated { self?.cachedDisplayTargets() ?? [] }
         }
     )
+    lazy var windowRouteFollower = WindowRouteFollower { [weak self] rules in
+        self?.applyFollowedRouteRules(rules)
+    }
+    var followedRouteRules: String?
+    lazy var routingAppCatalog: RoutingAppCatalog = {
+        let catalog = RoutingAppCatalog()
+        catalog.onUpdate = { [weak self] in
+            self?.reconcileRoutingAliases()
+            self?.refreshStatus()
+        }
+        return catalog
+    }()
+    var runningApplicationsCache: [WindowAudioRouteResolver.RunningApplication] = []
+    var displayTargetsCache: [WindowAudioRouteResolver.DisplayTarget]?
+    var nearfieldRunningObserver: CoreAudioPropertyObserver?
+    var windowFollowPlaybackMonitor: ProcessPlaybackMonitor?
     lazy var testTonePlayer = TestTonePlayer()
     lazy var displayIdentificationController = DisplayIdentificationController()
     let logger = Logger(subsystem: "com.kemuri.Nearfield", category: "AudioState")
@@ -53,17 +68,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     #endif
     var isInstallingDriver = false
     var driverInstallState: DriverInstallState = .idle
+    /// Read at launch, after installing or removing, and when Settings opens.
+    var driverDiskState: RouterDriverDiskState = .missing
+    var availableDriverUpdate: RouterDriverUpdate?
+    var didPromptForDriverUpdate = false
     var audioStateSynchronizationDepth = 0
     var proxyPreparedDisplayState: [DisplayOutputState]?
     var routerVolumeContinuity = RouterVolumeContinuity()
     var pendingAudioStateChangeTask: Task<Void, Never>?
     var pendingDisplayAssignmentTask: Task<Void, Never>?
-    var dynamicRoutingRulesTask: Task<Void, Never>?
     var dynamicRoutingNotificationObservers: [NSObjectProtocol] = []
     var isDynamicRoutingSystemActive = true
     var lastAppliedRouterRouteRules: String?
     var hadSufficientStudioDisplays = false
-    var shouldReactivateVirtualOutputAfterDisplayReconnect = false
+    var connectionActivationPending = false
+    var connectionHandoff: RouterConnectionHandoff?
+    var connectionHandoffTask: Task<Void, Never>?
+    var connectionHandoffFailure: Error?
+    var lastNonNearfieldOutputUID: String?
     var lastRuntimeError: String?
     var applicationRemovalMonitor: DispatchSourceFileSystemObject?
     var didPromptForDriverUninstallAfterApplicationRemoval = false
@@ -74,10 +96,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aggregateDeviceID: nil,
         isAggregateDefaultOutput: false
     )
-    var cachedRouterDriverAvailability = RouterDriverAvailability(
-        installedOnDisk: DriverInstaller.routerDriverDiskState().isCurrent
-    )
+    var cachedRouterDriverAvailability = RouterDriverAvailability(installedOnDisk: false)
     var cachedRouterDefaultOutput = false
+    lazy var routerOutputActivation = makeRouterOutputActivation()
+    var waitingDisplayPlaybackMonitor: ProcessPlaybackMonitor?
+    var waitingDisplayObservers: [CoreAudioPropertyObserver] = []
+    var routerStatusNotificationsAvailable = false
+    /// Whether Nearfield opens at login, while the Settings window is open.
+    var cachedOpenAtLogin: Bool?
+    var handoffChangeSignal: ChangeSignal?
+    var handoffPlaybackMonitor: ProcessPlaybackMonitor?
+    /// Only the active user's copy of Nearfield configures the driver.
+    var isSessionActive = true
+    var isSystemAsleep = false
+    var lastWakeUptime: TimeInterval?
+    var displayLossGraceTask: Task<Void, Never>?
+    var displaysLostDuringSleepWake = false
+    var nearfieldWasDefaultBeforeDisplayLoss = false
     var coreAudioReadinessGeneration = 0
     var coreAudioStartupTask: Task<Void, Never>?
     var didStartAudioServices = false
@@ -104,11 +139,13 @@ extension AppDelegate {
         LaunchDiagnostics.record("application location accepted")
         proxyPreparedDisplayState = loadProxyPreparedDisplayState()
         LaunchDiagnostics.record("loaded saved proxy display state")
-        let routerDriverDiskState = DriverInstaller.routerDriverDiskState()
+        refreshDriverInstallState()
+        let routerDriverDiskState = driverDiskState
         LaunchDiagnostics.record("read router driver disk state=\(String(describing: routerDriverDiskState))")
         cachedRouterDriverAvailability = RouterDriverAvailability(
             installedOnDisk: routerDriverDiskState.isCurrent
         )
+        isSessionActive = Self.sessionIsOnConsole()
         NearfieldPreferences.migrateOnboardingCompletionIfNeeded(
             currentDriverIsInstalled: routerDriverDiskState.isCurrent
         )
@@ -136,6 +173,7 @@ extension AppDelegate {
     func finishLaunching(notification: Notification) {
         LaunchDiagnostics.record("finishLaunching entered")
         configureDynamicRoutingLifecycleNotifications()
+        refreshRoutingAppCatalog()
         LaunchDiagnostics.record("configured routing lifecycle notifications")
         startApplicationRemovalMonitorIfNeeded()
         LaunchDiagnostics.record("configured application removal monitor")
@@ -185,7 +223,9 @@ extension AppDelegate {
         }
 
         LaunchDiagnostics.record("starting Core Audio services")
-        startCoreAudioServices()
+        startCoreAudioServices { [weak self] in
+            self?.promptForDriverUpdateIfNeeded()
+        }
         LaunchDiagnostics.record("finishLaunching completed")
     }
 
@@ -231,19 +271,33 @@ extension AppDelegate {
     func startAudioServices() {
         guard !didStartAudioServices else { return }
         didStartAudioServices = true
+        runningApplicationsCache = Self.currentRunningApplications()
+        observeRouterStatus()
+        observeConnectionDefaultOutput()
         hadSufficientStudioDisplays = cachedAudioState.detectedDisplays.count >= 2
+        undoInterruptedDisplayWait()
         preparePairOnLaunch()
         mediaKeyVolumeController.start()
         audioManager.startObserving { [weak self] in
-            Task { @MainActor in self?.scheduleAudioStateChange() }
+            Task { @MainActor in
+                self?.observeConnectionDefaultOutput()
+                self?.scheduleAudioStateChange()
+            }
         }
         handleAudioStateChange()
+    }
+
+    /// Reads the installed driver from disk. Only at launch, after installing
+    /// or removing, and when Settings opens: not on every audio change.
+    func refreshDriverInstallState() {
+        driverDiskState = DriverInstaller.routerDriverDiskState()
+        refreshDriverUpdateAvailability()
     }
 
     func currentRouterDriverAvailability(
         coreAudioIsReady: Bool = false
     ) -> RouterDriverAvailability {
-        let currentDriverIsInstalled = DriverInstaller.routerDriverDiskState().isCurrent
+        let currentDriverIsInstalled = driverDiskState.isCurrent
         return RouterDriverAvailability(
             installedOnDisk: currentDriverIsInstalled,
             loadedByCoreAudio: currentDriverIsInstalled &&
@@ -293,10 +347,15 @@ extension AppDelegate {
         coreAudioStartupTask?.cancel()
         coreAudioReadinessGeneration += 1
         pendingAudioStateChangeTask?.cancel()
-        dynamicRoutingRulesTask?.cancel()
+        cancelConnectionHandoff()
+        windowRouteFollower.stop()
+        // Takes back volume added while displays waited to be raised.
+        routerOutputActivation.invalidate()
+        displayLossGraceTask?.cancel()
         dynamicRoutingNotificationObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         dynamicRoutingNotificationObservers.removeAll()
         mediaKeyVolumeController.stop()
+        routerDriverManager.stopObservingStatus()
         audioManager.stopObserving()
         LaunchDiagnostics.record("applicationWillTerminate completed")
     }

@@ -76,6 +76,7 @@ protocol SettingsPreferencesControlling: AnyObject {
 enum DriverInstallRequest: Equatable {
     case userInitiated
     case enablingAppRouting
+    case driverUpgrade
     case onboarding(allowsMissingStudioDisplays: Bool)
 
     var disablesAppRoutingOnFailure: Bool {
@@ -84,7 +85,7 @@ enum DriverInstallRequest: Equatable {
 
     var requiresConfirmation: Bool {
         switch self {
-        case .userInitiated, .enablingAppRouting:
+        case .userInitiated, .enablingAppRouting, .driverUpgrade:
             true
         case .onboarding:
             false
@@ -93,7 +94,7 @@ enum DriverInstallRequest: Equatable {
 
     var presentsErrors: Bool {
         switch self {
-        case .userInitiated, .enablingAppRouting:
+        case .userInitiated, .enablingAppRouting, .driverUpgrade:
             true
         case .onboarding:
             false
@@ -101,6 +102,7 @@ enum DriverInstallRequest: Equatable {
     }
 
     var allowsMissingStudioDisplays: Bool {
+        if self == .driverUpgrade { return true }
         guard case .onboarding(let allowsMissingStudioDisplays) = self else {
             return false
         }
@@ -138,7 +140,9 @@ enum DriverInstallState: Equatable {
 @MainActor
 protocol SettingsDriverControlling: AnyObject {
     func settingsDriverInstalled() -> Bool
+    func settingsDriverUpdateAvailable() -> Bool
     func settingsIsInstallingDriver() -> Bool
+    func settingsIsRemovingDriver() -> Bool
     func settingsDriverInstallState() -> DriverInstallState
     func settingsResetDriverInstallState()
     func settingsInstallDriver(_ request: DriverInstallRequest)
@@ -156,6 +160,8 @@ protocol SettingsRoutingControlling: AnyObject {
     func settingsSetAppRoutingEnabled(_ enabled: Bool)
     func settingsAppRoutingAppBundleIDs() -> [String]?
     func settingsSetAppRoutingAppBundleIDs(_ bundleIDs: [String])
+    /// The app and the helper apps that play its audio, once Nearfield found them.
+    func settingsRoutingBundleIdentifiers(for bundleID: String) -> [String]?
     func settingsSpatialRoutingChannels(for requests: [AppAudioRouteRequest]) -> [String: SpatialRoutingChannel]
     func settingsRoutingRules() -> String
     func settingsSetRoutingRules(_ rules: String)

@@ -1,10 +1,10 @@
 enum NearfieldRouterPolicy {
     static func shouldActivateRouter(
         defaultOutputIsNearfield: Bool,
-        displaysJustReconnected: Bool,
-        shouldReactivateAfterReconnect: Bool
+        displaysJustConnected: Bool,
+        connectionActivationPending: Bool
     ) -> Bool {
-        defaultOutputIsNearfield || (displaysJustReconnected && shouldReactivateAfterReconnect)
+        defaultOutputIsNearfield || displaysJustConnected || connectionActivationPending
     }
 
     static func shouldConfigureRouterAfterDriverInstall(studioDisplayCount: Int) -> Bool {

@@ -5,6 +5,7 @@ enum RouterAudioDriverError: LocalizedError {
     case notInstalled
     case unsupportedDriver
     case unsupportedThreeDisplayDriver
+    case unsupportedReadinessDriver
     case configurationFailed(String, OSStatus)
     case defaultOutputFailed(OSStatus)
     case balanceFailed(String, OSStatus)
@@ -17,6 +18,8 @@ enum RouterAudioDriverError: LocalizedError {
             return "The installed Nearfield audio driver is outdated and does not support private target routing. Reinstall the driver from Nearfield Settings."
         case .unsupportedThreeDisplayDriver:
             return "The installed Nearfield audio driver is outdated and does not support three-display output. Reinstall the driver from Nearfield Settings."
+        case .unsupportedReadinessDriver:
+            return "Update the audio driver in Nearfield Settings to enable reliable automatic output switching."
         case .configurationFailed(let setting, let status):
             return "Configuring router driver setting '\(setting)' failed with CoreAudio status \(status)."
         case .defaultOutputFailed(let status):
@@ -42,6 +45,7 @@ final class RouterAudioDriverManager {
         case driverCapabilities = 7
         case targetAggregateDevices = 8
         case targetAggregateMode = 9
+        case targetOutputReadiness = 10
     }
 
     private enum ActiveCondition: Int {
@@ -49,8 +53,34 @@ final class RouterAudioDriverManager {
         case always = 2
     }
 
+    /// What was last sent to a 1.1 driver instance; only differences are sent.
+    private var appliedSettings: RouterDriverSettings?
+    private var appliedSettingsInstance: Int64?
+    /// What was last sent through the legacy channel, per box object.
+    private var appliedLegacyValues: [String: String] = [:]
+    private var appliedLegacyBoxID: AudioObjectID?
+    private var legacyCapabilities: (boxID: AudioObjectID, value: String?)?
+    private var statusObservation: (boxID: AudioObjectID, block: AudioObjectPropertyListenerBlock)?
+    /// The device's control objects, which only change with the device.
+    private var cachedControls: (deviceID: AudioObjectID, left: AudioObjectID, right: AudioObjectID, mute: AudioObjectID?)?
+
     var isInstalled: Bool {
         routerBoxID() != nil
+    }
+
+    /// Driver 1.1.0 and later: settings and status are dictionaries on the box.
+    var supportsSettingsProperty: Bool {
+        routerBoxID().map(hasSettingsProperty(boxID:)) ?? false
+    }
+
+    /// Forget what was sent, for example after the driver was reinstalled.
+    func resetAppliedSettings() {
+        appliedSettings = nil
+        appliedSettingsInstance = nil
+        appliedLegacyValues = [:]
+        appliedLegacyBoxID = nil
+        legacyCapabilities = nil
+        cachedControls = nil
     }
 
     func configureRouterOutput(
@@ -60,47 +90,63 @@ final class RouterAudioDriverManager {
         routingEnabled: Bool,
         routeRules: String
     ) throws {
-        guard let boxID = routerBoxID() else {
-            throw RouterAudioDriverError.notInstalled
-        }
-
-        try setConfiguratorPID(Int32(ProcessInfo.processInfo.processIdentifier), boxID: boxID)
-        guard supportsDriverOwnedTargetAggregate(boxID: boxID) else {
-            throw RouterAudioDriverError.unsupportedDriver
-        }
-        if targetDeviceUIDs.count >= 3,
-           !supportsThreeDisplayTargetAggregate(boxID: boxID) {
-            throw RouterAudioDriverError.unsupportedThreeDisplayDriver
-        }
-        try setConfiguration("deviceName", value: displayName, boxID: boxID)
-        try setConfiguration("targetAggregateDevices", value: targetDeviceUIDs.joined(separator: "\n"), boxID: boxID)
-        try setConfiguration("targetAggregateMode", value: mode.rawValue, boxID: boxID)
-        try setConfiguration("outputDevice", value: Self.driverTargetAggregateUID, boxID: boxID)
-        try setConfiguration("outputDeviceActiveCondition", value: "\(ActiveCondition.proxiedDeviceActive.rawValue)", boxID: boxID)
-        try setConfiguration("routingEnabled", value: routingEnabled ? "1" : "0", boxID: boxID)
-        try setConfiguration("routeRules", value: routeRules, boxID: boxID)
+        let split = RouterRouteRules.split(routeRules)
+        try configure(RouterDriverSettings(
+            deviceName: displayName,
+            targetDevices: targetDeviceUIDs,
+            mode: mode,
+            routingEnabled: routingEnabled,
+            routeRules: split.rules,
+            processRoutes: split.processRoutes,
+            diagnostics: NearfieldPreferences.driverDiagnostics(),
+            underrunStrategy: NearfieldPreferences.driverUnderrunStrategy()
+        ), legacyRouteRules: routeRules)
     }
 
     func setRoutingEnabled(_ enabled: Bool) throws {
         guard let boxID = routerBoxID() else {
             throw RouterAudioDriverError.notInstalled
         }
-        try setConfiguratorPID(Int32(ProcessInfo.processInfo.processIdentifier), boxID: boxID)
-        try setConfiguration("routingEnabled", value: enabled ? "1" : "0", boxID: boxID)
+        if hasSettingsProperty(boxID: boxID) {
+            try sendChanges(["routingEnabled": enabled], boxID: boxID)
+            appliedSettings?.routingEnabled = enabled
+        } else {
+            try setLegacyConfiguration("routingEnabled", value: enabled ? "1" : "0", boxID: boxID)
+        }
     }
 
+    /// Resolved rules may contain window-following process routes, which a
+    /// 1.1 driver applies on its next audio cycle without saving them.
     func setRouteRules(_ rules: String) throws {
         guard let boxID = routerBoxID() else {
             throw RouterAudioDriverError.notInstalled
         }
-        try setConfiguratorPID(Int32(ProcessInfo.processInfo.processIdentifier), boxID: boxID)
-        try setConfiguration("routeRules", value: rules, boxID: boxID)
+        if hasSettingsProperty(boxID: boxID) {
+            if readStatus(boxID: boxID)?.instance != appliedSettingsInstance {
+                // A restarted driver lost the process routes; send both again.
+                appliedSettings = nil
+            }
+            let split = RouterRouteRules.split(rules)
+            var changes: [String: Any] = [:]
+            if appliedSettings?.routeRules != split.rules { changes["routeRules"] = split.rules }
+            if appliedSettings?.processRoutes != split.processRoutes {
+                changes["processRoutes"] = Dictionary(uniqueKeysWithValues: split.processRoutes.map { (String($0.key), $0.value) })
+            }
+            guard !changes.isEmpty else { return }
+            try sendChanges(changes, boxID: boxID)
+            appliedSettings?.routeRules = split.rules
+            appliedSettings?.processRoutes = split.processRoutes
+        } else {
+            try setLegacyConfiguration("routeRules", value: rules, boxID: boxID)
+        }
     }
 
     func setPublished(_ published: Bool) throws {
         guard let boxID = routerBoxID() else {
             throw RouterAudioDriverError.notInstalled
         }
+        let current: UInt32? = CoreAudioProperty.read(from: boxID, selector: kAudioBoxPropertyAcquired)
+        guard current.map({ ($0 != 0) != published }) ?? true else { return }
         let status = CoreAudioProperty.write(
             UInt32(published ? 1 : 0),
             to: boxID,
@@ -111,13 +157,192 @@ final class RouterAudioDriverManager {
         }
     }
 
+    /// The driver's status (driver 1.1.0 and later), or nil for older drivers.
+    func status() -> RouterDriverStatus? {
+        guard let boxID = routerBoxID(), hasSettingsProperty(boxID: boxID) else { return nil }
+        return readStatus(boxID: boxID)
+    }
+
+    /// Calls |handler| on the main queue whenever the driver's status changes.
+    /// Returns false for drivers without status notifications. Call again
+    /// after Core Audio restarts; it re-registers when the box changed.
+    @discardableResult
+    func observeStatus(_ handler: @escaping () -> Void) -> Bool {
+        guard let boxID = routerBoxID(), hasSettingsProperty(boxID: boxID) else {
+            stopObservingStatus()
+            return false
+        }
+        if statusObservation?.boxID == boxID {
+            return true
+        }
+        stopObservingStatus()
+        var address = Self.address(RouterDriverProperty.status)
+        let block: AudioObjectPropertyListenerBlock = { _, _ in handler() }
+        guard AudioObjectAddPropertyListenerBlock(boxID, &address, .main, block) == noErr else {
+            return false
+        }
+        statusObservation = (boxID, block)
+        return true
+    }
+
+    func stopObservingStatus() {
+        guard let observation = statusObservation else { return }
+        var address = Self.address(RouterDriverProperty.status)
+        AudioObjectRemovePropertyListenerBlock(observation.boxID, &address, .main, observation.block)
+        statusObservation = nil
+    }
+
+    private func configure(_ settings: RouterDriverSettings, legacyRouteRules: String) throws {
+        guard let boxID = routerBoxID() else {
+            throw RouterAudioDriverError.notInstalled
+        }
+        guard hasSettingsProperty(boxID: boxID) else {
+            try configureLegacy(settings, routeRules: legacyRouteRules, boxID: boxID)
+            return
+        }
+        let status = readStatus(boxID: boxID)
+        guard status?.capabilities.contains("driverOwnedTargetAggregate") ?? false else {
+            throw RouterAudioDriverError.unsupportedDriver
+        }
+        if settings.targetDevices.count >= 3,
+           !(status?.capabilities.contains("threeDisplayTargetAggregate") ?? false) {
+            throw RouterAudioDriverError.unsupportedThreeDisplayDriver
+        }
+        if status?.instance != appliedSettingsInstance {
+            // A restarted driver lost the process routes; send everything.
+            appliedSettings = nil
+        }
+        let changes = settings.changes(since: appliedSettings)
+        guard !changes.isEmpty else { return }
+        try sendChanges(changes, boxID: boxID)
+        appliedSettings = settings
+        appliedSettingsInstance = status?.instance
+    }
+
+    private func sendChanges(_ changes: [String: Any], boxID: AudioObjectID) throws {
+        var address = Self.address(RouterDriverProperty.settings)
+        var dictionary = changes as CFDictionary
+        let status = withUnsafeMutablePointer(to: &dictionary) { pointer in
+            AudioObjectSetPropertyData(boxID, &address, 0, nil, UInt32(MemoryLayout<CFDictionary>.size), pointer)
+        }
+        guard status == noErr else {
+            throw RouterAudioDriverError.configurationFailed("settings", status)
+        }
+    }
+
+    private func readStatus(boxID: AudioObjectID) -> RouterDriverStatus? {
+        var address = Self.address(RouterDriverProperty.status)
+        var value: Unmanaged<CFPropertyList>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFPropertyList>?>.size)
+        guard AudioObjectGetPropertyData(boxID, &address, 0, nil, &size, &value) == noErr,
+              let dictionary = value?.takeRetainedValue() as? [String: Any] else {
+            return nil
+        }
+        return RouterDriverStatus(dictionary: dictionary)
+    }
+
+    private func hasSettingsProperty(boxID: AudioObjectID) -> Bool {
+        var address = Self.address(RouterDriverProperty.settings)
+        return AudioObjectHasProperty(boxID, &address)
+    }
+
+    private static func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    // MARK: Legacy configuration channel (drivers before 1.1.0)
+
+    private func configureLegacy(_ settings: RouterDriverSettings, routeRules: String, boxID: AudioObjectID) throws {
+        let capabilities = try legacyCapabilities(boxID: boxID)
+        guard Self.supportsDriverOwnedTargetAggregate(in: capabilities) else {
+            throw RouterAudioDriverError.unsupportedDriver
+        }
+        if settings.targetDevices.count >= 3,
+           !Self.supportsThreeDisplayTargetAggregate(in: capabilities) {
+            throw RouterAudioDriverError.unsupportedThreeDisplayDriver
+        }
+        try setLegacyConfiguration("deviceName", value: settings.deviceName, boxID: boxID)
+        try setLegacyConfiguration("targetAggregateDevices", value: settings.targetDevices.joined(separator: "\n"), boxID: boxID)
+        try setLegacyConfiguration("targetAggregateMode", value: settings.mode.rawValue, boxID: boxID)
+        try setLegacyConfiguration("outputDevice", value: Self.driverTargetAggregateUID, boxID: boxID)
+        try setLegacyConfiguration("outputDeviceActiveCondition", value: "\(ActiveCondition.proxiedDeviceActive.rawValue)", boxID: boxID)
+        try setLegacyConfiguration("routingEnabled", value: settings.routingEnabled ? "1" : "0", boxID: boxID)
+        try setLegacyConfiguration("routeRules", value: routeRules, boxID: boxID)
+    }
+
+    private func legacyCapabilities(boxID: AudioObjectID) throws -> String? {
+        if let cached = legacyCapabilities, cached.boxID == boxID {
+            return cached.value
+        }
+        let value = try? configurationValue(.driverCapabilities, boxID: boxID)
+        legacyCapabilities = (boxID, value ?? nil)
+        return value ?? nil
+    }
+
+    private func setLegacyConfiguration(_ key: String, value: String, boxID: AudioObjectID) throws {
+        if appliedLegacyBoxID != boxID {
+            appliedLegacyValues = [:]
+            appliedLegacyBoxID = boxID
+        }
+        guard appliedLegacyValues[key] != value else { return }
+        try setConfiguratorPID(Int32(ProcessInfo.processInfo.processIdentifier), boxID: boxID)
+        try setConfiguration(key, value: value, boxID: boxID)
+        appliedLegacyValues[key] = value
+    }
+
     func selectRouterAsDefaultOutput() throws {
         guard let routerDeviceID = routerDeviceID() else {
             throw RouterAudioDriverError.notInstalled
         }
 
-        try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultOutputDevice)
-        try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        if defaultOutputDeviceID() != routerDeviceID {
+            try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultOutputDevice)
+        }
+        if defaultDeviceID(selector: kAudioHardwarePropertyDefaultSystemOutputDevice) != routerDeviceID {
+            try setDefaultDevice(routerDeviceID, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        }
+    }
+
+    func targetOutputIsReady(deviceUIDs: [String], mode: NearfieldOutputMode) throws -> Bool {
+        guard let boxID = routerBoxID() else { return false }
+        if hasSettingsProperty(boxID: boxID) {
+            return readStatus(boxID: boxID)?.isReady(deviceUIDs: deviceUIDs, mode: mode) ?? false
+        }
+        let capabilities = try legacyCapabilities(boxID: boxID)
+        guard Self.capabilityTokens(in: capabilities).contains("targetOutputReadiness") else {
+            throw RouterAudioDriverError.unsupportedReadinessDriver
+        }
+        return Self.readinessMatches(
+            try configurationValue(.targetOutputReadiness, boxID: boxID),
+            deviceUIDs: deviceUIDs, mode: mode
+        )
+    }
+
+    static func readinessMatches(_ status: String?, deviceUIDs: [String], mode: NearfieldOutputMode) -> Bool {
+        guard (2...3).contains(deviceUIDs.count) else { return false }
+        return status == (["ready", mode.rawValue] + deviceUIDs).joined(separator: "\n")
+    }
+
+    func currentDefaultOutputUID() -> String? {
+        defaultOutputDeviceID().flatMap {
+            ProcessAudioPlayback.string(on: $0, selector: kAudioDevicePropertyDeviceUID)
+        }
+    }
+
+    func selectPreviousOutputForRecovery(uid: String, displayUIDs: [String]) throws {
+        // Display outputs are prepared at unity gain for the router. Never
+        // briefly make one of those full-volume endpoints the direct output.
+        guard !displayUIDs.contains(uid), !NearfieldAudioIdentifiers.virtualOutputUIDs.contains(uid),
+              uid != Self.driverTargetAggregateUID,
+              let device = audioObjectID(forUID: uid, selector: kAudioHardwarePropertyTranslateUIDToDevice),
+              CoreAudioProperty.read(from: device, selector: kAudioDevicePropertyDeviceIsAlive, as: UInt32.self) == 1 else {
+            throw RouterConnectionHandoff.Failure.playbackDidNotFollow
+        }
+        try setDefaultDevice(device, selector: kAudioHardwarePropertyDefaultOutputDevice)
     }
 
     func isRouterDefaultOutput() -> Bool {
@@ -152,15 +377,23 @@ final class RouterAudioDriverManager {
         return min(max(powf(10, decibels / 20), 0), 1)
     }
 
+    /// Applies |balance| around the current master volume. Writes nothing
+    /// when the channels already match.
     func setBalance(_ balance: Float32) throws {
         guard let controls = volumeControlIDs() else {
             throw RouterAudioDriverError.notInstalled
         }
+        let currentLeft = volumeControlValue(controls.left)
+        let currentRight = volumeControlValue(controls.right)
         let volumes = BalanceMath.channelVolumes(
-            currentLeft: volumeControlValue(controls.left),
-            currentRight: volumeControlValue(controls.right),
+            currentLeft: currentLeft,
+            currentRight: currentRight,
             balance: balance
         )
+        if let currentLeft, abs(currentLeft - volumes.left) < 0.0001,
+           let currentRight, abs(currentRight - volumes.right) < 0.0001 {
+            return
+        }
         try setVolumeControl(controls.left, value: volumes.left, channel: "left")
         try setVolumeControl(controls.right, value: volumes.right, channel: "right")
     }
@@ -177,6 +410,44 @@ final class RouterAudioDriverManager {
         )
         try setVolumeControl(controls.left, value: volumes.left, channel: "left")
         try setVolumeControl(controls.right, value: volumes.right, channel: "right")
+    }
+
+    /// Moves Nearfield's volume by |decibels| within its range, keeping
+    /// |balance|. Returns the change actually applied.
+    ///
+    /// Nearfield's driver maps its volume linearly in decibels across the
+    /// control's range. Core Audio does not pass the scalar/decibel conversion
+    /// properties through to the driver, so the mapping is computed here and
+    /// checked against the level the driver reports.
+    func shiftBaseVolume(byDecibels decibels: Float32, balance: Float32) throws -> Float32 {
+        guard decibels != 0 else { return 0 }
+        guard let controls = volumeControlIDs(),
+              let left = volumeControlValue(controls.left),
+              let right = volumeControlValue(controls.right) else {
+            throw RouterAudioDriverError.notInstalled
+        }
+        let louderControl = left >= right ? controls.left : controls.right
+        let base = max(left, right)
+        guard let range: AudioValueRange = CoreAudioProperty.read(
+                from: louderControl,
+                selector: kAudioLevelControlPropertyDecibelRange
+              ),
+              range.mMaximum > range.mMinimum,
+              let reported: Float32 = CoreAudioProperty.read(
+                from: louderControl,
+                selector: kAudioLevelControlPropertyDecibelValue
+              ) else {
+            throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnknownPropertyError)
+        }
+        let minimum = Float32(range.mMinimum)
+        let span = Float32(range.mMaximum - range.mMinimum)
+        let current = minimum + base * span
+        guard abs(current - reported) < 0.5 else {
+            throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnsupportedOperationError)
+        }
+        let target = min(max(current + decibels, minimum), minimum + span)
+        try setBalancedVolume((target - minimum) / span, balance: balance)
+        return target - current
     }
 
     func adjustVolume(by delta: Float32, balance: Float32) throws {
@@ -228,23 +499,9 @@ final class RouterAudioDriverManager {
         }
     }
 
-    private func supportsDriverOwnedTargetAggregate(boxID: AudioObjectID) -> Bool {
-        guard let capabilities = try? configurationValue(.driverCapabilities, boxID: boxID) else {
-            return false
-        }
-        return Self.supportsDriverOwnedTargetAggregate(in: capabilities)
-    }
-
     static func supportsDriverOwnedTargetAggregate(in capabilities: String?) -> Bool {
         capabilityTokens(in: capabilities)
             .contains("driverOwnedTargetAggregate")
-    }
-
-    private func supportsThreeDisplayTargetAggregate(boxID: AudioObjectID) -> Bool {
-        guard let capabilities = try? configurationValue(.driverCapabilities, boxID: boxID) else {
-            return false
-        }
-        return Self.supportsThreeDisplayTargetAggregate(in: capabilities)
     }
 
     static func supportsThreeDisplayTargetAggregate(in capabilities: String?) -> Bool {
@@ -357,6 +614,13 @@ final class RouterAudioDriverManager {
 
     private func volumeControlIDs() -> (left: AudioObjectID, right: AudioObjectID)? {
         guard let deviceID = routerDeviceID() else { return nil }
+        // Object IDs can be reused after Core Audio restarts; check that the
+        // cached control is still one of this device's volume controls.
+        if let cached = cachedControls, cached.deviceID == deviceID,
+           CoreAudioProperty.read(from: cached.left, selector: kAudioObjectPropertyOwner, as: AudioObjectID.self) == deviceID,
+           classID(for: cached.left) == kAudioVolumeControlClassID {
+            return (cached.left, cached.right)
+        }
         let controls = ownedObjectIDs(for: deviceID).filter { objectID in
             classID(for: objectID) == kAudioVolumeControlClassID &&
                 controlScope(for: objectID) == kAudioObjectPropertyScopeOutput
@@ -366,15 +630,20 @@ final class RouterAudioDriverManager {
               let right = controls.first(where: { controlElement(for: $0) == 2 }) else {
             return nil
         }
+        let mute = ownedObjectIDs(for: deviceID).first { objectID in
+            classID(for: objectID) == kAudioMuteControlClassID &&
+                controlScope(for: objectID) == kAudioObjectPropertyScopeOutput
+        }
+        cachedControls = (deviceID, left, right, mute)
         return (left, right)
     }
 
     private func muteControlID() -> AudioObjectID? {
         guard let deviceID = routerDeviceID() else { return nil }
-        return ownedObjectIDs(for: deviceID).first { objectID in
-            classID(for: objectID) == kAudioMuteControlClassID &&
-                controlScope(for: objectID) == kAudioObjectPropertyScopeOutput
+        if cachedControls?.deviceID != deviceID {
+            _ = volumeControlIDs()
         }
+        return cachedControls?.deviceID == deviceID ? cachedControls?.mute : nil
     }
 
     private func ownedObjectIDs(for objectID: AudioObjectID) -> [AudioObjectID] {

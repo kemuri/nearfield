@@ -12,6 +12,7 @@ BUILD_CONFIGURATION="${NEARFIELD_BUILD_CONFIGURATION:-debug}"
 LAUNCH_DIAGNOSTICS="${NEARFIELD_LAUNCH_DIAGNOSTICS:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/packaged_runtime_paths.sh"
 DIST_DIR="${NEARFIELD_DIST_DIR:-$ROOT_DIR/dist}"
 APP_BUNDLE="${NEARFIELD_APP_BUNDLE:-$DIST_DIR/$APP_NAME.app}"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -37,15 +38,33 @@ SWIFT_MODULE_CACHE_DIR="${NEARFIELD_SWIFT_MODULE_CACHE_DIR:-/private/tmp/nearfie
 SWIFT_BUILD_DIR="${NEARFIELD_SWIFT_BUILD_DIR:-$ROOT_DIR/.build/nearfield-bundle}"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-}"
 SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
+METAL_SRC="$ROOT_DIR/Sources/Nearfield/WaveLabEffects.metal"
+
+if [[ ! -f "$METAL_SRC" ]]; then
+  echo "error: required Metal source was not found: $METAL_SRC" >&2
+  exit 1
+fi
+if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+  echo "error: the Metal toolchain is required; Nearfield cannot be built with the SwiftUI fallback." >&2
+  echo "install it with: xcodebuild -downloadComponent MetalToolchain" >&2
+  exit 1
+fi
 
 mkdir -p "$SWIFT_MODULE_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_MODULE_CACHE_DIR"
+
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
 
 SWIFT_BUILD_ARGUMENTS=(
   build
   --disable-sandbox
   --scratch-path "$SWIFT_BUILD_DIR"
   -c "$BUILD_CONFIGURATION"
+  # Swift Build, SwiftPM's default build system since Swift 6.4, records the
+  # deployment target as the SDK version. macOS then runs Nearfield in
+  # compatibility mode: old-style controls, and a Settings window that never
+  # becomes key, so its display tiles cannot be dragged.
+  -Xlinker -platform_version -Xlinker macos -Xlinker "$MIN_SYSTEM_VERSION" -Xlinker "$SDK_VERSION"
 )
 if [[ "$LAUNCH_DIAGNOSTICS" == "1" ]]; then
   SWIFT_BUILD_ARGUMENTS+=(-Xswiftc -DNEARFIELD_LAUNCH_DIAGNOSTICS)
@@ -54,6 +73,16 @@ fi
 swift "${SWIFT_BUILD_ARGUMENTS[@]}"
 BUILD_BIN_DIR="$(swift "${SWIFT_BUILD_ARGUMENTS[@]}" --show-bin-path)"
 BUILD_BINARY="$BUILD_BIN_DIR/$PRODUCT_NAME"
+# Nearfield supports Apple silicon only; its driver is built for arm64 only.
+if [[ "$(lipo -archs "$BUILD_BINARY")" != "arm64" ]]; then
+  echo "Nearfield must be built for arm64 only; got: $(lipo -archs "$BUILD_BINARY")" >&2
+  exit 1
+fi
+BUILT_SDK_VERSION="$(vtool -show-build "$BUILD_BINARY" | awk '$1 == "sdk" { print $2; exit }')"
+if [[ "$BUILT_SDK_VERSION" != "$SDK_VERSION" ]]; then
+  echo "Nearfield must record the macOS $SDK_VERSION SDK it was built with; got: ${BUILT_SDK_VERSION:-none}" >&2
+  exit 1
+fi
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_FRAMEWORKS" "$APP_RESOURCES" "$APP_DRIVERS"
@@ -99,20 +128,11 @@ fi
 rm -rf "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 cp -R "$ROUTER_DRIVER_SOURCE" "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 
-METAL_SRC="$ROOT_DIR/Sources/Nearfield/WaveLabEffects.metal"
-if [[ -f "$METAL_SRC" ]]; then
-  if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-    METAL_AIR="$(mktemp -t WaveLabEffects).air"
-    xcrun -sdk macosx metal -O -fmodules-cache-path="$SWIFT_MODULE_CACHE_DIR" -c "$METAL_SRC" -o "$METAL_AIR"
-    xcrun -sdk macosx metallib "$METAL_AIR" -o "$APP_RESOURCES/default.metallib"
-    rm -f "$METAL_AIR"
-    echo "compiled Metal effects -> $APP_RESOURCES/default.metallib"
-  else
-    echo "warning: Metal toolchain unavailable; Wave Lab effects will use the SwiftUI fallback." >&2
-    echo "         install it with: xcodebuild -downloadComponent MetalToolchain" >&2
-    rm -f "$APP_RESOURCES/default.metallib"
-  fi
-fi
+METAL_AIR="$(mktemp -t WaveLabEffects).air"
+xcrun -sdk macosx metal -O -fmodules-cache-path="$SWIFT_MODULE_CACHE_DIR" -c "$METAL_SRC" -o "$METAL_AIR"
+xcrun -sdk macosx metallib "$METAL_AIR" -o "$APP_RESOURCES/default.metallib"
+rm -f "$METAL_AIR"
+echo "compiled Metal effects -> $APP_RESOURCES/default.metallib"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -158,53 +178,12 @@ if [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
   /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$INFO_PLIST"
 fi
 
-validate_runtime_rpaths() {
-  local saw_framework_rpath=0
-  local rpath
-  while IFS= read -r rpath; do
-    case "$rpath" in
-      "/usr/lib/swift"|"@loader_path")
-        ;;
-      "@executable_path/../Frameworks")
-        saw_framework_rpath=1
-        ;;
-      *)
-        echo "unexpected runtime search path in packaged executable: $rpath" >&2
-        return 1
-        ;;
-    esac
-  done < <(
-    otool -l "$APP_BINARY" |
-      awk '$1 == "cmd" && $2 == "LC_RPATH" { wants_path = 1; next }
-           wants_path && $1 == "path" { print $2; wants_path = 0 }'
-  )
-
-  if [[ "$saw_framework_rpath" != "1" ]]; then
-    echo "packaged executable is missing @executable_path/../Frameworks" >&2
-    return 1
-  fi
-}
-
-remove_build_toolchain_rpaths() {
-  local rpath
-  while IFS= read -r rpath; do
-    case "$rpath" in
-      /Applications/Xcode.app/Contents/Developer/Toolchains/*/usr/lib/swift-*/macosx)
-        install_name_tool -delete_rpath "$rpath" "$APP_BINARY"
-        ;;
-    esac
-  done < <(
-    otool -l "$APP_BINARY" |
-      awk '$1 == "cmd" && $2 == "LC_RPATH" { wants_path = 1; next }
-           wants_path && $1 == "path" { print $2; wants_path = 0 }'
-  )
-}
-
 validate_packaged_app_layout() {
   local required_paths=(
     "$APP_BINARY"
     "$INFO_PLIST"
     "$APP_RESOURCES/Nearfield.icns"
+    "$APP_RESOURCES/default.metallib"
     "$RESOURCE_BUNDLE_DESTINATION"
     "$PACKAGED_MENU_BAR_ICON"
     "$APP_FRAMEWORKS/Sparkle.framework"
@@ -233,7 +212,7 @@ validate_packaged_app_layout() {
       echo "packaged executable contains an absolute build-directory fallback" >&2
       return 1
     fi
-    validate_runtime_rpaths
+    validate_runtime_rpaths "$APP_BINARY"
   fi
 }
 
@@ -249,7 +228,7 @@ sign_path() {
   codesign "${args[@]}" "$path" >/dev/null
 }
 
-remove_build_toolchain_rpaths
+remove_build_toolchain_rpaths "$APP_BINARY"
 sign_path "$APP_FRAMEWORKS/Sparkle.framework"
 sign_path "$APP_DRIVERS/$ROUTER_DRIVER_BUNDLE_NAME"
 sign_path "$APP_BUNDLE"

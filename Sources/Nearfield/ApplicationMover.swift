@@ -1,6 +1,21 @@
 import Foundation
 import Security
 
+enum ApplicationLocation {
+    /// /Applications or ~/Applications. Sparkle updates Nearfield in either.
+    static func isInApplicationsFolder(
+        _ bundleURL: URL,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> Bool {
+        let parent = bundleURL.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().path
+        let folders = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            homeDirectory.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        return folders.contains { $0.standardizedFileURL.resolvingSymlinksInPath().path == parent }
+    }
+}
+
 enum ApplicationMover {
     static func installBundle(
         from sourceURL: URL,

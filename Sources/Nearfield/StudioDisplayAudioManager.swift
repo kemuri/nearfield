@@ -82,6 +82,9 @@ struct AudioDevice: Equatable {
     let uid: String
     let name: String
     let outputChannelCount: UInt32
+    var transportType: UInt32 = 0
+    var modelUID: String = ""
+    var isAggregate = false
 
     var visualKind: DisplayEndpointVisualKind {
         DisplayEndpointVisualKind(deviceUID: uid, deviceName: name)
@@ -97,6 +100,52 @@ struct AudioDevice: Equatable {
             return String(uid.suffix(10))
         }
         return String(parts[parts.count - 2].suffix(8))
+    }
+}
+
+enum StudioDisplayDetection {
+    /// Studio Display speakers are a USB (or Thunderbolt) audio device, never
+    /// an aggregate. The model identifies them; the name is only a hint.
+    static func isStudioDisplaySpeaker(_ device: AudioDevice) -> Bool {
+        guard device.outputChannelCount > 0,
+              !device.isAggregate,
+              device.transportType == kAudioDeviceTransportTypeUSB ||
+                device.transportType == kAudioDeviceTransportTypeThunderbolt else {
+            return false
+        }
+        return device.modelUID.localizedCaseInsensitiveContains("Studio Display") ||
+            device.modelUID.uppercased().contains(":05AC:1114") ||
+            device.uid.localizedCaseInsensitiveContains(":Studio Display:") ||
+            device.name.localizedCaseInsensitiveContains("Studio Display")
+    }
+
+    static func isBuiltInSpeaker(_ device: AudioDevice) -> Bool {
+        device.transportType == kAudioDeviceTransportTypeBuiltIn && device.outputChannelCount > 0
+    }
+}
+
+enum FallbackOutput {
+    /// Where the Mac's sound goes when Nearfield cannot play: the previous
+    /// output, then the built-in speakers, then any real output. Never a
+    /// Studio Display left at full volume for Nearfield.
+    static func choose(
+        from devices: [AudioDevice],
+        preferredUID: String?,
+        isEligible: (AudioDevice) -> Bool
+    ) -> AudioDevice? {
+        let eligible = devices.filter {
+            $0.outputChannelCount > 0 &&
+                !$0.isAggregate &&
+                $0.transportType != kAudioDeviceTransportTypeVirtual &&
+                !NearfieldAudioIdentifiers.virtualOutputUIDs.contains($0.uid) &&
+                isEligible($0)
+        }
+        if let preferredUID, let previous = eligible.first(where: { $0.uid == preferredUID }) {
+            return previous
+        }
+        return eligible.first(where: StudioDisplayDetection.isBuiltInSpeaker) ??
+            eligible.first { !StudioDisplayDetection.isStudioDisplaySpeaker($0) } ??
+            eligible.first
     }
 }
 
@@ -304,10 +353,21 @@ final class StudioDisplayAudioManager {
         device(matchingUID: uid)?.id == defaultSystemOutputDeviceID()
     }
 
+    func deviceID(forUID uid: String) -> AudioObjectID? {
+        deviceID(matchingUID: uid)
+    }
+
     @discardableResult
-    func selectFallbackOutputAsDefault() throws -> Bool {
+    func selectFallbackOutputAsDefault(
+        preferredUID: String? = nil,
+        excludingPreparedDisplayUIDs: Set<String> = []
+    ) throws -> Bool {
         let devices = allDevices()
-        guard let fallback = fallbackOutputDevice(from: devices) else {
+        guard let fallback = fallbackOutputDevice(
+            from: devices,
+            preferredUID: preferredUID,
+            excludingPreparedDisplayUIDs: excludingPreparedDisplayUIDs
+        ) else {
             return false
         }
         try setDefaultOutputDevice(fallback.id)
@@ -425,6 +485,107 @@ final class StudioDisplayAudioManager {
         }
     }
 
+    /// Target displays another process plays on directly rather than through
+    /// Nearfield. Raising their volume would make that playback louder too.
+    /// |driverProcessID| is the process hosting Nearfield's driver, which plays
+    /// Nearfield's audio on the displays. Before macOS 14.2 processes cannot be
+    /// told apart, so any display that is running counts.
+    func displaysWithOtherPlayback(_ uids: [String], driverProcessID: Int32?) -> Set<String> {
+        let targets = Set(uids)
+        guard ProcessAudioPlayback.isSupported else {
+            return targets.filter { uid in
+                guard let device = device(matchingUID: uid) else { return false }
+                return CoreAudioProperty.read(
+                    from: device.id,
+                    selector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+                    as: UInt32.self
+                ) == 1
+            }
+        }
+        return Self.displaysWithOtherPlayback(
+            targets,
+            playback: ProcessAudioPlayback.activeOutputs(),
+            driverProcessID: driverProcessID
+        )
+    }
+
+    /// Apple's service that hosts audio drivers, one process per driver.
+    static let driverServiceBundleID = "com.apple.audio.Core-Audio-Driver-Service.helper"
+
+    static func displaysWithOtherPlayback(
+        _ targets: Set<String>,
+        playback: [RouterConnectionHandoff.Playback],
+        driverProcessID: Int32?
+    ) -> Set<String> {
+        let nearfieldUIDs = NearfieldAudioIdentifiers.virtualOutputUIDs.union(NearfieldAudioIdentifiers.managedAggregateUIDs)
+        return playback.reduce(into: Set<String>()) { busy, playback in
+            if let driverProcessID {
+                guard playback.processID != driverProcessID else { return }
+            } else if playback.bundleID == driverServiceBundleID {
+                // Drivers before 1.1.0 do not report their process; skip every
+                // driver host rather than wait on Nearfield's own output.
+                return
+            }
+            guard playback.outputUIDs.isDisjoint(with: nearfieldUIDs) else { return }
+            busy.formUnion(playback.outputUIDs.intersection(targets))
+        }
+    }
+
+    /// How many decibels setting these displays to full volume adds, for the
+    /// display whose level rises most; muted displays add nothing audible.
+    /// A display that does not report decibels is read on Nearfield's own
+    /// 63.5 dB curve, which overestimates, so compensation errs on the quiet side.
+    func fullVolumeRaiseDecibels(forUIDs uids: [String]) -> Float32 {
+        uids.compactMap { device(matchingUID: $0) }.map { device -> Float32 in
+            if isMuted(device) == true {
+                return 0
+            }
+            if let current = decibels(for: device), let range = decibelRange(for: device) {
+                return max(0, Float32(range.mMaximum) - current)
+            }
+            let scalar = min(max(volume(for: device) ?? 0, 0), 1)
+            return (1 - scalar) * Self.fallbackVolumeRangeDecibels
+        }.max() ?? 0
+    }
+
+    private static let fallbackVolumeRangeDecibels: Float32 = 63.5
+
+    /// The display's level in decibels; for per-channel volume, the quietest channel.
+    private func decibels(for device: AudioDevice) -> Float32? {
+        if let master: Float32 = CoreAudioProperty.read(
+            from: device.id,
+            selector: kAudioDevicePropertyVolumeDecibels,
+            scope: kAudioDevicePropertyScopeOutput,
+            element: kAudioObjectPropertyElementMain
+        ) {
+            return master
+        }
+        return (1...max(1, device.outputChannelCount)).compactMap { channel -> Float32? in
+            CoreAudioProperty.read(
+                from: device.id,
+                selector: kAudioDevicePropertyVolumeDecibels,
+                scope: kAudioDevicePropertyScopeOutput,
+                element: channel,
+                as: Float32.self
+            )
+        }.min()
+    }
+
+    private func decibelRange(for device: AudioDevice) -> AudioValueRange? {
+        let elements = [kAudioObjectPropertyElementMain] + Array(1...max(1, device.outputChannelCount))
+        for element in elements {
+            if let range: AudioValueRange = CoreAudioProperty.read(
+                from: device.id,
+                selector: kAudioDevicePropertyVolumeRangeDecibels,
+                scope: kAudioDevicePropertyScopeOutput,
+                element: element
+            ) {
+                return range
+            }
+        }
+        return nil
+    }
+
     func captureDisplayOutputState() throws -> [DisplayOutputState] {
         let displays = Array(studioDisplayOutputs().prefix(3))
         guard displays.count >= 2 else {
@@ -498,7 +659,7 @@ final class StudioDisplayAudioManager {
 
     private func studioDisplayOutputs() -> [AudioDevice] {
         Array(allDevices()
-            .filter { $0.outputChannelCount > 0 && $0.name.localizedCaseInsensitiveContains("Studio Display") }
+            .filter(StudioDisplayDetection.isStudioDisplaySpeaker)
             .sorted { $0.uid < $1.uid }
             .prefix(3))
     }
@@ -543,7 +704,17 @@ final class StudioDisplayAudioManager {
               let uid: String = getObjectProperty(id, selector: kAudioDevicePropertyDeviceUID) else {
             return nil
         }
-        return AudioDevice(id: id, uid: uid, name: name, outputChannelCount: outputChannelCount(for: id))
+        let transportType: UInt32? = CoreAudioProperty.read(from: id, selector: kAudioDevicePropertyTransportType)
+        let modelUID: String? = getObjectProperty(id, selector: kAudioDevicePropertyModelUID)
+        return AudioDevice(
+            id: id,
+            uid: uid,
+            name: name,
+            outputChannelCount: outputChannelCount(for: id),
+            transportType: transportType ?? 0,
+            modelUID: modelUID ?? "",
+            isAggregate: classID(for: id) == kAudioAggregateDeviceClassID
+        )
     }
 
     private func managedNearfieldAggregates() -> [AudioDevice] {
@@ -648,21 +819,17 @@ final class StudioDisplayAudioManager {
         return status == noErr && id != 0 ? id : nil
     }
 
-    private func fallbackOutputDevice(from devices: [AudioDevice]) -> AudioDevice? {
-        let eligibleDevices = devices.filter {
-            $0.outputChannelCount > 0 &&
-                !NearfieldAudioIdentifiers.virtualOutputUIDs.contains($0.uid) &&
-                !isNearfieldAggregate($0)
+    private func fallbackOutputDevice(
+        from devices: [AudioDevice],
+        preferredUID: String? = nil,
+        excludingPreparedDisplayUIDs: Set<String> = []
+    ) -> AudioDevice? {
+        FallbackOutput.choose(from: devices, preferredUID: preferredUID) { device in
+            guard !isNearfieldAggregate(device) else { return false }
+            guard StudioDisplayDetection.isStudioDisplaySpeaker(device) else { return true }
+            // A display prepared for Nearfield plays at full volume on its own.
+            return !excludingPreparedDisplayUIDs.contains(device.uid) && (volume(for: device) ?? 1) < 0.99
         }
-        return eligibleDevices.first(where: isBuiltInSpeaker) ??
-            eligibleDevices.first { !$0.name.localizedCaseInsensitiveContains("Studio Display") } ??
-            eligibleDevices.first
-    }
-
-    private func isBuiltInSpeaker(_ device: AudioDevice) -> Bool {
-        device.name.localizedCaseInsensitiveContains("MacBook") ||
-            device.name.localizedCaseInsensitiveContains("Built-in") ||
-            device.name.localizedCaseInsensitiveContains("Internal Speakers")
     }
 
     private func isNearfieldAggregate(_ device: AudioDevice) -> Bool {

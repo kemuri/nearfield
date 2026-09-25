@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -81,6 +82,86 @@ class ChangelogTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("already exists", result.stderr)
             self.assertEqual(history.read_bytes(), published)
+
+
+class ReleaseNotesDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        self.script = self.root / "script/update_release_changelog.py"
+        self.script.parent.mkdir()
+        shutil.copyfile(SCRIPT, self.script)
+        self.notes = self.root / "release-notes/0.1.10.json"
+        self.notes.parent.mkdir()
+        self.content = {"version": "0.1.10", "changes": ["Fixed volume recovery."]}
+        self.notes.write_text(json.dumps(self.content))
+        self.cwd = self.root / "unrelated-directory"
+        self.cwd.mkdir()
+
+    def run_command(self, *arguments):
+        return subprocess.run(
+            [sys.executable, str(self.script), *arguments], cwd=self.cwd,
+            capture_output=True, text=True,
+        )
+
+    def test_preflight_discovers_versioned_notes_independently_of_working_directory(self):
+        result = self.run_command("validate-notes", "--version", "0.1.10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.notes))
+
+    def test_explicit_path_takes_priority_and_is_resolved_for_publisher(self):
+        override = self.cwd / "custom notes.json"
+        override.write_text(json.dumps(self.content))
+        result = self.run_command("validate-notes", "--version", "0.1.10",
+                                  "--notes", override.name)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(override))
+
+        override.write_text(json.dumps({**self.content, "version": "0.1.9"}))
+        result = self.run_command("validate-notes", "--version", "0.1.10",
+                                  "--notes", override.name)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must name version 0.1.10", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_future_release_cannot_reuse_previous_notes(self):
+        result = self.run_command("validate-notes", "--version", "0.1.11")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(self.root / "release-notes/0.1.11.json"), result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_discovered_notes_still_require_exact_version_and_changes(self):
+        for content in [{**self.content, "version": "0.1.9"},
+                        {**self.content, "changes": []}]:
+            with self.subTest(content=content):
+                self.notes.write_text(json.dumps(content))
+                result = self.run_command("validate-notes", "--version", "0.1.10")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_publisher_uses_discovered_notes_and_appcast_date(self):
+        website = self.root / "website"
+        (website / "src/data").mkdir(parents=True)
+        (website / "src/pages").mkdir()
+        (website / "src/pages/changelog.astro").touch()
+        history = website / "src/data/releases.json"
+        history.write_text("[]")
+        appcast = self.root / "appcast.xml"
+        appcast.write_text('''<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+          <channel><item><sparkle:shortVersionString>0.1.10</sparkle:shortVersionString>
+          <pubDate>Mon, 21 Sep 2026 10:00:00 +0200</pubDate></item></channel></rss>''')
+        arguments = ("update", "--version", "0.1.10", "--website", str(website),
+                     "--appcast", str(appcast))
+        result = self.run_command(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(history.read_text()),
+                         [{**self.content, "date": "2026-09-21"}])
+
+        # Retrying a published release still works when its local notes are absent.
+        self.notes.unlink()
+        result = self.run_command(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

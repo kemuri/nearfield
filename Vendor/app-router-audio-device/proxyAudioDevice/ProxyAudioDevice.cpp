@@ -1,98 +1,28 @@
 #include "ProxyAudioDevice.h"
 
+#include <Security/Security.h>
 #include <algorithm>
-#include <cctype>
 #include <cstdlib>
+#include <dlfcn.h>
+#include <libproc.h>
 #include <string>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 
 #include "AudioDevice.h"
-#include "AudioRingBuffer.h"
 #include "CFTypeHelpers.h"
 #include "debugHelpers.h"
-#include "utilities.h"
 
 #pragma mark Utility Functions
 
-template<typename T>
-bool contains(const std::vector<T> &v, const T &val) {
-    return std::find(v.begin(), v.end(), val) != v.end();
-}
-
 std::string CFStringToStdString(CFStringRef s);
-static std::string trimString(std::string value);
-static std::string lowercaseString(std::string value);
-static std::vector<std::string> splitTargetDeviceUIDs(CFStringRef value);
-static bool routeDestinationFromString(const std::string &value, ProxyAudioDevice::RouteDestination &destination);
 
 std::string CFStringToStdString(CFStringRef s) {
     if (!s) {
         return std::string("<null>");
     }
-    
-    char *buffer;
-    size_t length = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
-    buffer = new char[length];
-    buffer[0] = '\0';
-    if (!CFStringGetCString(s, buffer, length, kCFStringEncodingUTF8)) {
-        delete[] buffer;
-        return std::string("<invalid>");
-    }
-    std::string result(buffer);
-    delete[] buffer;
-    
-    return result;
-}
-
-static std::string trimString(std::string value) {
-    auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
-    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](unsigned char c) { return !isSpace(c); }));
-    value.erase(std::find_if(value.rbegin(), value.rend(), [&](unsigned char c) { return !isSpace(c); }).base(), value.end());
-    return value;
-}
-
-static std::string lowercaseString(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return (char)std::tolower(c);
-    });
-    return value;
-}
-
-static std::vector<std::string> splitTargetDeviceUIDs(CFStringRef value) {
-    std::vector<std::string> result;
-    std::string raw = CFStringToStdString(value);
-    size_t offset = 0;
-    while (offset < raw.size()) {
-        size_t separator = raw.find_first_of("\n|", offset);
-        std::string item = trimString(raw.substr(offset, separator == std::string::npos ? std::string::npos : separator - offset));
-        offset = separator == std::string::npos ? raw.size() : separator + 1;
-        if (!item.empty() && item != "<null>" && item != "<invalid>") {
-            result.push_back(item);
-        }
-    }
-    return result;
-}
-
-static bool routeDestinationFromString(const std::string &value, ProxyAudioDevice::RouteDestination &destination) {
-    std::string normalized = lowercaseString(trimString(value));
-    if (normalized == "pair" || normalized == "default") {
-        destination = ProxyAudioDevice::RouteDestination::pair;
-        return true;
-    }
-    if (normalized == "left" || normalized == "left-display") {
-        destination = ProxyAudioDevice::RouteDestination::left;
-        return true;
-    }
-    if (normalized == "right" || normalized == "right-display") {
-        destination = ProxyAudioDevice::RouteDestination::right;
-        return true;
-    }
-    if (normalized == "muted" || normalized == "mute" || normalized == "none") {
-        destination = ProxyAudioDevice::RouteDestination::muted;
-        return true;
-    }
-    return false;
+    const std::string value = nearfield::stringFromCF(s);
+    return value.empty() && CFStringGetLength(s) > 0 ? std::string("<invalid>") : value;
 }
 
 #pragma mark The Interface
@@ -504,7 +434,7 @@ HRESULT ProxyAudioDevice::QueryInterface(void *inDriver, REFIID inUUID, LPVOID *
     //    CFPlugIns and AudioServerPlugInDriverInterface (which is the actual interface the HAL will
     //    use).
     if (CFEqual(theRequestedUUID, IUnknownUUID) || CFEqual(theRequestedUUID, kAudioServerPlugInDriverInterfaceUUID)) {
-        CAMutex::Locker locker(stateMutex);
+        StateLocker locker(stateMutex);
         ++gPlugIn_RefCount;
         *outInterface = gAudioServerPlugInDriverRef;
     } else {
@@ -529,7 +459,7 @@ ULONG ProxyAudioDevice::AddRef(void *inDriver) {
 
     //    decrement the refcount
     {
-        CAMutex::Locker locker(stateMutex);
+        StateLocker locker(stateMutex);
         if (gPlugIn_RefCount < UINT32_MAX) {
             ++gPlugIn_RefCount;
         }
@@ -550,7 +480,7 @@ ULONG ProxyAudioDevice::Release(void *inDriver) {
 
     //    increment the refcount
     {
-        CAMutex::Locker locker(stateMutex);
+        StateLocker locker(stateMutex);
         if (gPlugIn_RefCount > 0) {
             --gPlugIn_RefCount;
             //    Note that we don't do anything special if the refcount goes to zero as the HAL
@@ -566,6 +496,25 @@ Done:
 
 #pragma mark Basic Operations
 
+static Float64 hostTicksPerSecond() {
+    struct mach_timebase_info theTimeBaseInfo;
+    mach_timebase_info(&theTimeBaseInfo);
+    return ((Float64)theTimeBaseInfo.denom / theTimeBaseInfo.numer) * 1000000000.0;
+}
+
+static void engineSignalHandler(void *context, uintptr_t signals) {
+    // Called on the audio threads: only merges bits into a dispatch source.
+    dispatch_source_t source = static_cast<ProxyAudioDevice *>(context)->engineSignalSource;
+    if (source) {
+        dispatch_source_merge_data(source, signals);
+    }
+}
+
+ProxyAudioDevice::ProxyAudioDevice() {
+    engine.setSignalHandler(engineSignalHandler, this);
+    engine.setDiagnostics(&diagnostics);
+}
+
 OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost) {
     //    The job of this method is, as the name implies, to get the driver initialized. One specific
     //    thing that needs to be done is to store the AudioServerPlugInHostRef so that it can be used
@@ -573,20 +522,14 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     //    maintains (such as the device list) to get the inital set of objects the driver is
     //    publishing. So, there is no need to notifiy the HAL about any objects created as part of the
     //    execution of this method.
-
-    //    declare the local variables
-    OSStatus theAnswer = 0;
     DebugMsg("ProxyAudio: ProxyAudio_Initialize");
 
-    //    check the arguments
     if (inDriver != gAudioServerPlugInDriverRef) {
-        DebugMsg("ProxyAudio: ProxyAudio_Initialize: bad driver reference");
-        { theAnswer = kAudioHardwareBadObjectError; }
-        return theAnswer;
+        return kAudioHardwareBadObjectError;
     }
 
-    //    store the AudioServerPlugInHostRef
     gPlugIn_Host = inHost;
+    initializedHostTime = mach_absolute_time();
 
     //    initialize the box acquired property from the settings
     CFPropertyListRef theSettingsData = NULL;
@@ -603,15 +546,14 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     }
 
     //    initialize the box name from the settings
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("box acquired"), &theSettingsData);
+    theSettingsData = NULL;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("box name"), &theSettingsData);
     if (theSettingsData != NULL) {
         if (CFGetTypeID(theSettingsData) == CFStringGetTypeID()) {
             boxName = CFStringCreateCopy(NULL, (CFStringRef)theSettingsData);
         }
         CFRelease(theSettingsData);
     }
-
-    //    set the box name directly as a last resort
     if (boxName == NULL) {
         boxName = CFStringCreateCopy(NULL, CFSTR("Nearfield Audio Box"));
     }
@@ -620,39 +562,125 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
         DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, -1
     );
     audioOutputQueue = dispatch_queue_create("com.kemuri.Nearfield.AudioDevice.audioOutputQueue", priorityAttribute);
-    
-    inputMonitoringTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, audioOutputQueue);
-    dispatch_source_set_timer(inputMonitoringTimer, dispatch_walltime(NULL, 0), 500ull * NSEC_PER_MSEC, 20ull * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(inputMonitoringTimer, ^{ monitorUserActivity(); });
-    dispatch_resume(inputMonitoringTimer);
-    
-    deviceName = copyDeviceNameFromStorage();
-    outputDeviceUID = copyOutputDeviceUIDFromStorage();
-    targetAggregateDevicesString = copyTargetAggregateDevicesFromStorage();
-    targetAggregateStereo = retrieveTargetAggregateStereoFromStorage();
-    outputDeviceBufferFrameSize = retrieveOutputDeviceBufferFrameSizeFromStorage();
-    outputDeviceActiveCondition = retrieveOutputDeviceActiveConditionFromStorage();
-    routingEnabled = retrieveRoutingEnabledFromStorage();
-    routeRulesString = copyRouteRulesFromStorage();
+
+    // The audio threads report events (latency changes, underruns, drained
+    // buffers) by merging bits into this source; the work runs on the queue.
+    engineSignalSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0, audioOutputQueue);
+    dispatch_source_set_event_handler(engineSignalSource, ^{
+        handleEngineSignals(dispatch_source_get_data(engineSignalSource));
+    });
+    dispatch_resume(engineSignalSource);
+
+    loadSettingsFromStorage();
+    // Read once, before any client can write settings.
+    loadOwnTeamIdentifier();
+
+    Float64 sampleRate = 48000.0;
     {
-        CAMutex::Locker locker(stateMutex);
-        rebuildRouteRulesNoLock();
+        StateLocker locker(stateMutex);
+        if (settings.sampleRate > 0) {
+            sampleRate = settings.sampleRate;
+        }
+    }
+    if (!isSupportedSampleRate(sampleRate)) {
+        sampleRate = isSupportedSampleRate(48000.0) ? 48000.0 : currentAvailableSampleRates().front();
+    }
+    gDevice_SampleRate = sampleRate;
+    deviceClock.setHostTicksPerFrame(hostTicksPerSecond() / sampleRate);
+    deviceClock.reset(mach_absolute_time());
+    engine.configure(sampleRate);
+    {
+        StateLocker locker(stateMutex);
+        applyPlaybackSettingsNoLock();
+    }
+    renderBuffer = new Float32[nearfield::kMaxRenderFrames * nearfield::kStreamChannels]();
+
+    syslog(LOG_NOTICE, "NearfieldAudioDevice: initialized at %.0f Hz", sampleRate);
+    initializeOutputDevice();
+    return 0;
+}
+
+void ProxyAudioDevice::loadSettingsFromStorage() {
+    StateLocker locker(stateMutex);
+
+    CFPropertyListRef stored = NULL;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("settings"), &stored);
+    const bool loaded = nearfield::loadPersistentSettings(stored, settings);
+    if (stored) {
+        if (loaded && CFGetTypeID(stored) == CFDictionaryGetTypeID()) {
+            lastPersistedSettings = (CFDictionaryRef)CFRetain(stored);
+        }
+        CFRelease(stored);
     }
 
-    //    calculate the host ticks per frame
-    struct mach_timebase_info theTimeBaseInfo;
-    mach_timebase_info(&theTimeBaseInfo);
-    Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / theTimeBaseInfo.numer;
-    theHostClockFrequency *= 1000000000.0;
-    gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
+    if (!loaded) {
+        // Migrate the individual keys written by driver 1.0.x. They stay in
+        // storage so an older driver still finds them after a downgrade.
+        auto copyStored = [this](CFStringRef key) -> CFPropertyListRef {
+            CFPropertyListRef value = NULL;
+            gPlugIn_Host->CopyFromStorage(gPlugIn_Host, key, &value);
+            return value;
+        };
+        CFMutableDictionaryRef legacy =
+            CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        const std::pair<CFStringRef, CFStringRef> keys[] = {
+            {CFSTR("deviceName"), nearfield::kSettingsDeviceNameKey},
+            {CFSTR("targetAggregateDevices"), nearfield::kSettingsTargetDevicesKey},
+            {CFSTR("targetAggregateMode"), nearfield::kSettingsTargetModeKey},
+            {CFSTR("routingEnabled"), nearfield::kSettingsRoutingEnabledKey},
+            {CFSTR("routeRules"), nearfield::kSettingsRouteRulesKey},
+            {CFSTR("outputDeviceBufferFrameSize"), nearfield::kSettingsOutputBufferFrameSizeKey},
+            {CFSTR("outputDeviceUID"), nearfield::kSettingsOutputDeviceKey},
+            {CFSTR("outputDeviceActiveCondition"), nearfield::kSettingsActiveConditionKey},
+        };
+        for (const auto &key : keys) {
+            CFPropertyListRef value = copyStored(key.first);
+            if (value) {
+                CFDictionarySetValue(legacy, key.second, value);
+                CFRelease(value);
+            }
+        }
+        nearfield::SettingsUpdate update;
+        if (nearfield::parseSettingsUpdate(legacy, update)) {
+            std::map<pid_t, nearfield::Route> ignoredProcessRoutes;
+            if (update.outputDeviceUID && *update.outputDeviceUID == kDriverTargetAggregate_UID) {
+                update.outputDeviceUID.reset();
+            }
+            nearfield::applySettingsUpdate(settings, ignoredProcessRoutes, update);
+        }
+        CFRelease(legacy);
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: migrated settings from driver 1.0");
+    }
 
-    inputBuffer = new AudioRingBuffer(gDevice_BytesPerFrameInChannel * gDevice_ChannelsPerFrame, 88200);
-    workBuffer = new Byte[gDevice_BytesPerFrameInChannel * gDevice_ChannelsPerFrame * kDevice_RingBufferSize * 2];
-    routeMixBuffer = new Byte[gDevice_BytesPerFrameInChannel * gDevice_ChannelsPerFrame * kDevice_RingBufferSize * 2];
+    bundleRoutes = nearfield::parseRouteRules(settings.routeRules).bundleRoutes;
+    persistSettingsIfChangedNoLock();
+}
 
-    initializeOutputDevice();
+void ProxyAudioDevice::persistSettingsIfChangedNoLock() {
+    if (!gPlugIn_Host) {
+        return;
+    }
+    CFDictionaryRef current = nearfield::createPersistentSettings(settings);
+    if (!current) {
+        return;
+    }
+    if (lastPersistedSettings && CFEqual(current, lastPersistedSettings)) {
+        CFRelease(current);
+        return;
+    }
+    gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("settings"), current);
+    if (lastPersistedSettings) {
+        CFRelease(lastPersistedSettings);
+    }
+    lastPersistedSettings = current;
+}
 
-    return theAnswer;
+void ProxyAudioDevice::applyPlaybackSettingsNoLock() {
+    const bool steer = settings.underrunStrategy != nearfield::UnderrunStrategy::gap;
+    const bool gap = settings.underrunStrategy != nearfield::UnderrunStrategy::steer;
+    engine.setStrategy(steer, gap);
+    engine.setBaseSafetyGapMilliseconds(settings.safetyGapMilliseconds);
+    diagnostics.enabled.store(settings.diagnostics || NEARFIELD_DRIVER_DIAGNOSTICS != 0);
 }
 
 OSStatus ProxyAudioDevice::CreateDevice(AudioServerPlugInDriverRef inDriver,
@@ -702,142 +730,118 @@ Done:
 OSStatus ProxyAudioDevice::AddDeviceClient(AudioServerPlugInDriverRef inDriver,
                                            AudioObjectID inDeviceObjectID,
                                            const AudioServerPlugInClientInfo *inClientInfo) {
-    //    This method is used to inform the driver about a new client that is using the given device.
-    //    This allows the device to act differently depending on who the client is. This driver does
-    //    not need to track the clients using the device, so we just check the arguments and return
-    //    successfully.
+    //    Clients are tracked so App Audio Routing can send each app's audio to
+    //    its display.
 
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "ProxyAudio_AddDeviceClient: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "ProxyAudio_AddDeviceClient: bad device ID");
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
 
     if (inClientInfo != NULL) {
-        CAMutex::Locker locker(stateMutex);
+        StateLocker locker(stateMutex);
         ClientInfo client;
         client.clientID = inClientInfo->mClientID;
         client.processID = inClientInfo->mProcessID;
         if (inClientInfo->mBundleID != NULL) {
             client.bundleID = CFStringToStdString(inClientInfo->mBundleID);
         }
-        client.destination = routeDestinationForClientNoLock(client.bundleID, client.processID);
+        client.route = routeForClientNoLock(client.bundleID, client.processID);
         clientsByID[client.clientID] = client;
-        publishRouteSnapshotNoLock();
+        if (!routeTable.assign(client.clientID, client.route)) {
+            syslog(LOG_WARNING, "NearfieldAudioDevice: route table full; client %u keeps its stereo image", client.clientID);
+        }
         syslog(LOG_NOTICE,
                "NearfieldAudioDevice: client added id=%u pid=%d bundle=%s route=%s",
                client.clientID,
                client.processID,
                client.bundleID.c_str(),
-               routeDestinationName(client.destination));
+               nearfield::routeName(client.route));
     }
-
-Done:
-    return theAnswer;
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::RemoveDeviceClient(AudioServerPlugInDriverRef inDriver,
                                               AudioObjectID inDeviceObjectID,
                                               const AudioServerPlugInClientInfo *inClientInfo) {
-    //    This method is used to inform the driver about a client that is no longer using the given
-    //    device. This driver does not track clients, so we just check the arguments and return
-    //    successfully.
-
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "ProxyAudio_RemoveDeviceClient: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "ProxyAudio_RemoveDeviceClient: bad device ID");
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
 
     if (inClientInfo != NULL) {
-        CAMutex::Locker locker(stateMutex);
+        StateLocker locker(stateMutex);
         clientsByID.erase(inClientInfo->mClientID);
-        publishRouteSnapshotNoLock();
+        routeTable.release(inClientInfo->mClientID);
         syslog(LOG_NOTICE,
                "NearfieldAudioDevice: client removed id=%u pid=%d",
                inClientInfo->mClientID,
                inClientInfo->mProcessID);
     }
+    return 0;
+}
 
-Done:
-    return theAnswer;
+nearfield::Route ProxyAudioDevice::routeForClientNoLock(const std::string &bundleID, pid_t processID) const {
+    if (!settings.routingEnabled) {
+        return nearfield::Route::pair;
+    }
+    auto processRule = processRoutes.find(processID);
+    if (processRule != processRoutes.end()) {
+        return processRule->second;
+    }
+    if (!bundleID.empty()) {
+        auto bundleRule = bundleRoutes.find(bundleID);
+        if (bundleRule != bundleRoutes.end()) {
+            return bundleRule->second;
+        }
+    }
+    return nearfield::Route::pair;
+}
+
+void ProxyAudioDevice::updateClientRoutesNoLock() {
+    // Takes effect on the next IO cycle, crossfaded by the IO thread.
+    for (auto &entry : clientsByID) {
+        entry.second.route = routeForClientNoLock(entry.second.bundleID, entry.second.processID);
+        routeTable.setRoute(entry.first, entry.second.route);
+    }
 }
 
 OSStatus ProxyAudioDevice::PerformDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver,
                                                             AudioObjectID inDeviceObjectID,
                                                             UInt64 inChangeAction,
                                                             void *inChangeInfo) {
-    //    This method is called to tell the device that it can perform the configuation change that it
-    //    had requested via a call to the host method, RequestDeviceConfigurationChange(). The
-    //    arguments, inChangeAction and inChangeInfo are the same as what was passed to
-    //    RequestDeviceConfigurationChange().
-    //
-    //    The HAL guarantees that IO will be stopped while this method is in progress. The HAL will
-    //    also handle figuring out exactly what changed for the non-control related properties. This
-    //    means that the only notifications that would need to be sent here would be for either
-    //    custom properties the HAL doesn't know about or for controls.
-    //
-    //    For the device implemented by this driver, only sample rate changes go through this process
-    //    as it is the only state that can be changed for the device that isn't a control. For this
-    //    change, the new sample rate is passed in the inChangeAction argument.
+    //    The HAL stops IO while this runs. Only sample rate changes use this
+    //    path; the new rate is passed in inChangeAction.
 
 #pragma unused(inChangeInfo)
 
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-    struct mach_timebase_info theTimeBaseInfo;
-    Float64 theHostClockFrequency = 0;
-
-    DebugMsg("ProxyAudio: PerformDeviceConfigurationChange");
-    
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "ProxyAudio_PerformDeviceConfigurationChange: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "ProxyAudio_PerformDeviceConfigurationChange: bad device ID");
-    FailWithAction(!contains(gDevice_SampleRates, (Float64)inChangeAction),
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "ProxyAudio_PerformDeviceConfigurationChange: bad sample rate");
-
-    //    lock the state mutex
-    {
-        CAMutex::Locker locker(stateMutex);
-
-        //    change the sample rate
-        gDevice_SampleRate = inChangeAction;
-        DebugMsg("ProxyAudio: Setting sample rate to: %llu", inChangeAction);
-
-        //    recalculate the state that depends on the sample rate
-        mach_timebase_info(&theTimeBaseInfo);
-        theHostClockFrequency = (Float64)theTimeBaseInfo.denom / theTimeBaseInfo.numer;
-        theHostClockFrequency *= 1000000000.0;
-        gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
+    const Float64 sampleRate = (Float64)inChangeAction;
+    if (!isSupportedSampleRate(sampleRate)) {
+        return kAudioHardwareBadObjectError;
     }
 
-    DebugMsg("ProxyAudio: finished PerformDeviceConfigurationChange, will match sample rate");
-    matchOutputDeviceSampleRate();
+    {
+        StateLocker locker(stateMutex);
+        gDevice_SampleRate = sampleRate;
+        settings.sampleRate = sampleRate;
+        persistSettingsIfChangedNoLock();
+    }
+    deviceClock.setHostTicksPerFrame(hostTicksPerSecond() / sampleRate);
+    deviceClock.reset(mach_absolute_time());
+    // Buffered audio at the previous rate cannot be played at the new one.
+    engine.configure(sampleRate);
+    diagnostics.record(nearfield::kDiagnosticSampleRate, 0, 0, 0, sampleRate, 0);
+    syslog(LOG_NOTICE, "NearfieldAudioDevice: sample rate is now %.0f Hz", sampleRate);
 
-Done:
-    return theAnswer;
+    // Apps choose Nearfield's rate; pass it on to the displays.
+    ExecuteInAudioOutputThread(^{
+        applyRequestedSampleRateToOutput(sampleRate);
+        matchOutputDeviceSampleRate();
+        notifyLatencyChanged();
+    });
+    notifyStatusChanged();
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver,
@@ -865,7 +869,7 @@ OSStatus ProxyAudioDevice::AbortDeviceConfigurationChange(AudioServerPlugInDrive
                    "ProxyAudio_PerformDeviceConfigurationChange: bad device ID");
 
     syslog(LOG_ERR,
-           "ProxyAudio error: was not able to change the sample rate of Proxy Audio Device to %llu",
+           "NearfieldAudioDevice: the sample rate change to %llu Hz was not performed",
            inChangeAction);
 
 Done:
@@ -910,7 +914,6 @@ Boolean ProxyAudioDevice::HasProperty(AudioServerPlugInDriverRef inDriver,
         case kObjectID_Volume_Output_L:
         case kObjectID_Volume_Output_R:
         case kObjectID_Mute_Output_Master:
-        case kObjectID_DataSource_Output_Master:
             theAnswer = HasControlProperty(inDriver, inObjectID, inClientProcessID, inAddress);
             break;
     };
@@ -965,7 +968,6 @@ OSStatus ProxyAudioDevice::IsPropertySettable(AudioServerPlugInDriverRef inDrive
         case kObjectID_Volume_Output_L:
         case kObjectID_Volume_Output_R:
         case kObjectID_Mute_Output_Master:
-        case kObjectID_DataSource_Output_Master:
             theAnswer = IsControlPropertySettable(inDriver, inObjectID, inClientProcessID, inAddress, outIsSettable);
             break;
 
@@ -1029,7 +1031,6 @@ OSStatus ProxyAudioDevice::GetPropertyDataSize(AudioServerPlugInDriverRef inDriv
         case kObjectID_Volume_Output_L:
         case kObjectID_Volume_Output_R:
         case kObjectID_Mute_Output_Master:
-        case kObjectID_DataSource_Output_Master:
             theAnswer = GetControlPropertyDataSize(
                 inDriver, inObjectID, inClientProcessID, inAddress, inQualifierDataSize, inQualifierData, outDataSize);
             break;
@@ -1128,7 +1129,6 @@ OSStatus ProxyAudioDevice::GetPropertyData(AudioServerPlugInDriverRef inDriver,
         case kObjectID_Volume_Output_L:
         case kObjectID_Volume_Output_R:
         case kObjectID_Mute_Output_Master:
-        case kObjectID_DataSource_Output_Master:
             theAnswer = GetControlPropertyData(inDriver,
                                                inObjectID,
                                                inClientProcessID,
@@ -1229,7 +1229,6 @@ OSStatus ProxyAudioDevice::SetPropertyData(AudioServerPlugInDriverRef inDriver,
         case kObjectID_Volume_Output_L:
         case kObjectID_Volume_Output_R:
         case kObjectID_Mute_Output_Master:
-        case kObjectID_DataSource_Output_Master:
             theAnswer = SetControlPropertyData(inDriver,
                                                inObjectID,
                                                inClientProcessID,
@@ -1406,11 +1405,7 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyDataSize(AudioServerPlugInDriverRef 
             break;
 
         case kAudioObjectPropertyOwnedObjects:
-            if (gBox_Acquired) {
-                *outDataSize = 2 * sizeof(AudioObjectID);
-            } else {
-                *outDataSize = sizeof(AudioObjectID);
-            }
+            *outDataSize = (deviceIsPublished() ? 2 : 1) * sizeof(AudioObjectID);
             break;
 
         case kAudioPlugInPropertyBoxList:
@@ -1422,11 +1417,7 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyDataSize(AudioServerPlugInDriverRef 
             break;
 
         case kAudioPlugInPropertyDeviceList:
-            if (gBox_Acquired) {
-                *outDataSize = sizeof(AudioObjectID);
-            } else {
-                *outDataSize = 0;
-            }
+            *outDataSize = deviceIsPublished() ? sizeof(AudioObjectID) : 0;
             break;
 
         case kAudioPlugInPropertyTranslateUIDToDevice:
@@ -1527,7 +1518,8 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyData(AudioServerPlugInDriverRef inDr
                            Done,
                            "GetPlugInPropertyData: not enough space for the return value of "
                            "kAudioObjectPropertyManufacturer for the plug-in");
-            *((CFStringRef *)outData) = CFSTR("Apple Inc.");
+            //    Localized by the HAL from the plug-in's Localizable.strings.
+            *((CFStringRef *)outData) = CFSTR("ManufacturerName");
             *outDataSize = sizeof(CFStringRef);
             break;
 
@@ -1537,9 +1529,9 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyData(AudioServerPlugInDriverRef inDr
             //    case, only that number of items will be returned
             theNumberItemsToFetch = inDataSize / sizeof(AudioObjectID);
 
-            //    Clamp that to the number of boxes this driver implements (which is just 1)
-            if (theNumberItemsToFetch > (gBox_Acquired ? 2 : 1)) {
-                theNumberItemsToFetch = (gBox_Acquired ? 2 : 1);
+            //    The box, and the device while it is published
+            if (theNumberItemsToFetch > (deviceIsPublished() ? 2 : 1)) {
+                theNumberItemsToFetch = (deviceIsPublished() ? 2 : 1);
             }
 
             //    Write the devices' object IDs into the return value
@@ -1609,10 +1601,9 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyData(AudioServerPlugInDriverRef inDr
             //    case, only that number of items will be returned
             theNumberItemsToFetch = inDataSize / sizeof(AudioObjectID);
 
-            //    Clamp that to the number of devices this driver implements (which is just 1 if the
-            //    box has been acquired)
-            if (theNumberItemsToFetch > (gBox_Acquired ? 1 : 0)) {
-                theNumberItemsToFetch = (gBox_Acquired ? 1 : 0);
+            //    The device is listed while it is published and the displays are present
+            if (theNumberItemsToFetch > (deviceIsPublished() ? 1 : 0)) {
+                theNumberItemsToFetch = (deviceIsPublished() ? 1 : 0);
             }
 
             //    Write the devices' object IDs into the return value
@@ -1728,6 +1719,13 @@ Done:
 
 #pragma mark Box Property Operations
 
+static const AudioServerPlugInCustomPropertyInfo kBoxCustomProperties[] = {
+    {kNearfieldPropertySettings, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList,
+     kAudioServerPlugInCustomPropertyDataTypeNone},
+    {kNearfieldPropertyStatus, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList,
+     kAudioServerPlugInCustomPropertyDataTypeNone},
+};
+
 Boolean ProxyAudioDevice::HasBoxProperty(AudioServerPlugInDriverRef inDriver,
                                          AudioObjectID inObjectID,
                                          pid_t inClientProcessID,
@@ -1744,9 +1742,6 @@ Boolean ProxyAudioDevice::HasBoxProperty(AudioServerPlugInDriverRef inDriver,
     FailIf(inAddress == NULL, Done, "HasBoxProperty: no address");
     FailIf(inObjectID != kObjectID_Box, Done, "HasBoxProperty: not the box object");
 
-    //    Note that for each object, this driver implements all the required properties plus a few
-    //    extras that are useful but not required. There is more detailed commentary about each
-    //    property in the GetBoxPropertyData() method.
     switch (inAddress->mSelector) {
         case kAudioObjectPropertyBaseClass:
         case kAudioObjectPropertyClass:
@@ -1758,6 +1753,7 @@ Boolean ProxyAudioDevice::HasBoxProperty(AudioServerPlugInDriverRef inDriver,
         case kAudioObjectPropertyIdentify:
         case kAudioObjectPropertySerialNumber:
         case kAudioObjectPropertyFirmwareVersion:
+        case kAudioObjectPropertyCustomPropertyInfoList:
         case kAudioBoxPropertyBoxUID:
         case kAudioBoxPropertyTransportType:
         case kAudioBoxPropertyHasAudio:
@@ -1767,6 +1763,8 @@ Boolean ProxyAudioDevice::HasBoxProperty(AudioServerPlugInDriverRef inDriver,
         case kAudioBoxPropertyAcquired:
         case kAudioBoxPropertyAcquisitionFailed:
         case kAudioBoxPropertyDeviceList:
+        case kNearfieldPropertySettings:
+        case kNearfieldPropertyStatus:
             theAnswer = true;
             break;
     };
@@ -1780,9 +1778,6 @@ OSStatus ProxyAudioDevice::IsBoxPropertySettable(AudioServerPlugInDriverRef inDr
                                                  pid_t inClientProcessID,
                                                  const AudioObjectPropertyAddress *inAddress,
                                                  Boolean *outIsSettable) {
-    //    This method returns whether or not the given property on the plug-in object can have its
-    //    value changed.
-
 #pragma unused(inClientProcessID)
 
     //    declare the local variables
@@ -1804,9 +1799,6 @@ OSStatus ProxyAudioDevice::IsBoxPropertySettable(AudioServerPlugInDriverRef inDr
                    Done,
                    "IsBoxPropertySettable: not the plug-in object");
 
-    //    Note that for each object, this driver implements all the required properties plus a few
-    //    extras that are useful but not required. There is more detailed commentary about each
-    //    property in the GetBoxPropertyData() method.
     switch (inAddress->mSelector) {
         case kAudioObjectPropertyBaseClass:
         case kAudioObjectPropertyClass:
@@ -1816,6 +1808,7 @@ OSStatus ProxyAudioDevice::IsBoxPropertySettable(AudioServerPlugInDriverRef inDr
         case kAudioObjectPropertyOwnedObjects:
         case kAudioObjectPropertySerialNumber:
         case kAudioObjectPropertyFirmwareVersion:
+        case kAudioObjectPropertyCustomPropertyInfoList:
         case kAudioBoxPropertyBoxUID:
         case kAudioBoxPropertyTransportType:
         case kAudioBoxPropertyHasAudio:
@@ -1824,12 +1817,14 @@ OSStatus ProxyAudioDevice::IsBoxPropertySettable(AudioServerPlugInDriverRef inDr
         case kAudioBoxPropertyIsProtected:
         case kAudioBoxPropertyAcquisitionFailed:
         case kAudioBoxPropertyDeviceList:
+        case kNearfieldPropertyStatus:
             *outIsSettable = false;
             break;
 
         case kAudioObjectPropertyName:
         case kAudioObjectPropertyIdentify:
         case kAudioBoxPropertyAcquired:
+        case kNearfieldPropertySettings:
             *outIsSettable = true;
             break;
 
@@ -1849,8 +1844,6 @@ OSStatus ProxyAudioDevice::GetBoxPropertyDataSize(AudioServerPlugInDriverRef inD
                                                   UInt32 inQualifierDataSize,
                                                   const void *inQualifierData,
                                                   UInt32 *outDataSize) {
-    //    This method returns the byte size of the property's data.
-
 #pragma unused(inClientProcessID, inQualifierDataSize, inQualifierData)
 
     //    declare the local variables
@@ -1872,14 +1865,8 @@ OSStatus ProxyAudioDevice::GetBoxPropertyDataSize(AudioServerPlugInDriverRef inD
                    Done,
                    "GetBoxPropertyDataSize: not the plug-in object");
 
-    //    Note that for each object, this driver implements all the required properties plus a few
-    //    extras that are useful but not required. There is more detailed commentary about each
-    //    property in the GetBoxPropertyData() method.
     switch (inAddress->mSelector) {
         case kAudioObjectPropertyBaseClass:
-            *outDataSize = sizeof(AudioClassID);
-            break;
-
         case kAudioObjectPropertyClass:
             *outDataSize = sizeof(AudioClassID);
             break;
@@ -1889,14 +1876,11 @@ OSStatus ProxyAudioDevice::GetBoxPropertyDataSize(AudioServerPlugInDriverRef inD
             break;
 
         case kAudioObjectPropertyName:
-            *outDataSize = sizeof(CFStringRef);
-            break;
-
         case kAudioObjectPropertyModelName:
-            *outDataSize = sizeof(CFStringRef);
-            break;
-
         case kAudioObjectPropertyManufacturer:
+        case kAudioObjectPropertySerialNumber:
+        case kAudioObjectPropertyFirmwareVersion:
+        case kAudioBoxPropertyBoxUID:
             *outDataSize = sizeof(CFStringRef);
             break;
 
@@ -1904,54 +1888,29 @@ OSStatus ProxyAudioDevice::GetBoxPropertyDataSize(AudioServerPlugInDriverRef inD
             *outDataSize = 0;
             break;
 
+        case kAudioObjectPropertyCustomPropertyInfoList:
+            *outDataSize = sizeof(kBoxCustomProperties);
+            break;
+
         case kAudioObjectPropertyIdentify:
-            *outDataSize = sizeof(UInt32);
-            break;
-
-        case kAudioObjectPropertySerialNumber:
-            *outDataSize = sizeof(CFStringRef);
-            break;
-
-        case kAudioObjectPropertyFirmwareVersion:
-            *outDataSize = sizeof(CFStringRef);
-            break;
-
-        case kAudioBoxPropertyBoxUID:
-            *outDataSize = sizeof(CFStringRef);
-            break;
-
         case kAudioBoxPropertyTransportType:
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyHasAudio:
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyHasVideo:
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyHasMIDI:
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyIsProtected:
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyAcquired:
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyAcquisitionFailed:
             *outDataSize = sizeof(UInt32);
             break;
 
-        case kAudioBoxPropertyDeviceList: {
-            CAMutex::Locker locker(stateMutex);
-            *outDataSize = gBox_Acquired ? sizeof(AudioObjectID) : 0;
-        } break;
+        case kAudioBoxPropertyDeviceList:
+            *outDataSize = deviceIsPublished() ? sizeof(AudioObjectID) : 0;
+            break;
+
+        case kNearfieldPropertySettings:
+        case kNearfieldPropertyStatus:
+            *outDataSize = sizeof(CFPropertyListRef);
+            break;
 
         default:
             theAnswer = kAudioHardwareUnknownPropertyError;
@@ -1996,237 +1955,194 @@ OSStatus ProxyAudioDevice::GetBoxPropertyData(AudioServerPlugInDriverRef inDrive
                    Done,
                    "GetBoxPropertyData: not the plug-in object");
 
-    //    Note that for each object, this driver implements all the required properties plus a few
-    //    extras that are useful but not required.
-    //
-    //    Also, since most of the data that will get returned is static, there are few instances where
-    //    it is necessary to lock the state mutex.
     switch (inAddress->mSelector) {
         case kAudioObjectPropertyBaseClass:
-            //    The base class for kAudioBoxClassID is kAudioObjectClassID
             FailWithAction(inDataSize < sizeof(AudioClassID),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of kAudioObjectPropertyBaseClass "
-                           "for the box");
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyBaseClass");
             *((AudioClassID *)outData) = kAudioObjectClassID;
             *outDataSize = sizeof(AudioClassID);
             break;
 
         case kAudioObjectPropertyClass:
-            //    The class is always kAudioBoxClassID for regular drivers
-            FailWithAction(
-                inDataSize < sizeof(AudioClassID),
-                theAnswer = kAudioHardwareBadPropertySizeError,
-                Done,
-                "GetBoxPropertyData: not enough space for the return value of kAudioObjectPropertyClass for the box");
+            FailWithAction(inDataSize < sizeof(AudioClassID),
+                           theAnswer = kAudioHardwareBadPropertySizeError,
+                           Done,
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyClass");
             *((AudioClassID *)outData) = kAudioBoxClassID;
             *outDataSize = sizeof(AudioClassID);
             break;
 
         case kAudioObjectPropertyOwner:
-            //    The owner is the plug-in object
-            FailWithAction(
-                inDataSize < sizeof(AudioObjectID),
-                theAnswer = kAudioHardwareBadPropertySizeError,
-                Done,
-                "GetBoxPropertyData: not enough space for the return value of kAudioObjectPropertyOwner for the box");
+            FailWithAction(inDataSize < sizeof(AudioObjectID),
+                           theAnswer = kAudioHardwareBadPropertySizeError,
+                           Done,
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyOwner");
             *((AudioObjectID *)outData) = kObjectID_PlugIn;
             *outDataSize = sizeof(AudioObjectID);
             break;
 
         case kAudioObjectPropertyName:
-            //    This is the human readable name of the maker of the box.
             FailWithAction(inDataSize < sizeof(CFStringRef),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioObjectPropertyManufacturer for the box");
-
-            // See the comment in the switch case for 'kAudioObjectPropertyIdentify' in SetBoxPropertyData to get a
-            // description of the crazy hackery that is going on here.
-
-            if (inClientProcessID == configuratorPid && nextConfigurationToRead != ConfigType::none) {
-                DebugMsg("ProxyAudio: returning config data type %d instead of box name", nextConfigurationToRead);
-                *((CFStringRef *)outData) = copyConfigurationValue(nextConfigurationToRead);
-                
-            } else {
-                CAMutex::Locker locker(stateMutex);
-                *((CFStringRef *)outData) = CFStringCreateCopy(NULL, boxName);
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyName");
+            {
+                // Legacy configuration channel: the registered configurator
+                // reads the requested setting through the box name.
+                const int pendingRead = nextConfigurationToRead.load();
+                bool isConfiguratorRead = false;
+                {
+                    StateLocker locker(stateMutex);
+                    isConfiguratorRead = inClientProcessID == configuratorPid && configuratorPid != 0;
+                }
+                if (isConfiguratorRead && pendingRead != (int)ConfigType::none) {
+                    *((CFStringRef *)outData) = copyConfigurationValue((ConfigType)pendingRead);
+                } else {
+                    StateLocker locker(stateMutex);
+                    *((CFStringRef *)outData) =
+                        boxName ? CFStringCreateCopy(NULL, boxName) : CFSTR("Nearfield Audio Box");
+                }
             }
-
             *outDataSize = sizeof(CFStringRef);
             break;
 
         case kAudioObjectPropertyModelName:
-            //    This is the human readable name of the maker of the box.
             FailWithAction(inDataSize < sizeof(CFStringRef),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioObjectPropertyManufacturer for the box");
-            *((CFStringRef *)outData) = CFSTR("Proxy Audio Model");
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyModelName");
+            *((CFStringRef *)outData) = CFSTR("Nearfield");
             *outDataSize = sizeof(CFStringRef);
             break;
 
         case kAudioObjectPropertyManufacturer:
-            //    This is the human readable name of the maker of the box.
+            //    Localized by the HAL from the plug-in's Localizable.strings.
             FailWithAction(inDataSize < sizeof(CFStringRef),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioObjectPropertyManufacturer for the box");
-            *((CFStringRef *)outData) = CFSTR("Apple Inc.");
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyManufacturer");
+            *((CFStringRef *)outData) = CFSTR("ManufacturerName");
             *outDataSize = sizeof(CFStringRef);
             break;
 
         case kAudioObjectPropertyOwnedObjects:
-            //    This returns the objects directly owned by the object. Boxes don't own anything.
+            //    Boxes don't own anything.
             *outDataSize = 0;
             break;
 
         case kAudioObjectPropertyIdentify:
-            //    This is used to highling the device in the UI, but it's value has no meaning
             FailWithAction(inDataSize < sizeof(UInt32),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of kAudioObjectPropertyIdentify "
-                           "for the box");
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyIdentify");
             *((UInt32 *)outData) = 0;
             *outDataSize = sizeof(UInt32);
             break;
 
         case kAudioObjectPropertySerialNumber:
-            //    This is the human readable serial number of the box.
             FailWithAction(inDataSize < sizeof(CFStringRef),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioObjectPropertySerialNumber for the box");
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertySerialNumber");
             *((CFStringRef *)outData) = CFSTR("00000001");
             *outDataSize = sizeof(CFStringRef);
             break;
 
         case kAudioObjectPropertyFirmwareVersion:
-            //    This is the human readable firmware version of the box.
             FailWithAction(inDataSize < sizeof(CFStringRef),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioObjectPropertyFirmwareVersion for the box");
+                           "GetBoxPropertyData: not enough space for kAudioObjectPropertyFirmwareVersion");
             *((CFStringRef *)outData) = CFSTR("1.0");
             *outDataSize = sizeof(CFStringRef);
             break;
 
+        case kAudioObjectPropertyCustomPropertyInfoList: {
+            const UInt32 count = std::min<UInt32>(inDataSize / sizeof(AudioServerPlugInCustomPropertyInfo),
+                                                  sizeof(kBoxCustomProperties) / sizeof(kBoxCustomProperties[0]));
+            memcpy(outData, kBoxCustomProperties, count * sizeof(AudioServerPlugInCustomPropertyInfo));
+            *outDataSize = count * sizeof(AudioServerPlugInCustomPropertyInfo);
+        } break;
+
         case kAudioBoxPropertyBoxUID:
-            //    Boxes have UIDs the same as devices
             FailWithAction(inDataSize < sizeof(CFStringRef),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioObjectPropertyManufacturer for the box");
+                           "GetBoxPropertyData: not enough space for kAudioBoxPropertyBoxUID");
             *((CFStringRef *)outData) = CFSTR(kBox_UID);
+            *outDataSize = sizeof(CFStringRef);
             break;
 
         case kAudioBoxPropertyTransportType:
-            //    This value represents how the device is attached to the system. This can be
-            //    any 32 bit integer, but common values for this property are defined in
-            //    <CoreAudio/AudioHardwareBase.h>
             FailWithAction(inDataSize < sizeof(UInt32),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioDevicePropertyTransportType for the box");
+                           "GetBoxPropertyData: not enough space for kAudioBoxPropertyTransportType");
             *((UInt32 *)outData) = kAudioDeviceTransportTypeVirtual;
             *outDataSize = sizeof(UInt32);
             break;
 
         case kAudioBoxPropertyHasAudio:
-            //    Indicates whether or not the box has audio capabilities
-            FailWithAction(
-                inDataSize < sizeof(UInt32),
-                theAnswer = kAudioHardwareBadPropertySizeError,
-                Done,
-                "GetBoxPropertyData: not enough space for the return value of kAudioBoxPropertyHasAudio for the box");
-            *((UInt32 *)outData) = 1;
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyHasVideo:
-            //    Indicates whether or not the box has video capabilities
-            FailWithAction(
-                inDataSize < sizeof(UInt32),
-                theAnswer = kAudioHardwareBadPropertySizeError,
-                Done,
-                "GetBoxPropertyData: not enough space for the return value of kAudioBoxPropertyHasVideo for the box");
-            *((UInt32 *)outData) = 0;
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyHasMIDI:
-            //    Indicates whether or not the box has MIDI capabilities
-            FailWithAction(
-                inDataSize < sizeof(UInt32),
-                theAnswer = kAudioHardwareBadPropertySizeError,
-                Done,
-                "GetBoxPropertyData: not enough space for the return value of kAudioBoxPropertyHasMIDI for the box");
-            *((UInt32 *)outData) = 0;
-            *outDataSize = sizeof(UInt32);
-            break;
-
         case kAudioBoxPropertyIsProtected:
-            //    Indicates whether or not the box has requires authentication to use
+        case kAudioBoxPropertyAcquisitionFailed:
             FailWithAction(inDataSize < sizeof(UInt32),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of kAudioBoxPropertyIsProtected "
-                           "for the box");
-            *((UInt32 *)outData) = 0;
+                           "GetBoxPropertyData: not enough space for a box flag");
+            *((UInt32 *)outData) = inAddress->mSelector == kAudioBoxPropertyHasAudio ? 1 : 0;
             *outDataSize = sizeof(UInt32);
             break;
 
         case kAudioBoxPropertyAcquired:
-            //    When set to a non-zero value, the device is acquired for use by the local machine
-            FailWithAction(
-                inDataSize < sizeof(UInt32),
-                theAnswer = kAudioHardwareBadPropertySizeError,
-                Done,
-                "GetBoxPropertyData: not enough space for the return value of kAudioBoxPropertyAcquired for the box");
-            {
-                CAMutex::Locker locker(stateMutex);
-                *((UInt32 *)outData) = gBox_Acquired ? 1 : 0;
-            }
-
-            *outDataSize = sizeof(UInt32);
-            break;
-
-        case kAudioBoxPropertyAcquisitionFailed:
-            //    This is used for notifications to say when an attempt to acquire a device has failed.
             FailWithAction(inDataSize < sizeof(UInt32),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
-                           "GetBoxPropertyData: not enough space for the return value of "
-                           "kAudioBoxPropertyAcquisitionFailed for the box");
-            *((UInt32 *)outData) = 0;
+                           "GetBoxPropertyData: not enough space for kAudioBoxPropertyAcquired");
+            {
+                StateLocker locker(stateMutex);
+                *((UInt32 *)outData) = gBox_Acquired ? 1 : 0;
+            }
             *outDataSize = sizeof(UInt32);
             break;
 
         case kAudioBoxPropertyDeviceList:
-            //    This is used to indicate which devices came from this box
-            {
-                CAMutex::Locker locker(stateMutex);
-                if (gBox_Acquired) {
-                    FailWithAction(inDataSize < sizeof(AudioObjectID),
-                                   theAnswer = kAudioHardwareBadPropertySizeError,
-                                   Done,
-                                   "GetBoxPropertyData: not enough space for the return value of "
-                                   "kAudioBoxPropertyDeviceList for the box");
-                    *((AudioObjectID *)outData) = kObjectID_Device;
-                    *outDataSize = sizeof(AudioObjectID);
-                } else {
-                    *outDataSize = 0;
-                }
+            //    The device is listed while Nearfield publishes it and the
+            //    displays are present.
+            if (deviceIsPublished()) {
+                FailWithAction(inDataSize < sizeof(AudioObjectID),
+                               theAnswer = kAudioHardwareBadPropertySizeError,
+                               Done,
+                               "GetBoxPropertyData: not enough space for kAudioBoxPropertyDeviceList");
+                *((AudioObjectID *)outData) = kObjectID_Device;
+                *outDataSize = sizeof(AudioObjectID);
+            } else {
+                *outDataSize = 0;
             }
+            break;
+
+        case kNearfieldPropertySettings:
+            FailWithAction(inDataSize < sizeof(CFPropertyListRef),
+                           theAnswer = kAudioHardwareBadPropertySizeError,
+                           Done,
+                           "GetBoxPropertyData: not enough space for the settings");
+            {
+                StateLocker locker(stateMutex);
+                *((CFPropertyListRef *)outData) = nearfield::createPersistentSettings(settings);
+            }
+            *outDataSize = sizeof(CFPropertyListRef);
+            break;
+
+        case kNearfieldPropertyStatus:
+            FailWithAction(inDataSize < sizeof(CFPropertyListRef),
+                           theAnswer = kAudioHardwareBadPropertySizeError,
+                           Done,
+                           "GetBoxPropertyData: not enough space for the status");
+            *((CFPropertyListRef *)outData) = copyStatusDictionary();
+            *outDataSize = sizeof(CFPropertyListRef);
             break;
 
         default:
@@ -2248,7 +2164,7 @@ OSStatus ProxyAudioDevice::SetBoxPropertyData(AudioServerPlugInDriverRef inDrive
                                               const void *inData,
                                               UInt32 *outNumberPropertiesChanged,
                                               AudioObjectPropertyAddress outChangedAddresses[2]) {
-#pragma unused(inClientProcessID, inQualifierDataSize, inQualifierData, inDataSize, inData)
+#pragma unused(inQualifierDataSize, inQualifierData)
 
     //    declare the local variables
     OSStatus theAnswer = 0;
@@ -2276,53 +2192,60 @@ OSStatus ProxyAudioDevice::SetBoxPropertyData(AudioServerPlugInDriverRef inDrive
     //    initialize the returned number of changed properties
     *outNumberPropertiesChanged = 0;
 
-    //    Note that for each object, this driver implements all the required properties plus a few
-    //    extras that are useful but not required. There is more detailed commentary about each
-    //    property in the GetPlugInPropertyData() method.
     switch (inAddress->mSelector) {
-        case kAudioObjectPropertyName:
-            //    Boxes should allow their name to be editable
-            {
-                FailWithAction(inDataSize != sizeof(CFStringRef),
-                               theAnswer = kAudioHardwareBadPropertySizeError,
-                               Done,
-                               "SetBoxPropertyData: wrong size for the data for kAudioObjectPropertyName");
-                CFStringRef *newValue = (CFStringRef *)inData;
-
-                FailWithAction((newValue == NULL || *newValue == NULL || CFGetTypeID(*newValue) != CFStringGetTypeID()),
-                               theAnswer = kAudioHardwareIllegalOperationError,
-                               Done,
-                               "SetBoxPropertyData: bad value for kAudioObjectPropertyName");
-
-                // See the comment in the switch case for 'kAudioObjectPropertyIdentify' to get a description of the
-                // crazy hackery that is going on here.
-                
-                if (inClientProcessID == configuratorPid) {
-                    DebugMsg("ProxyAudio: setting box name from configurator process, performing configuration action "
-                             "instead!");
-                    CFStringSmartRef value = nullptr;
-                    ConfigType action = ConfigType::none;
-                    parseConfigurationString(*newValue, action, value);
-
-                    if (action != ConfigType::none && value) {
-                        setConfigurationValue(action, value);
-                    }
-                } else {
-                    CAMutex::Locker locker(stateMutex);
-
-                    if (boxName != NULL) {
-                        CFRelease(boxName);
-                    }
-
-                    boxName = CFStringCreateCopy(NULL, *newValue);
-                    *outNumberPropertiesChanged = 1;
-                    outChangedAddresses[0].mSelector = kAudioObjectPropertyName;
-                    outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
-                    outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
-                }
-
+        case kNearfieldPropertySettings: {
+            FailWithAction(inDataSize != sizeof(CFPropertyListRef) || inData == NULL,
+                           theAnswer = kAudioHardwareBadPropertySizeError,
+                           Done,
+                           "SetBoxPropertyData: wrong size for the settings");
+            CFPropertyListRef propertyList = *((const CFPropertyListRef *)inData);
+            nearfield::SettingsUpdate update;
+            if (!propertyList || CFGetTypeID(propertyList) != CFDictionaryGetTypeID() ||
+                !nearfield::parseSettingsUpdate((CFDictionaryRef)propertyList, update)) {
+                theAnswer = kAudioHardwareIllegalOperationError;
+                break;
             }
-            break;
+            theAnswer = applySettings(update, inClientProcessID);
+        } break;
+
+        case kAudioObjectPropertyName: {
+            FailWithAction(inDataSize != sizeof(CFStringRef),
+                           theAnswer = kAudioHardwareBadPropertySizeError,
+                           Done,
+                           "SetBoxPropertyData: wrong size for the data for kAudioObjectPropertyName");
+            CFStringRef *newValue = (CFStringRef *)inData;
+            FailWithAction((newValue == NULL || *newValue == NULL || CFGetTypeID(*newValue) != CFStringGetTypeID()),
+                           theAnswer = kAudioHardwareIllegalOperationError,
+                           Done,
+                           "SetBoxPropertyData: bad value for kAudioObjectPropertyName");
+
+            bool isConfigurator = false;
+            {
+                StateLocker locker(stateMutex);
+                isConfigurator = configuratorPid != 0 && inClientProcessID == configuratorPid;
+            }
+            if (isConfigurator) {
+                // Legacy configuration channel: "setting=value" written as the
+                // box name by the registered configurator.
+                CFStringSmartRef value;
+                ConfigType action = ConfigType::none;
+                parseConfigurationString(*newValue, action, value.item);
+                if (action != ConfigType::none && value) {
+                    setConfigurationValue(action, value, inClientProcessID);
+                }
+            } else {
+                StateLocker locker(stateMutex);
+                if (boxName != NULL) {
+                    CFRelease(boxName);
+                }
+                boxName = CFStringCreateCopy(NULL, *newValue);
+                gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("box name"), boxName);
+                *outNumberPropertiesChanged = 1;
+                outChangedAddresses[0].mSelector = kAudioObjectPropertyName;
+                outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
+                outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
+            }
+        } break;
 
         case kAudioObjectPropertyIdentify:
             FailWithAction(inDataSize != sizeof(UInt32),
@@ -2330,83 +2253,53 @@ OSStatus ProxyAudioDevice::SetBoxPropertyData(AudioServerPlugInDriverRef inDrive
                            Done,
                            "SetBoxPropertyData: wrong size for the data for kAudioObjectPropertyIdentify");
             {
-                SInt32 signedValue = *((SInt32 *)inData);
-
-                // To handle reading and setting configurations for the driver, we're using a rather ridiculous hack.
-                // However Apple makes it very, very difficult for a client process to configure the driver in any way.
-                // From the research I did, it seems to require at minimum using a LaunchDaemon to relay messages from a
-                // client process, which seemed like such a tedious and annoying thing to set up.
-
-                // So here's the alternative method: we use a few of the properties of the box device in ways they
-                // weren't intended to be used:
-
-                // First, if a process sets the "identify" property of the box device to its pid, then that pid will
-                // become the designated 'configurator' pid. The driver will then respond differently to read and write
-                // actions taken by the process for certain key properties on the box device.
-
-                // If the configurator process writes a negative value to the box device's identify property, then that
-                // sets the current setting (with the absolute value of what was written to the identify property
-                // corresponding to the ConfigType enum). The current setting is what will be returned if that same
-                // process reads the box device's name property. In the case of integer settings (such as the output
-                // device's buffer frame length) then it is converted to a string before being returned.
-
-                // Lastly, the configurator process can write out new values to the driver's settings again using the
-                // box's name property. When it sets it to a value in the form "settingName=value" then it will parse
-                // that string and adjust the specified setting accordingly.
-
-                // The identify and name properties of the box are used for this because they are a few of the only
-                // settings that can be written to at all, and aren't of particular importance to the operation of the
-                // driver.
-
-                if (signedValue != 0 && signedValue != 1) {
-                    if (signedValue < 0) {
-                        nextConfigurationToRead = ConfigType(-signedValue);
-                        DebugMsg("ProxyAudio: received signal, will return data on next call to box name: %d",
-                                 nextConfigurationToRead);
-                    } else {
-                        configuratorPid = signedValue;
-                        DebugMsg("ProxyAudio: received signal, configurator pid is: %d",
-                                 configuratorPid);
+                // Legacy configuration channel, kept for one release: a
+                // process writes its own pid to register as the configurator,
+                // then a negative ConfigType to choose what the box name
+                // returns on its next read.
+                const SInt32 signedValue = *((const SInt32 *)inData);
+                if (signedValue < 0) {
+                    bool isConfigurator = false;
+                    {
+                        StateLocker locker(stateMutex);
+                        isConfigurator = configuratorPid != 0 && inClientProcessID == configuratorPid;
                     }
-                    
+                    if (isConfigurator) {
+                        nextConfigurationToRead.store(-signedValue);
+                    }
+                } else if (signedValue > 1 && signedValue == inClientProcessID && writerIsAuthorized(inClientProcessID)) {
+                    StateLocker locker(stateMutex);
+                    configuratorPid = signedValue;
                 }
             }
-
             theAnswer = noErr;
             break;
 
         case kAudioBoxPropertyAcquired:
-            //    When the box is acquired, it means the contents, namely the device, are available to the system
+            //    When the box is acquired, the device is published to the system.
             {
                 FailWithAction(inDataSize != sizeof(UInt32),
                                theAnswer = kAudioHardwareBadPropertySizeError,
                                Done,
                                "SetBoxPropertyData: wrong size for the data for kAudioBoxPropertyAcquired");
+                bool changed = false;
                 {
-                    CAMutex::Locker locker(stateMutex);
-                    if (gBox_Acquired != (*((UInt32 *)inData) != 0)) {
-                        //    the new value is different from the old value, so save it
-                        gBox_Acquired = *((UInt32 *)inData) != 0;
+                    StateLocker locker(stateMutex);
+                    const bool acquired = *((const UInt32 *)inData) != 0;
+                    if (gBox_Acquired != acquired) {
+                        gBox_Acquired = acquired;
                         gPlugIn_Host->WriteToStorage(
                             gPlugIn_Host, CFSTR("box acquired"), gBox_Acquired ? kCFBooleanTrue : kCFBooleanFalse);
-
-                        //    and it means that this property and the device list property have changed
-                        *outNumberPropertiesChanged = 2;
-                        outChangedAddresses[0].mSelector = kAudioBoxPropertyAcquired;
-                        outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
-                        outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
-                        outChangedAddresses[1].mSelector = kAudioBoxPropertyDeviceList;
-                        outChangedAddresses[1].mScope = kAudioObjectPropertyScopeGlobal;
-                        outChangedAddresses[1].mElement = kAudioObjectPropertyElementMain;
-
-                        //    but it also means that the device list has changed for the plug-in too
-                        ExecuteInAudioOutputThread(^() {
-                            AudioObjectPropertyAddress theAddress = {kAudioPlugInPropertyDeviceList,
-                                                                     kAudioObjectPropertyScopeGlobal,
-                                                                     kAudioObjectPropertyElementMain};
-                            gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_PlugIn, 1, &theAddress);
-                        });
+                        changed = true;
                     }
+                }
+                if (changed) {
+                    *outNumberPropertiesChanged = 1;
+                    outChangedAddresses[0].mSelector = kAudioBoxPropertyAcquired;
+                    outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
+                    outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
+                    notifyDeviceListChanged();
+                    notifyStatusChanged();
                 }
             }
             break;
@@ -2615,7 +2508,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyDataSize(AudioServerPlugInDriverRef 
         case kAudioObjectPropertyOwnedObjects:
             switch (inAddress->mScope) {
                 case kAudioObjectPropertyScopeGlobal:
-                    *outDataSize = 5 * sizeof(AudioObjectID);
+                    *outDataSize = 4 * sizeof(AudioObjectID);
                     break;
 
                 case kAudioObjectPropertyScopeInput:
@@ -2623,7 +2516,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyDataSize(AudioServerPlugInDriverRef 
                     break;
 
                 case kAudioObjectPropertyScopeOutput:
-                    *outDataSize = 5 * sizeof(AudioObjectID);
+                    *outDataSize = 4 * sizeof(AudioObjectID);
                     break;
             };
             break;
@@ -2685,7 +2578,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyDataSize(AudioServerPlugInDriverRef 
             break;
 
         case kAudioObjectPropertyControlList:
-            *outDataSize = 4 * sizeof(AudioObjectID);
+            *outDataSize = 3 * sizeof(AudioObjectID);
             break;
 
         case kAudioDevicePropertySafetyOffset:
@@ -2697,7 +2590,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyDataSize(AudioServerPlugInDriverRef 
             break;
 
         case kAudioDevicePropertyAvailableNominalSampleRates:
-            *outDataSize = (UInt32)gDevice_SampleRates.size() * sizeof(AudioValueRange);
+            *outDataSize = (UInt32)currentAvailableSampleRates().size() * sizeof(AudioValueRange);
             break;
 
         case kAudioDevicePropertyIsHidden:
@@ -2812,7 +2705,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
                            Done,
                            "GetDevicePropertyData: not enough space for the return value of "
                            "kAudioObjectPropertyManufacturer for the device");
-            *((CFStringRef *)outData) = CFStringCreateCopy(NULL, deviceName);
+            *((CFStringRef *)outData) = copyDeviceName();
             *outDataSize = sizeof(CFStringRef);
             break;
 
@@ -2838,8 +2731,8 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
             switch (inAddress->mScope) {
                 case kAudioObjectPropertyScopeGlobal:
                     //    global scope means return all objects
-                    if (theNumberItemsToFetch > 5) {
-                        theNumberItemsToFetch = 5;
+                    if (theNumberItemsToFetch > 4) {
+                        theNumberItemsToFetch = 4;
                     }
 
                     //    fill out the list with as many objects as requested, which is everything
@@ -2854,8 +2747,8 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
 
                 case kAudioObjectPropertyScopeOutput:
                     //    output scope means just the objects on the output side
-                    if (theNumberItemsToFetch > 5) {
-                        theNumberItemsToFetch = 5;
+                    if (theNumberItemsToFetch > 4) {
+                        theNumberItemsToFetch = 4;
                     }
 
                     //    fill out the list with the right objects
@@ -2974,7 +2867,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
                            "GetDevicePropertyData: not enough space for the return value of "
                            "kAudioDevicePropertyDeviceIsRunning for the device");
             {
-                CAMutex::Locker locker(stateMutex);
+                StateLocker locker(stateMutex);
                 *((UInt32 *)outData) = ((gDevice_IOIsRunning > 0) > 0) ? 1 : 0;
             }
             *outDataSize = sizeof(UInt32);
@@ -3009,14 +2902,17 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
             break;
 
         case kAudioDevicePropertyLatency:
-            //    This property returns the presentation latency of the device. For this,
-            //    device, the value is 0 due to the fact that it always vends silence.
+            //    The measured delay from Nearfield's clock to the displays'
+            //    speakers: the buffered audio plus the displays' own latency.
             FailWithAction(inDataSize < sizeof(UInt32),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
                            "GetDevicePropertyData: not enough space for the return value of "
                            "kAudioDevicePropertyLatency for the device");
-            *((UInt32 *)outData) = 0;
+            {
+                const UInt32 reported = reportedLatencyFrames.load();
+                *((UInt32 *)outData) = reported > 0 ? reported : currentLatencyFrames();
+            }
             *outDataSize = sizeof(UInt32);
             break;
 
@@ -3069,8 +2965,8 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
             //    number is allowed to be smaller than the actual size of the list. In such
             //    case, only that number of items will be returned
             theNumberItemsToFetch = inDataSize / sizeof(AudioObjectID);
-            if (theNumberItemsToFetch > 4) {
-                theNumberItemsToFetch = 4;
+            if (theNumberItemsToFetch > 3) {
+                theNumberItemsToFetch = 3;
             }
 
             //    fill out the list with as many objects as requested, which is everything
@@ -3103,7 +2999,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
                            "GetDevicePropertyData: not enough space for the return value of "
                            "kAudioDevicePropertyNominalSampleRate for the device");
             {
-                CAMutex::Locker locker(stateMutex);
+                StateLocker locker(stateMutex);
                 *((Float64 *)outData) = gDevice_SampleRate;
             }
             *outDataSize = sizeof(Float64);
@@ -3117,11 +3013,14 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
             //    Calculate the number of items that have been requested. Note that this
             //    number is allowed to be smaller than the actual size of the list. In such
             //    case, only that number of items will be returned
-            theNumberItemsToFetch = (UInt32)std::min(inDataSize / sizeof(AudioValueRange), gDevice_SampleRates.size());
-
-            for (unsigned int i = 0; i < theNumberItemsToFetch; ++i) {
-                ((AudioValueRange *)outData)[i].mMinimum = gDevice_SampleRates[i];
-                ((AudioValueRange *)outData)[i].mMaximum = gDevice_SampleRates[i];
+            //    Only the rates the displays support.
+            {
+                const std::vector<Float64> rates = currentAvailableSampleRates();
+                theNumberItemsToFetch = (UInt32)std::min<size_t>(inDataSize / sizeof(AudioValueRange), rates.size());
+                for (unsigned int i = 0; i < theNumberItemsToFetch; ++i) {
+                    ((AudioValueRange *)outData)[i].mMinimum = rates[i];
+                    ((AudioValueRange *)outData)[i].mMaximum = rates[i];
+                }
             }
 
             //    report how much we wrote
@@ -3187,7 +3086,7 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
                            Done,
                            "GetDevicePropertyData: not enough space for the return value of "
                            "kAudioDevicePropertyZeroTimeStampPeriod for the device");
-            *((UInt32 *)outData) = kDevice_RingBufferSize;
+            *((UInt32 *)outData) = kDevice_ZeroTimeStampPeriod;
             *outDataSize = sizeof(UInt32);
             break;
 
@@ -3274,14 +3173,14 @@ OSStatus ProxyAudioDevice::SetDevicePropertyData(AudioServerPlugInDriverRef inDr
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
                            "SetDevicePropertyData: wrong size for the data for kAudioDevicePropertyNominalSampleRate");
-            FailWithAction((!contains(gDevice_SampleRates, *(Float64 *)inData)),
+            FailWithAction(!isSupportedSampleRate(*(const Float64 *)inData),
                            theAnswer = kAudioHardwareIllegalOperationError,
                            Done,
                            "SetDevicePropertyData: unsupported value for kAudioDevicePropertyNominalSampleRate");
 
             //    make sure that the new value is different than the old value
             {
-                CAMutex::Locker locker(stateMutex);
+                StateLocker locker(stateMutex);
                 theOldSampleRate = gDevice_SampleRate;
             }
 
@@ -3490,7 +3389,7 @@ OSStatus ProxyAudioDevice::GetStreamPropertyDataSize(AudioServerPlugInDriverRef 
 
         case kAudioStreamPropertyAvailableVirtualFormats:
         case kAudioStreamPropertyAvailablePhysicalFormats:
-            *outDataSize = (UInt32)(gDevice_SampleRates.size() * sizeof(AudioStreamRangedDescription));
+            *outDataSize = (UInt32)(currentAvailableSampleRates().size() * sizeof(AudioStreamRangedDescription));
             break;
 
         default:
@@ -3591,7 +3490,7 @@ OSStatus ProxyAudioDevice::GetStreamPropertyData(AudioServerPlugInDriverRef inDr
                            "GetStreamPropertyData: not enough space for the return value of "
                            "kAudioStreamPropertyIsActive for the stream");
             {
-                CAMutex::Locker locker(stateMutex);
+                StateLocker locker(stateMutex);
                 *((UInt32 *)outData) = gStream_Output_IsActive;
             }
             *outDataSize = sizeof(UInt32);
@@ -3659,7 +3558,7 @@ OSStatus ProxyAudioDevice::GetStreamPropertyData(AudioServerPlugInDriverRef inDr
                            "GetStreamPropertyData: not enough space for the return value of "
                            "kAudioStreamPropertyVirtualFormat for the stream");
             {
-                CAMutex::Locker locker(stateMutex);
+                StateLocker locker(stateMutex);
                 ((AudioStreamBasicDescription *)outData)->mSampleRate = gDevice_SampleRate;
                 ((AudioStreamBasicDescription *)outData)->mFormatID = kAudioFormatLinearPCM;
                 ((AudioStreamBasicDescription *)outData)->mFormatFlags =
@@ -3683,11 +3582,13 @@ OSStatus ProxyAudioDevice::GetStreamPropertyData(AudioServerPlugInDriverRef inDr
             //    Calculate the number of items that have been requested. Note that this
             //    number is allowed to be smaller than the actual size of the list. In such
             //    case, only that number of items will be returned
+            {
+            const std::vector<Float64> rates = currentAvailableSampleRates();
             theNumberItemsToFetch =
-                (UInt32)std::min(inDataSize / sizeof(AudioStreamRangedDescription), gDevice_SampleRates.size());
+                (UInt32)std::min<size_t>(inDataSize / sizeof(AudioStreamRangedDescription), rates.size());
 
             for (unsigned int i = 0; i < theNumberItemsToFetch; ++i) {
-                ((AudioStreamRangedDescription *)outData)[i].mFormat.mSampleRate = gDevice_SampleRates[i];
+                ((AudioStreamRangedDescription *)outData)[i].mFormat.mSampleRate = rates[i];
                 ((AudioStreamRangedDescription *)outData)[i].mFormat.mFormatID = kAudioFormatLinearPCM;
                 ((AudioStreamRangedDescription *)outData)[i].mFormat.mFormatFlags =
                     kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
@@ -3699,8 +3600,9 @@ OSStatus ProxyAudioDevice::GetStreamPropertyData(AudioServerPlugInDriverRef inDr
                 ((AudioStreamRangedDescription *)outData)[i].mFormat.mChannelsPerFrame = gDevice_ChannelsPerFrame;
                 ((AudioStreamRangedDescription *)outData)[i].mFormat.mBitsPerChannel =
                     gDevice_BytesPerFrameInChannel * 8;
-                ((AudioStreamRangedDescription *)outData)[i].mSampleRateRange.mMinimum = gDevice_SampleRates[i];
-                ((AudioStreamRangedDescription *)outData)[i].mSampleRateRange.mMaximum = gDevice_SampleRates[i];
+                ((AudioStreamRangedDescription *)outData)[i].mSampleRateRange.mMinimum = rates[i];
+                ((AudioStreamRangedDescription *)outData)[i].mSampleRateRange.mMaximum = rates[i];
+            }
             }
 
             //    report how much we wrote
@@ -3768,7 +3670,7 @@ OSStatus ProxyAudioDevice::SetStreamPropertyData(AudioServerPlugInDriverRef inDr
                            Done,
                            "SetStreamPropertyData: wrong size for the data for kAudioDevicePropertyNominalSampleRate");
             {
-                CAMutex::Locker locker(stateMutex);
+                StateLocker locker(stateMutex);
                 if (gStream_Output_IsActive != (*((const UInt32 *)inData) != 0)) {
                     gStream_Output_IsActive = *((const UInt32 *)inData) != 0;
                     *outNumberPropertiesChanged = 1;
@@ -3824,7 +3726,7 @@ OSStatus ProxyAudioDevice::SetStreamPropertyData(AudioServerPlugInDriverRef inDr
                 theAnswer = kAudioDeviceUnsupportedFormatError,
                 Done,
                 "SetStreamPropertyData: unsupported bits per channel for kAudioStreamPropertyPhysicalFormat");
-            FailWithAction((!contains(gDevice_SampleRates, ((const AudioStreamBasicDescription *)inData)->mSampleRate)),
+            FailWithAction(!isSupportedSampleRate(((const AudioStreamBasicDescription *)inData)->mSampleRate),
                            theAnswer = kAudioHardwareIllegalOperationError,
                            Done,
                            "SetStreamPropertyData: unsupported sample rate for kAudioStreamPropertyPhysicalFormat");
@@ -3832,7 +3734,7 @@ OSStatus ProxyAudioDevice::SetStreamPropertyData(AudioServerPlugInDriverRef inDr
             //    If we made it this far, the requested format is something we support, so make sure the sample rate is
             //    actually different
             {
-                CAMutex::Locker locker(stateMutex);
+                StateLocker locker(stateMutex);
                 theOldSampleRate = gDevice_SampleRate;
             }
             if (((const AudioStreamBasicDescription *)inData)->mSampleRate != theOldSampleRate) {
@@ -3908,18 +3810,6 @@ Boolean ProxyAudioDevice::HasControlProperty(AudioServerPlugInDriverRef inDriver
             };
             break;
 
-        case kObjectID_DataSource_Output_Master:
-            switch (inAddress->mSelector) {
-                case kAudioObjectPropertyBaseClass:
-                case kAudioObjectPropertyClass:
-                case kAudioObjectPropertyOwner:
-                case kAudioObjectPropertyOwnedObjects:
-                case kAudioControlPropertyScope:
-                case kAudioControlPropertyElement:
-                    theAnswer = true;
-                    break;
-            };
-            break;
     };
 
 Done:
@@ -3996,23 +3886,6 @@ OSStatus ProxyAudioDevice::IsControlPropertySettable(AudioServerPlugInDriverRef 
 
                 case kAudioBooleanControlPropertyValue:
                     *outIsSettable = true;
-                    break;
-
-                default:
-                    theAnswer = kAudioHardwareUnknownPropertyError;
-                    break;
-            };
-            break;
-
-        case kObjectID_DataSource_Output_Master:
-            switch (inAddress->mSelector) {
-                case kAudioObjectPropertyBaseClass:
-                case kAudioObjectPropertyClass:
-                case kAudioObjectPropertyOwner:
-                case kAudioObjectPropertyOwnedObjects:
-                case kAudioControlPropertyScope:
-                case kAudioControlPropertyElement:
-                    *outIsSettable = false;
                     break;
 
                 default:
@@ -4151,38 +4024,6 @@ OSStatus ProxyAudioDevice::GetControlPropertyDataSize(AudioServerPlugInDriverRef
             };
             break;
 
-        case kObjectID_DataSource_Output_Master:
-            switch (inAddress->mSelector) {
-                case kAudioObjectPropertyBaseClass:
-                    *outDataSize = sizeof(AudioClassID);
-                    break;
-
-                case kAudioObjectPropertyClass:
-                    *outDataSize = sizeof(AudioClassID);
-                    break;
-
-                case kAudioObjectPropertyOwner:
-                    *outDataSize = sizeof(AudioObjectID);
-                    break;
-
-                case kAudioObjectPropertyOwnedObjects:
-                    *outDataSize = 0 * sizeof(AudioObjectID);
-                    break;
-
-                case kAudioControlPropertyScope:
-                    *outDataSize = sizeof(AudioObjectPropertyScope);
-                    break;
-
-                case kAudioControlPropertyElement:
-                    *outDataSize = sizeof(AudioObjectPropertyElement);
-                    break;
-
-                default:
-                    theAnswer = kAudioHardwareUnknownPropertyError;
-                    break;
-            };
-            break;
-
         default:
             theAnswer = kAudioHardwareBadObjectError;
             break;
@@ -4302,7 +4143,7 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                                    "GetControlPropertyData: not enough space for the return value of "
                                    "kAudioLevelControlPropertyScalarValue for the volume control");
                     {
-                        CAMutex::Locker locker(stateMutex);
+                        StateLocker locker(stateMutex);
                         if (inObjectID == kObjectID_Volume_Output_L) {
                             *((Float32 *)outData) = gVolume_Output_L_Value;
                         } else {
@@ -4321,7 +4162,7 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                                    "GetControlPropertyData: not enough space for the return value of "
                                    "kAudioLevelControlPropertyDecibelValue for the volume control");
                     {
-                        CAMutex::Locker locker(stateMutex);
+                        StateLocker locker(stateMutex);
                         if (inObjectID == kObjectID_Volume_Output_L) {
                             *((Float32 *)outData) = gVolume_Output_L_Value;
                         } else {
@@ -4453,78 +4294,10 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                                    "GetControlPropertyData: not enough space for the return value of "
                                    "kAudioBooleanControlPropertyValue for the mute control");
                     {
-                        CAMutex::Locker locker(stateMutex);
+                        StateLocker locker(stateMutex);
                         *((UInt32 *)outData) = gMute_Output_Mute ? 1 : 0;
                     }
                     *outDataSize = sizeof(UInt32);
-                    break;
-
-                default:
-                    theAnswer = kAudioHardwareUnknownPropertyError;
-                    break;
-            };
-            break;
-
-        case kObjectID_DataSource_Output_Master:
-            switch (inAddress->mSelector) {
-                case kAudioObjectPropertyBaseClass:
-                    //    The base class for kAudioDataSourceControlClassID is kAudioSelectorControlClassID
-                    FailWithAction(inDataSize < sizeof(AudioClassID),
-                                   theAnswer = kAudioHardwareBadPropertySizeError,
-                                   Done,
-                                   "GetControlPropertyData: not enough space for the return value of "
-                                   "kAudioObjectPropertyBaseClass for the data source control");
-                    *((AudioClassID *)outData) = kAudioSelectorControlClassID;
-                    *outDataSize = sizeof(AudioClassID);
-                    break;
-
-                case kAudioObjectPropertyClass:
-                    //    Data Source controls are of the class, kAudioDataSourceControlClassID
-                    FailWithAction(inDataSize < sizeof(AudioClassID),
-                                   theAnswer = kAudioHardwareBadPropertySizeError,
-                                   Done,
-                                   "GetControlPropertyData: not enough space for the return value of "
-                                   "kAudioObjectPropertyClass for the data source control");
-                    *((AudioClassID *)outData) = kAudioDataSourceControlClassID;
-                    *outDataSize = sizeof(AudioClassID);
-                    break;
-
-                case kAudioObjectPropertyOwner:
-                    //    The control's owner is the device object
-                    FailWithAction(inDataSize < sizeof(AudioObjectID),
-                                   theAnswer = kAudioHardwareBadPropertySizeError,
-                                   Done,
-                                   "GetControlPropertyData: not enough space for the return value of "
-                                   "kAudioObjectPropertyOwner for the data source control");
-                    *((AudioObjectID *)outData) = kObjectID_Device;
-                    *outDataSize = sizeof(AudioObjectID);
-                    break;
-
-                case kAudioObjectPropertyOwnedObjects:
-                    //    Controls do not own any objects
-                    *outDataSize = 0 * sizeof(AudioObjectID);
-                    break;
-
-                case kAudioControlPropertyScope:
-                    //    This property returns the scope that the control is attached to.
-                    FailWithAction(inDataSize < sizeof(AudioObjectPropertyScope),
-                                   theAnswer = kAudioHardwareBadPropertySizeError,
-                                   Done,
-                                   "GetControlPropertyData: not enough space for the return value of "
-                                   "kAudioControlPropertyScope for the data source control");
-                    *((AudioObjectPropertyScope *)outData) = kAudioObjectPropertyScopeOutput;
-                    *outDataSize = sizeof(AudioObjectPropertyScope);
-                    break;
-
-                case kAudioControlPropertyElement:
-                    //    This property returns the element that the control is attached to.
-                    FailWithAction(inDataSize < sizeof(AudioObjectPropertyElement),
-                                   theAnswer = kAudioHardwareBadPropertySizeError,
-                                   Done,
-                                   "GetControlPropertyData: not enough space for the return value of "
-                                   "kAudioControlPropertyElement for the data source control");
-                    *((AudioObjectPropertyElement *)outData) = kAudioObjectPropertyElementMain;
-                    *outDataSize = sizeof(AudioObjectPropertyElement);
                     break;
 
                 default:
@@ -4599,7 +4372,7 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
                         theNewVolume = 1.0;
                     }
                     {
-                        CAMutex::Locker locker(stateMutex);
+                        StateLocker locker(stateMutex);
                         if (inObjectID == kObjectID_Volume_Output_L) {
                             if (gVolume_Output_L_Value != theNewVolume) {
                                 gVolume_Output_L_Value = theNewVolume;
@@ -4638,7 +4411,7 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
                     theNewVolume = *((const Float32 *)inData);
                     theNewVolume = volumeDecibelsToScalar(theNewVolume);
                     {
-                        CAMutex::Locker locker(stateMutex);
+                        StateLocker locker(stateMutex);
                         if (inObjectID == kObjectID_Volume_Output_L) {
                             if (gVolume_Output_L_Value != theNewVolume) {
                                 gVolume_Output_L_Value = theNewVolume;
@@ -4680,7 +4453,7 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
                         Done,
                         "SetControlPropertyData: wrong size for the data for kAudioBooleanControlPropertyValue");
                     {
-                        CAMutex::Locker locker(stateMutex);
+                        StateLocker locker(stateMutex);
                         if (gMute_Output_Mute != (*((const UInt32 *)inData) != 0)) {
                             gMute_Output_Mute = *((const UInt32 *)inData) != 0;
                             *outNumberPropertiesChanged = 1;
@@ -4697,10 +4470,6 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
             };
             break;
 
-        case kObjectID_DataSource_Output_Master:
-            theAnswer = kAudioHardwareUnknownPropertyError;
-            break;
-
         default:
             theAnswer = kAudioHardwareBadObjectError;
             break;
@@ -4712,476 +4481,846 @@ Done:
 
 #pragma mark Output Device Operations
 
-AudioDevice ProxyAudioDevice::findTargetOutputAudioDevice() {
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice");
-    CFStringSmartRef currentOutputDeviceUID;
-    
-    {
-        CAMutex::Locker locker(&stateMutex);
-        
-        if (!outputDeviceUID) {
-            DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, output device UID is null");
-            return AudioDevice();
-        }
-        
-        currentOutputDeviceUID = CFStringCreateCopy(NULL, outputDeviceUID);
-    }
-    
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice target UID: %s", CFStringToStdString(currentOutputDeviceUID).c_str());
+// Everything in this section runs on the driver's queue unless noted. Core
+// Audio listener callbacks only queue work; they never call back into Core
+// Audio themselves.
 
-    AudioObjectID translatedDevice = AudioDevice::audioDeviceIDForDeviceUID(currentOutputDeviceUID);
-    if (translatedDevice != kAudioObjectUnknown) {
-        DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, found output device by UID");
-        return AudioDevice(translatedDevice);
-    }
+static const AudioObjectPropertySelector kOutputDeviceListenedSelectors[] = {
+    kAudioDevicePropertyDeviceIsAlive,
+    kAudioDevicePropertyNominalSampleRate,
+    kAudioDevicePropertyAvailableNominalSampleRates,
+    kAudioDevicePropertyLatency,
+    kAudioDevicePropertyBufferFrameSize,
+    kAudioAggregateDevicePropertyActiveSubDeviceList,
+    kAudioAggregateDevicePropertyFullSubDeviceList,
+};
 
-    std::vector<AudioObjectID> devices = AudioDevice::allAudioDevices();
-    for (AudioObjectID device : devices) {
-        AudioObjectPropertyAddress propertyAddress = {
-            kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain};
-
-        CFStringSmartRef uid;
-        UInt32 size = sizeof(CFStringRef);
-        OSStatus err = AudioObjectGetPropertyData(device, &propertyAddress, 0, NULL, &size, &uid);
-
-        if (err == noErr && uid) {
-            if (CFStringCompare(uid, currentOutputDeviceUID, 0) == kCFCompareEqualTo) {
-                DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, found output device");
-                return AudioDevice(device);
-            }
-        }
-    }
-
-    DebugMsg("ProxyAudio: findTargetOutputAudioDevice finished, not not find output device");
-    
-    return AudioDevice();
+static bool isAggregateOnlySelector(AudioObjectPropertySelector selector) {
+    return selector == kAudioAggregateDevicePropertyActiveSubDeviceList ||
+           selector == kAudioAggregateDevicePropertyFullSubDeviceList;
 }
 
-int ProxyAudioDevice::outputDeviceAliveListenerStatic(AudioObjectID inObjectID,
+static AudioObjectPropertyScope scopeForListenedSelector(AudioObjectPropertySelector selector) {
+    switch (selector) {
+        case kAudioDevicePropertyLatency:
+        case kAudioDevicePropertyBufferFrameSize:
+            return kAudioObjectPropertyScopeOutput;
+        default:
+            return kAudioObjectPropertyScopeGlobal;
+    }
+}
+
+static AudioObjectID audioObjectForUID(const std::string &uid) {
+    if (uid.empty()) {
+        return kAudioObjectUnknown;
+    }
+    CFStringSmartRef uidString(nearfield::createCFString(uid));
+    if (!uidString) {
+        return kAudioObjectUnknown;
+    }
+    return AudioDevice::audioDeviceIDForDeviceUID(uidString);
+}
+
+static bool deviceIsAlive(AudioObjectID device) {
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+    UInt32 alive = 0;
+    UInt32 size = sizeof(alive);
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    nearfield::countHALRequest();
+    return AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &alive) == noErr && alive != 0;
+}
+
+AudioDevice ProxyAudioDevice::findTargetOutputAudioDevice() {
+    std::string uid;
+    {
+        StateLocker locker(stateMutex);
+        uid = settings.targetDevices.size() >= 2 ? std::string(kDriverTargetAggregate_UID) : settings.outputDeviceUID;
+    }
+    if (uid.empty()) {
+        // Before Nearfield configured any displays: follow the Mac's output.
+        CFStringSmartRef defaultUID(copyDefaultProxyOutputDeviceUID());
+        uid = nearfield::stringFromCF(defaultUID);
+    }
+    const AudioObjectID device = audioObjectForUID(uid);
+    if (device == kAudioObjectUnknown) {
+        return AudioDevice();
+    }
+    return AudioDevice(device);
+}
+
+OSStatus ProxyAudioDevice::outputDeviceListenerStatic(AudioObjectID inObjectID,
                                                       UInt32 inNumberAddresses,
                                                       const AudioObjectPropertyAddress *inAddresses,
                                                       void *inClientData) {
-    if (!inClientData) {
+    ProxyAudioDevice *device = static_cast<ProxyAudioDevice *>(inClientData);
+    if (!device || !inAddresses) {
         return noErr;
     }
-
-    return ((ProxyAudioDevice *)inClientData)->outputDeviceAliveListener(inObjectID, inNumberAddresses, inAddresses);
-}
-
-int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
-                                                UInt32 inNumberAddresses,
-                                                const AudioObjectPropertyAddress *inAddresses) {
-#pragma unused(inObjectID)
-#pragma unused(inNumberAddresses)
-#pragma unused(inAddresses)
-
-    DebugMsg("ProxyAudio: outputDeviceAliveListener");
-    {
-        CAMutex::Locker locker(outputDeviceMutex);
-        UInt32 alive = 0;
-        OSStatus err = outputDevice.getIntegerPropertyData(
-            alive, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain);
-
-        if (err == noErr && alive == 1) {
-            return noErr;
-        }
+    for (UInt32 index = 0; index < inNumberAddresses; ++index) {
+        const AudioObjectPropertySelector selector = inAddresses[index].mSelector;
+        device->ExecuteInAudioOutputThread(^{
+            if (device->outputDevice.isValid() && device->outputDevice.id == inObjectID) {
+                device->handleOutputDeviceChange(selector);
+            }
+        });
     }
-
-    DebugMsg("ProxyAudio: outputDeviceAliveListener output device no longer alive");
-    deinitializeOutputDevice();
-
     return noErr;
 }
 
-int ProxyAudioDevice::outputDeviceSampleRateListenerStatic(AudioObjectID inObjectID,
-                                                           UInt32 inNumberAddresses,
-                                                           const AudioObjectPropertyAddress *inAddresses,
-                                                           void *inClientData) {
-    if (!inClientData) {
-        return noErr;
-    }
-
-    return ((ProxyAudioDevice *)inClientData)
-        ->outputDeviceSampleRateListener(inObjectID, inNumberAddresses, inAddresses);
-}
-
-int ProxyAudioDevice::outputDeviceSampleRateListener(AudioObjectID inObjectID,
+OSStatus ProxyAudioDevice::devicesListenerProcStatic(AudioObjectID inObjectID,
                                                      UInt32 inNumberAddresses,
-                                                     const AudioObjectPropertyAddress *inAddresses) {
-#pragma unused(inObjectID)
-#pragma unused(inNumberAddresses)
-#pragma unused(inAddresses)
-    DebugMsg("ProxyAudio: outputDeviceSampleRateListener, will match sample rate");
-    matchOutputDeviceSampleRate();
-
+                                                     const AudioObjectPropertyAddress *inAddresses,
+                                                     void *inClientData) {
+#pragma unused(inObjectID, inNumberAddresses, inAddresses)
+    ProxyAudioDevice *device = static_cast<ProxyAudioDevice *>(inClientData);
+    if (device) {
+        // Re-entering the HAL from this callback (for example to build the
+        // aggregate) can deadlock the driver service.
+        device->ExecuteInAudioOutputThread(^{ device->handleDeviceListChange(); });
+    }
     return noErr;
 }
 
-int ProxyAudioDevice::devicesListenerProcStatic(AudioObjectID inObjectID,
-                                                UInt32 inNumberAddresses,
-                                                const AudioObjectPropertyAddress *inAddresses,
-                                                void *inClientData) {
-    if (!inClientData) {
-        return noErr;
-    }
-
-    return ((ProxyAudioDevice *)inClientData)->devicesListenerProc(inObjectID, inNumberAddresses, inAddresses);
+void ProxyAudioDevice::handleDeviceListChange() {
+    rebuildDriverOwnedTargetAggregate(false);
+    setupTargetOutputDevice();
+    refreshTargetOutputReadiness();
 }
 
-int ProxyAudioDevice::devicesListenerProc(AudioObjectID inObjectID,
-                                          UInt32 inNumberAddresses,
-                                          const AudioObjectPropertyAddress *inAddresses) {
-#pragma unused(inObjectID)
-#pragma unused(inNumberAddresses)
-#pragma unused(inAddresses)
-    DebugMsg("ProxyAudio: devicesListenerProc current devices changed");
-    // Core Audio invokes this callback while it is processing a device-list
-    // change. Re-entering the HAL synchronously from here (the aggregate
-    // rebuild calls AudioHardwareCreateAggregateDevice) can deadlock the
-    // driver service and leave all clients with an empty device inventory.
-    ExecuteInAudioOutputThread(^{
-        rebuildDriverOwnedTargetAggregate(false);
-        setupTargetOutputDevice();
-    });
-    return noErr;
+void ProxyAudioDevice::handleOutputDeviceChange(AudioObjectPropertySelector selector) {
+    switch (selector) {
+        case kAudioDevicePropertyDeviceIsAlive:
+            if (!deviceIsAlive(outputDevice.id)) {
+                syslog(LOG_NOTICE, "NearfieldAudioDevice: output device %u is gone", outputDevice.id);
+                deinitializeOutputDevice();
+                refreshTargetOutputReadiness();
+            }
+            break;
+        case kAudioDevicePropertyNominalSampleRate:
+            matchOutputDeviceSampleRate();
+            break;
+        case kAudioDevicePropertyAvailableNominalSampleRates:
+            refreshAvailableSampleRates();
+            break;
+        case kAudioDevicePropertyLatency:
+        case kAudioDevicePropertyBufferFrameSize:
+            outputDevice.updateStreamInfo();
+            publishOutputFormatToEngine();
+            notifyLatencyChanged();
+            break;
+        case kAudioAggregateDevicePropertyActiveSubDeviceList:
+        case kAudioAggregateDevicePropertyFullSubDeviceList:
+            refreshTargetOutputReadiness();
+            break;
+        default:
+            break;
+    }
 }
 
-void ProxyAudioDevice::updateOutputDeviceStartedState() {
-    static bool userIsActivePrevious = false;
-    
-    if (!outputDevice.isValid()) {
-        return;
-    }
-
-    bool shouldStart = false;
-
-    if (!outputDeviceReady) {
-        shouldStart = false;
-
-    } else if (outputDeviceActiveCondition == ActiveCondition::userActive) {
-        // We consider the user to be active if they have done anything in the last 30 seconds:
-        bool userIsActive = (getUserIdleTimeInterval() < 30);
-        shouldStart = (inputIOIsActive || userIsActive);
-
-        if (userIsActive && !userIsActivePrevious) {
-            DebugMsg("ProxyAudio: detected user is now active");
-        } else if (!userIsActive && userIsActivePrevious) {
-            DebugMsg("ProxyAudio: detected user is now idle");
-        }
-
-        userIsActivePrevious = userIsActive;
-
-    } else if (outputDeviceActiveCondition == ActiveCondition::proxiedDeviceActive) {
-        shouldStart = inputIOIsActive;
-
-    } else {
-        shouldStart = true;
-    }
-
-    if (!outputDevice.isStarted && shouldStart) {
-        DebugMsg("ProxyAudio: starting outputDevice");
-        outputDevice.start();
-    } else if (outputDevice.isStarted && !shouldStart) {
-        DebugMsg("ProxyAudio: stopping outputDevice");
-        outputDevice.stop();
-        resetInputData();
-    }
-
+void ProxyAudioDevice::publishOutputFormatToEngine() {
+    engine.setOutputFormat(outputDevice.sampleRate, outputDevice.bufferFrameSize, outputDevice.latencyFrames);
 }
 
-void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
-    DebugMsg("ProxyAudio: matchOutputDeviceSampleRateNoLock");
-    
-    if (!outputDevice.isValid()) {
-        DebugMsg("ProxyAudio: matchOutputDeviceSampleRateNoLock ... no valid output device");
-        return;
-    }
-
-    Float64 currentInputSampleRate;
-    OSStatus err = outputDevice.getDoublePropertyData(outputDevice.sampleRate,
-                                                      kAudioDevicePropertyNominalSampleRate,
-                                                      kAudioObjectPropertyScopeGlobal,
-                                                      kAudioObjectPropertyElementMain);
-
-    if (err != noErr) {
-        syslog(LOG_WARNING, "ProxyAudio error: couldn't get new sample rate of output device");
-        return;
-    }
-
-    {
-        CAMutex::Locker stateMutexLocker(stateMutex);
-        currentInputSampleRate = gDevice_SampleRate;
-    }
-    
-    if (currentInputSampleRate == outputDevice.sampleRate) {
-        outputDeviceReady = true;
-        updateOutputDeviceStartedState();
-        return;
-    }
-
-    DebugMsg("ProxyAudio: matchOutputDeviceSampleRateNoLock changing sample rate to match: %lf", outputDevice.sampleRate);
-    // NB: it's important that we not modify OutputDevice until it is no longer playing since
-    // we're not using a locking mechanism on its attributes between this function and its IO
-    // function.
-    
-    outputDeviceReady = false;
-    updateOutputDeviceStartedState();
-    
-    resetInputData();
-    outputDevice.updateStreamInfo();
-
-    if (!contains(gDevice_SampleRates, outputDevice.sampleRate)) {
-        syslog(LOG_WARNING, "ProxyAudio: output device using unavailable sample rate, cannot play!");
-        return;
-    }
-
-    DebugMsg("ProxyAudio: matchOutputDeviceSampleRateNoLock about to request device configuration change");
-    
-    ExecuteInAudioOutputThread(^{
-        gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, outputDevice.sampleRate, NULL);
-    });
+// The output device is set up and usable as it is: same device, same buffer
+// size, and its IO callback exists. A failed callback creation is never
+// "current", so the next setup tries again.
+static bool outputSetupIsCurrent(bool currentIsValid,
+                                 AudioObjectID currentID,
+                                 UInt32 currentBufferFrameSize,
+                                 bool currentHasIOProc,
+                                 AudioObjectID wantedID,
+                                 UInt32 wantedBufferFrameSize) {
+    return currentIsValid && currentHasIOProc && currentID == wantedID && currentBufferFrameSize == wantedBufferFrameSize;
 }
 
-void ProxyAudioDevice::matchOutputDeviceSampleRate()
-{
-    DebugMsg("ProxyAudio: matchOutputDeviceSampleRate");
-    CAMutex::Locker outputMutexLocker(outputDeviceMutex);
-    matchOutputDeviceSampleRateNoLock();
+// Seconds before retry |attempt| (0-based) of a failed output setup, or a
+// negative value once retries are used up (until the displays change).
+static double outputSetupRetryDelay(int attempt) {
+    constexpr int kMaximumAttempts = 12;
+    if (attempt < 0 || attempt >= kMaximumAttempts) {
+        return -1;
+    }
+    return std::min(4.0, 0.25 * (double)(1u << std::min(attempt, 4)));
 }
 
 void ProxyAudioDevice::setupTargetOutputDevice() {
-    DebugMsg("ProxyAudio: setupTargetOutputDevice");
+    if (!manageOutputDevice) {
+        return;
+    }
     AudioDevice newOutputDevice = findTargetOutputAudioDevice();
+    UInt32 bufferFrameSize = nearfield::kDefaultOutputBufferFrameSize;
+    {
+        StateLocker locker(stateMutex);
+        bufferFrameSize = settings.outputBufferFrameSize;
+    }
 
-    DebugMsg("ProxyAudio: setupTargetOutputDevice newOutputDevice: %d", newOutputDevice.id);
-    CAMutex::Locker locker(outputDeviceMutex);
-    
-    if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id
-        && outputDevice.bufferFrameSize == outputDeviceBufferFrameSize) {
-        DebugMsg("ProxyAudio: setupTargetOutputDevice no change in device");
+    if (outputSetupIsCurrent(outputDevice.isValid(), outputDevice.id, outputDevice.bufferFrameSize,
+                             outputDevice.procId != nullptr, newOutputDevice.id, bufferFrameSize)) {
         return;
     }
 
-    DebugMsg("ProxyAudio: setupTargetOutputDevice deinitializing old device");
-    // NB: it's important that we not modify OutputDevice until it is no longer playing since
-    // we're not using a locking mechanism on its attributes between this function and its IO
-    // function.
-    deinitializeOutputDeviceNoLock();
-
-    if (newOutputDevice.isValid()) {
-        DebugMsg("ProxyAudio: setupTargetOutputDevice setting up new device");
-        resetInputData();
-        outputDevice = newOutputDevice;
-        outputDevice.setBufferFrameSize(outputDeviceBufferFrameSize);
-        outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
-        outputDevice.addPropertyListener(kAudioDevicePropertyDeviceIsAlive,
-                                         kAudioObjectPropertyScopeGlobal,
-                                         kAudioObjectPropertyElementMain,
-                                         outputDeviceAliveListenerStatic,
-                                         this);
-        outputDevice.addPropertyListener(kAudioDevicePropertyNominalSampleRate,
-                                         kAudioObjectPropertyScopeGlobal,
-                                         kAudioObjectPropertyElementMain,
-                                         outputDeviceSampleRateListenerStatic,
-                                         this);
-        DebugMsg("ProxyAudio: setupTargetOutputDevice will match sample rate");
-        matchOutputDeviceSampleRateNoLock();
-    } else {
-        syslog(LOG_WARNING, "ProxyAudio: setupTargetOutputDevice could not find output device");
+    deinitializeOutputDevice();
+    if (!newOutputDevice.isValid()) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: no output device is available yet");
+        return;
     }
+    if (newOutputDevice.id != outputSetupRetryDeviceID) {
+        outputSetupRetryDeviceID = newOutputDevice.id;
+        outputSetupRetryCount = 0;
+    }
+
+    outputDevice = newOutputDevice;
+    UInt32 classID = 0;
+    outputIsAggregate = outputDevice.getIntegerPropertyData(classID, kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal,
+                                                            kAudioObjectPropertyElementMain) == noErr &&
+                        classID == kAudioAggregateDeviceClassID;
+    outputDevice.setBufferFrameSize(bufferFrameSize);
+    outputDevice.updateStreamInfo();
+    outputDevice.setupIOProc(outputDeviceIOProcStatic, this);
+    if (outputDevice.procId == nullptr) {
+        scheduleOutputSetupRetry();
+    } else {
+        outputSetupRetryCount = 0;
+        ++outputSetupRetryToken;
+    }
+    for (AudioObjectPropertySelector selector : kOutputDeviceListenedSelectors) {
+        if (outputIsAggregate || !isAggregateOnlySelector(selector)) {
+            outputDevice.addPropertyListener(selector, scopeForListenedSelector(selector), kAudioObjectPropertyElementMain,
+                                             outputDeviceListenerStatic, this);
+        }
+    }
+    engine.resetClockEstimate();
+    publishOutputFormatToEngine();
+    syslog(LOG_NOTICE,
+           "NearfieldAudioDevice: output device %u at %.0f Hz, buffer %u, latency %u",
+           outputDevice.id,
+           outputDevice.sampleRate,
+           outputDevice.bufferFrameSize,
+           outputDevice.latencyFrames);
+
+    refreshAvailableSampleRates();
+    // Nearfield's own rate is remembered across restarts; ask the displays
+    // for it before following theirs.
+    applyRequestedSampleRateToOutput(gDevice_SampleRate.load());
+    matchOutputDeviceSampleRate();
+    notifyLatencyChanged();
+}
+
+// Creating the IO callback can fail transiently, for example while Core Audio
+// is still building the displays' aggregate.
+void ProxyAudioDevice::scheduleOutputSetupRetry() {
+    const double delay = outputSetupRetryDelay(outputSetupRetryCount);
+    if (delay < 0) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: could not set up output device %u; waiting for a device change",
+               outputSetupRetryDeviceID);
+        return;
+    }
+    syslog(LOG_WARNING, "NearfieldAudioDevice: output setup failed; retrying in %.2f s", delay);
+    ++outputSetupRetryCount;
+    const UInt64 token = ++outputSetupRetryToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), AudioOutputDispatchQueue(), ^{
+        if (token != outputSetupRetryToken) {
+            return;
+        }
+        setupTargetOutputDevice();
+        updateOutputDeviceStartedState();
+    });
 }
 
 void ProxyAudioDevice::initializeOutputDevice() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000 * NSEC_PER_MSEC),
-                   AudioOutputDispatchQueue(),
-                   ^() {
-                       // Any initialization that involves calling CoreAudio APIs must be done here
-                       // in a separate thread from the rest of the driver. Otherwise we'll get
-                       // deadlocks!
-                       DebugMsg("ProxyAudio: initializeOutputDevice running in separate thread");
-                       if (!outputDeviceUID) {
-                           outputDeviceUID = copyDefaultProxyOutputDeviceUID();
-                       }
-                       
-                       rebuildDriverOwnedTargetAggregate(false);
-                       setupTargetOutputDevice();
-                       setupAudioDevicesListener();
-                   });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000 * NSEC_PER_MSEC), AudioOutputDispatchQueue(), ^() {
+        // Calls into Core Audio must not happen during Initialize.
+        UInt64 revision;
+        {
+            StateLocker stateLocker(stateMutex);
+            revision = targetConfigurationRevision;
+        }
+        rebuildDriverOwnedTargetAggregate(false);
+        setupTargetOutputDevice();
+        appliedTargetConfigurationRevision.store(revision);
+        setupAudioDevicesListener();
+        refreshTargetOutputReadiness();
+    });
 }
 
-void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
-    DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock");
+void ProxyAudioDevice::deinitializeOutputDevice() {
+    readyTargetConfigurationRevision.store(0);
     if (outputDevice.isValid()) {
-        DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock stopping device");
         outputDevice.stop();
-        outputDeviceReady = false;
-        outputDevice.removePropertyListener(kAudioDevicePropertyDeviceIsAlive,
-                                            kAudioObjectPropertyScopeGlobal,
-                                            kAudioObjectPropertyElementMain,
-                                            outputDeviceAliveListenerStatic,
-                                            this);
-        outputDevice.removePropertyListener(kAudioDevicePropertyNominalSampleRate,
-                                            kAudioObjectPropertyScopeGlobal,
-                                            kAudioObjectPropertyElementMain,
-                                            outputDeviceSampleRateListenerStatic,
-                                            this);
-        DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock removing IO proc");
+        outputRunning.store(false);
+        for (AudioObjectPropertySelector selector : kOutputDeviceListenedSelectors) {
+            if (outputIsAggregate || !isAggregateOnlySelector(selector)) {
+                outputDevice.removePropertyListener(selector, scopeForListenedSelector(selector),
+                                                    kAudioObjectPropertyElementMain, outputDeviceListenerStatic, this);
+            }
+        }
         outputDevice.destroyIOProc();
-        DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock invalidating");
         outputDevice.invalidate();
-    } else {
-        DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock output device is already invalidated");
+        notifyStatusChanged();
     }
-}
-
-void ProxyAudioDevice::deinitializeOutputDevice()
-{
-    DebugMsg("ProxyAudio: deinitializeOutputDevice");
-    CAMutex::Locker locker(outputDeviceMutex);
-    deinitializeOutputDeviceNoLock();
+    outputDeviceReady = false;
+    requestedOutputSampleRate = 0;
 }
 
 void ProxyAudioDevice::setupAudioDevicesListener() {
-    DebugMsg("ProxyAudio: setupAudioDevicesListener");
-    AudioObjectPropertyAddress listenerPropertyAddress = {
-        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-    
-    OSStatus err = AudioObjectAddPropertyListener(
-                                                  kAudioObjectSystemObject, &listenerPropertyAddress, &devicesListenerProcStatic, this);
-    
-    if (err != noErr) {
-        syslog(LOG_WARNING,
-               "ProxyAudio: failed to add listener for '%c%c%c%c' '%c%c%c%c' %u",
-               (listenerPropertyAddress.mSelector >> 24) % 0xFF,
-               (listenerPropertyAddress.mSelector >> 16) % 0xFF,
-               (listenerPropertyAddress.mSelector >> 8) % 0xFF,
-               (listenerPropertyAddress.mSelector) % 0xFF,
-               (listenerPropertyAddress.mScope >> 24) % 0xFF,
-               (listenerPropertyAddress.mScope >> 16) % 0xFF,
-               (listenerPropertyAddress.mScope >> 8) % 0xFF,
-               (listenerPropertyAddress.mScope) % 0xFF,
-               listenerPropertyAddress.mElement);
+    if (devicesListenerInstalled || !manageOutputDevice) {
+        return;
     }
-    
-    DebugMsg("ProxyAudio: setupAudioDevicesListener finished");
+    AudioObjectPropertyAddress address = {
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    nearfield::countHALRequest();
+    OSStatus status = AudioObjectAddPropertyListener(kAudioObjectSystemObject, &address, &devicesListenerProcStatic, this);
+    if (status != noErr) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: failed to observe the device list (%d)", (int)status);
+        return;
+    }
+    devicesListenerInstalled = true;
+}
+
+// Starts the displays when a client plays and stops them once everything
+// buffered was played and they have been idle for the keep-alive period.
+void ProxyAudioDevice::updateOutputDeviceStartedState() {
+    if (!outputDevice.isValid()) {
+        return;
+    }
+    int activeCondition = 0;
+    {
+        StateLocker locker(stateMutex);
+        activeCondition = settings.activeCondition;
+    }
+    const bool clients = engine.hasActiveClients();
+    const bool wanted = activeCondition == 2 || clients || !engine.isDrained();
+    if (outputDeviceReady && wanted) {
+        ++outputStopToken;
+        if (!outputDevice.isStarted) {
+            engine.noteOutputStarting();
+            diagnostics.record(nearfield::kDiagnosticOutputStartRequested);
+            outputDevice.start();
+            outputRunning.store(outputDevice.isStarted);
+            notifyStatusChanged();
+        }
+        return;
+    }
+    if (outputDevice.isStarted) {
+        scheduleOutputStop(outputDeviceReady ? kOutputKeepAliveSeconds : 0);
+    }
+}
+
+void ProxyAudioDevice::scheduleOutputStop(double seconds) {
+    const UInt64 token = ++outputStopToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), AudioOutputDispatchQueue(), ^{
+        if (token != outputStopToken || !outputDevice.isValid() || !outputDevice.isStarted) {
+            return;
+        }
+        if (outputDeviceReady && (engine.hasActiveClients() || !engine.isDrained())) {
+            return;
+        }
+        outputDevice.stop();
+        outputRunning.store(false);
+        diagnostics.record(nearfield::kDiagnosticOutputStopped);
+        notifyStatusChanged();
+    });
+}
+
+bool ProxyAudioDevice::isSupportedSampleRate(Float64 sampleRate) {
+    for (Float64 rate : currentAvailableSampleRates()) {
+        if (fabs(rate - sampleRate) < 0.5) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<Float64> ProxyAudioDevice::currentAvailableSampleRates() {
+    StateLocker locker(stateMutex);
+    if (settings.availableSampleRates.empty()) {
+        // Before the displays are known: the rates Studio Displays support.
+        return {44100.0, 48000.0, 88200.0, 96000.0};
+    }
+    return settings.availableSampleRates;
+}
+
+// Offers only the rates the displays support.
+void ProxyAudioDevice::refreshAvailableSampleRates() {
+    if (!outputDevice.isValid()) {
+        return;
+    }
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyAvailableNominalSampleRates,
+                                          kAudioObjectPropertyScopeGlobal,
+                                          kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    nearfield::countHALRequest();
+    if (AudioObjectGetPropertyDataSize(outputDevice.id, &address, 0, NULL, &size) != noErr || size == 0) {
+        return;
+    }
+    std::vector<AudioValueRange> ranges(size / sizeof(AudioValueRange));
+    nearfield::countHALRequest();
+    if (AudioObjectGetPropertyData(outputDevice.id, &address, 0, NULL, &size, ranges.data()) != noErr) {
+        return;
+    }
+    ranges.resize(size / sizeof(AudioValueRange));
+    static const Float64 kStandardRates[] = {44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0};
+    std::vector<Float64> rates;
+    for (Float64 rate : kStandardRates) {
+        for (const AudioValueRange &range : ranges) {
+            if (rate >= range.mMinimum - 0.5 && rate <= range.mMaximum + 0.5) {
+                rates.push_back(rate);
+                break;
+            }
+        }
+    }
+    if (rates.empty()) {
+        return;
+    }
+    bool changed = false;
+    {
+        StateLocker locker(stateMutex);
+        if (settings.availableSampleRates != rates) {
+            settings.availableSampleRates = rates;
+            persistSettingsIfChangedNoLock();
+            changed = true;
+        }
+    }
+    if (changed) {
+        AudioObjectPropertyAddress deviceAddress = {kAudioDevicePropertyAvailableNominalSampleRates,
+                                                    kAudioObjectPropertyScopeGlobal,
+                                                    kAudioObjectPropertyElementMain};
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &deviceAddress);
+        AudioObjectPropertyAddress streamAddresses[2] = {
+            {kAudioStreamPropertyAvailableVirtualFormats, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+            {kAudioStreamPropertyAvailablePhysicalFormats, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain}};
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Stream_Output, 2, streamAddresses);
+        notifyStatusChanged();
+    }
+}
+
+void ProxyAudioDevice::applyRequestedSampleRateToOutput(Float64 sampleRate) {
+    if (!outputDevice.isValid() || sampleRate <= 0) {
+        return;
+    }
+    Float64 current = 0;
+    if (outputDevice.getDoublePropertyData(current, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal,
+                                           kAudioObjectPropertyElementMain) == noErr &&
+        fabs(current - sampleRate) < 0.5) {
+        requestedOutputSampleRate = 0;
+        return;
+    }
+    if (!isSupportedSampleRate(sampleRate)) {
+        return;
+    }
+    requestedOutputSampleRate = sampleRate;
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    nearfield::countHALRequest();
+    const OSStatus status = AudioObjectSetPropertyData(outputDevice.id, &address, 0, NULL, sizeof(sampleRate), &sampleRate);
+    if (status != noErr) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: the displays did not accept %.0f Hz (%d)", sampleRate, (int)status);
+        requestedOutputSampleRate = 0;
+        return;
+    }
+    syslog(LOG_NOTICE, "NearfieldAudioDevice: asked the displays for %.0f Hz", sampleRate);
+    // The rate listener normally reports the change; check again if it does not.
+    scheduleSampleRateRetry();
+}
+
+// Follows the displays' rate, or waits for a change Nearfield requested.
+void ProxyAudioDevice::matchOutputDeviceSampleRate() {
+    if (!outputDevice.isValid()) {
+        return;
+    }
+    Float64 outputRate = 0;
+    if (outputDevice.getDoublePropertyData(outputRate, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal,
+                                           kAudioObjectPropertyElementMain) != noErr) {
+        scheduleSampleRateRetry();
+        return;
+    }
+    outputDevice.sampleRate = outputRate;
+    outputDevice.updateStreamInfo();
+    publishOutputFormatToEngine();
+    const Float64 deviceRate = gDevice_SampleRate.load();
+    diagnostics.record(nearfield::kDiagnosticSampleRate, 1, 0, 0, deviceRate, outputRate);
+
+    if (fabs(outputRate - deviceRate) < 0.5) {
+        requestedOutputSampleRate = 0;
+        sampleRateRetryCount = 0;
+        ++sampleRateRetryToken;
+        if (!outputDeviceReady) {
+            outputDeviceReady = true;
+            notifyStatusChanged();
+        }
+        updateOutputDeviceStartedState();
+        refreshTargetOutputReadiness();
+        return;
+    }
+
+    // Until the rates agree the output plays silence.
+    if (outputDeviceReady) {
+        outputDeviceReady = false;
+        readyTargetConfigurationRevision.store(0);
+        notifyStatusChanged();
+    }
+    if (requestedOutputSampleRate > 0 && fabs(requestedOutputSampleRate - outputRate) >= 0.5) {
+        // Nearfield's own request to the displays is still being applied.
+        scheduleSampleRateRetry();
+        return;
+    }
+    if (outputRate > 0 && isSupportedSampleRate(outputRate)) {
+        // The displays' rate changed elsewhere (for example in Audio MIDI
+        // Setup): Nearfield follows.
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: following the displays to %.0f Hz", outputRate);
+        gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, (UInt64)outputRate, NULL);
+        return;
+    }
+    // The displays report a rate Nearfield cannot use (seen at boot): ask
+    // for Nearfield's rate and check again shortly.
+    syslog(LOG_WARNING, "NearfieldAudioDevice: the displays report an unusable rate %.0f Hz; retrying", outputRate);
+    applyRequestedSampleRateToOutput(deviceRate);
+    scheduleSampleRateRetry();
+}
+
+void ProxyAudioDevice::scheduleSampleRateRetry() {
+    if (sampleRateRetryCount >= 12) {
+        requestedOutputSampleRate = 0;
+        return;
+    }
+    const double delay = std::min(4.0, 0.25 * (double)(1u << std::min(sampleRateRetryCount, 4)));
+    ++sampleRateRetryCount;
+    const UInt64 token = ++sampleRateRetryToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), AudioOutputDispatchQueue(), ^{
+        if (token != sampleRateRetryToken) {
+            return;
+        }
+        if (sampleRateRetryCount >= 4) {
+            // Stop waiting for a request the displays never applied.
+            requestedOutputSampleRate = 0;
+        }
+        matchOutputDeviceSampleRate();
+    });
+}
+
+// Recomputed only when the displays, their aggregate or the configuration
+// change; never on a timer.
+void ProxyAudioDevice::refreshTargetOutputReadiness() {
+    std::vector<std::string> expected;
+    UInt64 revision;
+    {
+        StateLocker stateLocker(stateMutex);
+        expected = settings.targetDevices;
+        revision = targetConfigurationRevision;
+    }
+
+    int present = 0;
+    for (const std::string &uid : expected) {
+        if (deviceIsAlive(audioObjectForUID(uid))) {
+            ++present;
+        }
+    }
+    updateDisplayPresence(expected.size() >= 2 ? present : -1);
+
+    UInt64 ready = 0;
+    if (expected.size() >= 2 && expected.size() <= 3 && present == (int)expected.size() && outputDeviceReady &&
+        outputDevice.isValid() && outputDevice.procId && outputDevice.id == targetAggregateID &&
+        appliedTargetConfigurationRevision.load() == revision && deviceIsAlive(targetAggregateID)) {
+        bool matches = true;
+        AudioObjectPropertyAddress address = {kAudioAggregateDevicePropertyFullSubDeviceList,
+                                              kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        CFArrayRef fullList = nullptr;
+        UInt32 size = sizeof(fullList);
+        nearfield::countHALRequest();
+        if (AudioObjectGetPropertyData(targetAggregateID, &address, 0, nullptr, &size, &fullList) != noErr || !fullList) {
+            matches = false;
+        }
+        CFArraySmartRef fullListRef(fullList);
+        if (matches && CFArrayGetCount(fullList) != (CFIndex)expected.size()) {
+            matches = false;
+        }
+        for (size_t index = 0; matches && index < expected.size(); ++index) {
+            CFStringRef uid = static_cast<CFStringRef>(CFArrayGetValueAtIndex(fullList, (CFIndex)index));
+            if (!uid || CFGetTypeID(uid) != CFStringGetTypeID() || nearfield::stringFromCF(uid) != expected[index]) {
+                matches = false;
+            }
+        }
+        if (matches) {
+            address.mSelector = kAudioAggregateDevicePropertyActiveSubDeviceList;
+            size = 0;
+            nearfield::countHALRequest();
+            if (AudioObjectGetPropertyDataSize(targetAggregateID, &address, 0, nullptr, &size) != noErr ||
+                size != expected.size() * sizeof(AudioObjectID)) {
+                matches = false;
+            }
+        }
+        if (matches) {
+            std::vector<AudioObjectID> active(expected.size());
+            nearfield::countHALRequest();
+            if (AudioObjectGetPropertyData(targetAggregateID, &address, 0, nullptr, &size, active.data()) != noErr ||
+                size != expected.size() * sizeof(AudioObjectID)) {
+                matches = false;
+            }
+            for (size_t index = 0; matches && index < active.size(); ++index) {
+                CFStringSmartRef uid(AudioDevice::copyDeviceUID(active[index]));
+                if (!uid || std::find(expected.begin(), expected.end(), nearfield::stringFromCF(uid)) == expected.end()) {
+                    matches = false;
+                }
+            }
+        }
+        if (matches) {
+            StateLocker stateLocker(stateMutex);
+            if (revision == targetConfigurationRevision) {
+                ready = revision;
+            }
+        }
+    }
+    if (readyTargetConfigurationRevision.exchange(ready) != ready) {
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: display route %s", ready ? "ready" : "not ready");
+        notifyStatusChanged();
+    }
+}
+
+// Hides Nearfield once fewer than two displays have been active for about a
+// second, and shows it again as soon as they are back.
+void ProxyAudioDevice::updateDisplayPresence(int presentDisplays) {
+    presentTargetDisplays.store(presentDisplays);
+    if (presentDisplays < 0 || presentDisplays >= 2) {
+        ++hideToken;
+        if (displaysHidden.load()) {
+            setDisplaysHidden(false);
+        }
+        return;
+    }
+    if (displaysHidden.load()) {
+        return;
+    }
+    const double sinceStart = nearfield::hostTicksToMilliseconds(mach_absolute_time() - initializedHostTime) / 1000.0;
+    const double delay = std::max(kDisplayLossHideSeconds, kDisplayLossStartupGraceSeconds - sinceStart);
+    const UInt64 token = ++hideToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), AudioOutputDispatchQueue(), ^{
+        if (token != hideToken || displaysHidden.load()) {
+            return;
+        }
+        std::vector<std::string> expected;
+        {
+            StateLocker locker(stateMutex);
+            expected = settings.targetDevices;
+        }
+        int present = 0;
+        for (const std::string &uid : expected) {
+            if (deviceIsAlive(audioObjectForUID(uid))) {
+                ++present;
+            }
+        }
+        presentTargetDisplays.store(expected.size() >= 2 ? present : -1);
+        if (expected.size() >= 2 && present < 2) {
+            setDisplaysHidden(true);
+        }
+    });
+}
+
+void ProxyAudioDevice::setDisplaysHidden(bool hidden) {
+    if (displaysHidden.exchange(hidden) == hidden) {
+        return;
+    }
+    syslog(LOG_NOTICE, "NearfieldAudioDevice: %s Nearfield (%s)", hidden ? "hiding" : "showing",
+           hidden ? "fewer than two displays" : "displays are back");
+    notifyDeviceListChanged();
+    notifyStatusChanged();
+}
+
+bool ProxyAudioDevice::deviceIsPublished() {
+    StateLocker locker(stateMutex);
+    return gBox_Acquired && !displaysHidden.load();
+}
+
+void ProxyAudioDevice::destroyDriverOwnedTargetAggregate() {
+    if (targetAggregateID == kAudioObjectUnknown) {
+        targetAggregateID = audioObjectForUID(kDriverTargetAggregate_UID);
+    }
+    if (targetAggregateID == kAudioObjectUnknown) {
+        return;
+    }
+    if (outputDevice.isValid() && outputDevice.id == targetAggregateID) {
+        deinitializeOutputDevice();
+    }
+    nearfield::countHALRequest();
+    OSStatus status = AudioHardwareDestroyAggregateDevice(targetAggregateID);
+    if (status != noErr) {
+        syslog(LOG_WARNING,
+               "NearfieldAudioDevice: failed to destroy private target aggregate %u with status %d",
+               targetAggregateID,
+               (int)status);
+    }
+    targetAggregateID = kAudioObjectUnknown;
+}
+
+void ProxyAudioDevice::rebuildDriverOwnedTargetAggregate(bool forceRebuild) {
+    if (!manageOutputDevice) {
+        return;
+    }
+    std::vector<std::string> deviceUIDs;
+    bool stereo = true;
+    {
+        StateLocker locker(stateMutex);
+        deviceUIDs = settings.targetDevices;
+        stereo = settings.stereo;
+    }
+    if (deviceUIDs.size() < 2) {
+        return;
+    }
+
+    if (!forceRebuild) {
+        if (targetAggregateID == kAudioObjectUnknown) {
+            targetAggregateID = audioObjectForUID(kDriverTargetAggregate_UID);
+        }
+        if (targetAggregateID != kAudioObjectUnknown) {
+            return;
+        }
+    }
+
+    destroyDriverOwnedTargetAggregate();
+
+    CFMutableArrayRef subdevices = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    if (!subdevices) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: failed to allocate private target subdevice list");
+        return;
+    }
+    CFArraySmartRef subdevicesRef(subdevices);
+
+    for (size_t index = 0; index < deviceUIDs.size() && index < 3; ++index) {
+        CFStringSmartRef subdeviceUID(nearfield::createCFString(deviceUIDs[index]));
+        if (!subdeviceUID) {
+            continue;
+        }
+
+        UInt32 outputChannels = 1;
+        UInt32 driftCompensation = index == 0 ? 0 : 1;
+        UInt32 driftQuality = kAudioAggregateDriftCompensationHighQuality;
+        CFNumberSmartRef outputChannelsRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &outputChannels));
+        CFNumberSmartRef driftCompensationRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &driftCompensation));
+        CFNumberSmartRef driftQualityRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &driftQuality));
+        CFStringSmartRef subdeviceUIDKey(CFStringCreateWithCString(NULL, kAudioSubDeviceUIDKey, kCFStringEncodingUTF8));
+        CFStringSmartRef outputChannelsKey(CFStringCreateWithCString(NULL, kAudioSubDeviceOutputChannelsKey, kCFStringEncodingUTF8));
+        CFStringSmartRef driftCompensationKey(CFStringCreateWithCString(NULL, kAudioSubDeviceDriftCompensationKey, kCFStringEncodingUTF8));
+        CFStringSmartRef driftQualityKey(CFStringCreateWithCString(NULL, kAudioSubDeviceDriftCompensationQualityKey, kCFStringEncodingUTF8));
+
+        if (!outputChannelsRef || !driftCompensationRef || !driftQualityRef ||
+            !subdeviceUIDKey || !outputChannelsKey || !driftCompensationKey || !driftQualityKey) {
+            syslog(LOG_WARNING, "NearfieldAudioDevice: failed to allocate private target subdevice description");
+            continue;
+        }
+
+        const void *keys[] = {subdeviceUIDKey.ref(), outputChannelsKey.ref(), driftCompensationKey.ref(), driftQualityKey.ref()};
+        const void *values[] = {subdeviceUID.ref(), outputChannelsRef.ref(), driftCompensationRef.ref(), driftQualityRef.ref()};
+        CFDictionarySmartRef subdevice(CFDictionaryCreate(NULL, keys, values, sizeof(keys) / sizeof(keys[0]),
+                                                          &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+        if (subdevice) {
+            CFArrayAppendValue(subdevices, subdevice.ref());
+        }
+    }
+
+    if (CFArrayGetCount(subdevices) < 2) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: private target aggregate has fewer than two valid subdevices");
+        return;
+    }
+
+    UInt32 isPrivate = 1;
+    UInt32 isStacked = stereo ? 1 : 0;
+    CFStringSmartRef aggregateUID(CFStringCreateCopy(NULL, CFSTR(kDriverTargetAggregate_UID)));
+    CFStringSmartRef aggregateName(CFStringCreateCopy(NULL, CFSTR(kDriverTargetAggregate_Name)));
+    CFStringSmartRef mainSubdeviceUID(nearfield::createCFString(deviceUIDs[0]));
+    CFNumberSmartRef isPrivateRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &isPrivate));
+    CFNumberSmartRef isStackedRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &isStacked));
+    CFStringSmartRef aggregateUIDKey(CFStringCreateWithCString(NULL, kAudioAggregateDeviceUIDKey, kCFStringEncodingUTF8));
+    CFStringSmartRef aggregateNameKey(CFStringCreateWithCString(NULL, kAudioAggregateDeviceNameKey, kCFStringEncodingUTF8));
+    CFStringSmartRef subdeviceListKey(CFStringCreateWithCString(NULL, kAudioAggregateDeviceSubDeviceListKey, kCFStringEncodingUTF8));
+    CFStringSmartRef mainSubdeviceKey(CFStringCreateWithCString(NULL, kAudioAggregateDeviceMainSubDeviceKey, kCFStringEncodingUTF8));
+    CFStringSmartRef isPrivateKey(CFStringCreateWithCString(NULL, kAudioAggregateDeviceIsPrivateKey, kCFStringEncodingUTF8));
+    CFStringSmartRef isStackedKey(CFStringCreateWithCString(NULL, kAudioAggregateDeviceIsStackedKey, kCFStringEncodingUTF8));
+
+    if (!aggregateUID || !aggregateName || !mainSubdeviceUID || !isPrivateRef || !isStackedRef || !aggregateUIDKey ||
+        !aggregateNameKey || !subdeviceListKey || !mainSubdeviceKey || !isPrivateKey || !isStackedKey) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: failed to allocate private target aggregate description");
+        return;
+    }
+
+    const void *keys[] = {aggregateUIDKey.ref(), aggregateNameKey.ref(), subdeviceListKey.ref(),
+                          mainSubdeviceKey.ref(), isPrivateKey.ref(), isStackedKey.ref()};
+    const void *values[] = {aggregateUID.ref(), aggregateName.ref(), subdevicesRef.ref(),
+                            mainSubdeviceUID.ref(), isPrivateRef.ref(), isStackedRef.ref()};
+    CFDictionarySmartRef description(CFDictionaryCreate(NULL, keys, values, sizeof(keys) / sizeof(keys[0]),
+                                                        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+
+    AudioObjectID newAggregateID = kAudioObjectUnknown;
+    nearfield::countHALRequest();
+    OSStatus status = AudioHardwareCreateAggregateDevice(description, &newAggregateID);
+    if (status != noErr) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: failed to create private target aggregate with status %d", (int)status);
+        return;
+    }
+    targetAggregateID = newAggregateID;
+    syslog(LOG_NOTICE, "NearfieldAudioDevice: private target aggregate ready");
 }
 
 #pragma mark IO Operations
 
-void ProxyAudioDevice::resetInputDataNoLock() {
-    if (inputBuffer) {
-        inputBuffer->Clear();
-    }
-
-    lastInputFrameTime = -1;
-    lastInputBufferFrameSize = -1;
-    inputOutputSampleDelta = -1;
-    inputFinalFrameTime = -1;
-    smallestFramesToBufferEnd = -1;
-    outputOverrunCount = 0;
-}
-
-void ProxyAudioDevice::resetInputData() {
-    DebugMsg("ProxyAudio: resetInputData");
-    CAMutex::Locker locker(&IOMutex);
-    resetInputDataNoLock();
-}
-
 OSStatus ProxyAudioDevice::StartIO(AudioServerPlugInDriverRef inDriver,
                                    AudioObjectID inDeviceObjectID,
                                    UInt32 inClientID) {
-    //    This call tells the device that IO is starting for the given client. When this routine
-    //    returns, the device's clock is running and it is ready to have data read/written. It is
-    //    important to note that multiple clients can have IO running on the device at the same time.
-    //    So, work only needs to be done when the first client starts. All subsequent starts simply
-    //    increment the counter.
-    OSStatus theAnswer = 0;
-
-#pragma unused(inClientID)
-    
-    DebugMsg("ProxyAudio: StartIO");
+    //    When this returns, the device's clock is running. Several clients can
+    //    run IO at once; the first one starts a new session.
     if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
         return kAudioHardwareBadObjectError;
     }
 
-    CAMutex::Locker locker(stateMutex);
-    CAMutex::Locker ioLocker(IOMutex);
-
-    //    figure out what we need to do
-    if (gDevice_IOIsRunning == UINT64_MAX) {
-        //    overflowing is an error
-        theAnswer = kAudioHardwareIllegalOperationError;
-    } else if (gDevice_IOIsRunning == 0) {
-        // Only the first client starts a new shared timeline. Later clients
-        // must leave the buffered audio and timing of existing clients intact.
-        resetInputDataNoLock();
-        CAMutex::Locker timestampLocker(getZeroTimestampMutex);
-        gDevice_IOIsRunning = 1;
-        gDevice_NumberTimeStamps = 0;
-        gDevice_AnchorSampleTime = 0;
-        gDevice_AnchorHostTime = mach_absolute_time();
-        gDevice_ElapsedTicks = 0;
-        outputAccumulatedRateRatio = 0.0;
-        outputAccumulatedRateRatioSamples = 0;
-    } else {
-        //    IO is already running, so just bump the counter
-        ++gDevice_IOIsRunning;
+    bool firstClient = false;
+    UInt64 clients = 0;
+    {
+        StateLocker locker(stateMutex);
+        if (gDevice_IOIsRunning == UINT64_MAX) {
+            return kAudioHardwareIllegalOperationError;
+        }
+        firstClient = gDevice_IOIsRunning == 0;
+        clients = ++gDevice_IOIsRunning;
+        if (firstClient) {
+            deviceClock.reset(mach_absolute_time());
+            engine.beginClientSession();
+        }
     }
-    
-    inputIOIsActive = (gDevice_IOIsRunning > 0);
-    ExecuteInAudioOutputThread(^ () { updateOutputDeviceStartedState(); });
-    
-    DebugMsg("ProxyAudio: StartIO finished");
-    
-    return theAnswer;
+    diagnostics.record(nearfield::kDiagnosticStartIO, (int32_t)clients, inClientID);
+    if (firstClient) {
+        ExecuteInAudioOutputThread(^() { updateOutputDeviceStartedState(); });
+    }
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::StopIO(AudioServerPlugInDriverRef inDriver,
                                   AudioObjectID inDeviceObjectID,
                                   UInt32 inClientID) {
-    //    This call tells the device that the client has stopped IO. The driver can stop the hardware
-    //    once all clients have stopped.
-
-#pragma unused(inClientID)
-    DebugMsg("ProxyAudio: StopIO");
-
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "StopIO: bad driver reference");
-    FailWithAction(
-        inDeviceObjectID != kObjectID_Device, theAnswer = kAudioHardwareBadObjectError, Done, "StopIO: bad device ID");
-
-    //    we need to hold the state lock
-    {
-        CAMutex::Locker locker(stateMutex);
-
-        //    figure out what we need to do
-        if (gDevice_IOIsRunning == 0) {
-            //    underflowing is an error
-            theAnswer = kAudioHardwareIllegalOperationError;
-        } else if (gDevice_IOIsRunning == 1) {
-            // A client stopping must not truncate audio from remaining clients.
-            CAMutex::Locker ioLocker(IOMutex);
-            inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
-            gDevice_IOIsRunning = 0;
-        } else {
-            //    IO is still running, so just bump the counter
-            --gDevice_IOIsRunning;
-        }
-        inputIOIsActive = (gDevice_IOIsRunning > 0);
+    //    The displays keep playing what is buffered; they stop after it was
+    //    played and the keep-alive period passed.
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
     }
-    
-    ExecuteInAudioOutputThread(^ () { updateOutputDeviceStartedState(); });
-    
-    DebugMsg("ProxyAudio: StopIO finished");
 
-Done:
-    return theAnswer;
+    bool lastClient = false;
+    UInt64 clients = 0;
+    {
+        StateLocker locker(stateMutex);
+        if (gDevice_IOIsRunning == 0) {
+            return kAudioHardwareIllegalOperationError;
+        }
+        clients = --gDevice_IOIsRunning;
+        lastClient = clients == 0;
+        if (lastClient) {
+            engine.endClientSession();
+        }
+    }
+    diagnostics.record(nearfield::kDiagnosticStopIO, (int32_t)clients, inClientID);
+    if (lastClient) {
+        ExecuteInAudioOutputThread(^() { updateOutputDeviceStartedState(); });
+    }
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
@@ -5190,74 +5329,16 @@ OSStatus ProxyAudioDevice::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver,
                                             Float64 *outSampleTime,
                                             UInt64 *outHostTime,
                                             UInt64 *outSeed) {
-    //    This method returns the current zero time stamp for the device. The HAL models the timing of
-    //    a device as a series of time stamps that relate the sample time to a host time. The zero
-    //    time stamps are spaced such that the sample times are the value of
-    //    kAudioDevicePropertyZeroTimeStampPeriod apart. This is often modeled using a ring buffer
-    //    where the zero time stamp is updated when wrapping around the ring buffer.
-    //
-    //    For this device, the zero time stamps' sample time increments every kDevice_RingBufferSize
-    //    frames and the host time increments by kDevice_RingBufferSize * gDevice_HostTicksPerFrame.
-
+    //    The device's clock follows the displays' clock through the playback
+    //    engine's rate estimate (and steering, when enabled). Real-time: no
+    //    locks.
 #pragma unused(inClientID)
-    
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-    UInt64 theCurrentHostTime;
-    Float64 theHostTicksPerRingBuffer;
-    Float64 theHostTickOffset;
-    UInt64 theNextHostTime;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "GetZeroTimeStamp: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "GetZeroTimeStamp: bad device ID");
-
-    {
-        CAMutex::Locker locker(&getZeroTimestampMutex);
-        
-        //    get the current host time
-        theCurrentHostTime = mach_absolute_time();
-
-        // In order to keep the input and output IO in sync, we keep a running
-        // average of the output IO proc's mRateScalar field for its output time.
-        // Then each time we calculate the next zero timestamp we slightly adjust
-        // the tick count for our ring buffer by however much the output IO proc
-        // deviated from its sample rate.
-        
-        Float64 rateRatio = 1.0;
-        
-        if (outputAccumulatedRateRatioSamples > 0) {
-            rateRatio = outputAccumulatedRateRatio / outputAccumulatedRateRatioSamples;
-        }
-        
-        //    calculate the next host time
-        theHostTicksPerRingBuffer =
-            gDevice_HostTicksPerFrame * ((Float64)kDevice_RingBufferSize) * rateRatio;
-        theHostTickOffset = gDevice_ElapsedTicks + theHostTicksPerRingBuffer;
-        theNextHostTime = gDevice_AnchorHostTime + ((UInt64)theHostTickOffset);
-
-        //    go to the next time if the next host time is less than the current time
-        if (theNextHostTime <= theCurrentHostTime) {
-            ++gDevice_NumberTimeStamps;
-            gDevice_ElapsedTicks += theHostTicksPerRingBuffer;
-        }
-
-        //    set the return values
-        *outSampleTime = gDevice_NumberTimeStamps * kDevice_RingBufferSize;
-        *outHostTime = gDevice_AnchorHostTime + gDevice_ElapsedTicks;
-        *outSeed = 1;
-        outputAccumulatedRateRatio = 0.0;
-        outputAccumulatedRateRatioSamples = 0;
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
     }
-
-Done:
-    return theAnswer;
+    deviceClock.get(kDevice_ZeroTimeStampPeriod, engine.clockRatio(), mach_absolute_time(), *outSampleTime, *outHostTime);
+    *outSeed = 1;
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::WillDoIOOperation(AudioServerPlugInDriverRef inDriver,
@@ -5266,58 +5347,31 @@ OSStatus ProxyAudioDevice::WillDoIOOperation(AudioServerPlugInDriverRef inDriver
                                              UInt32 inOperationID,
                                              Boolean *outWillDo,
                                              Boolean *outWillDoInPlace) {
-    //    This method returns whether or not the device will do a given IO operation. For this device,
-    //    we only support reading input data and writing output data.
-    (void)inClientID;
+    //    Each client's audio is routed in ProcessOutput, whether or not App
+    //    Audio Routing is on, so turning routing on or off also affects audio
+    //    that is already playing. The HAL then mixes the clients and the
+    //    device takes the mix in WriteMix.
+#pragma unused(inClientID)
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
 
-    //    declare the local variables
-    OSStatus theAnswer = 0;
     bool willDo = false;
-    bool willDoInPlace = true;
-    bool currentRoutingEnabled = false;
-    std::shared_ptr<const RouteSnapshot> snapshot;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "WillDoIOOperation: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "WillDoIOOperation: bad device ID");
-
-    snapshot = std::atomic_load(&routeSnapshot);
-    currentRoutingEnabled = snapshot != nullptr && snapshot->routingEnabled;
-
-    //    figure out if we support the operation
     switch (inOperationID) {
         case kAudioServerPlugInIOOperationReadInput:
-            willDo = true;
-            willDoInPlace = true;
-            break;
-
-        case kAudioServerPlugInIOOperationMixOutput:
-            willDo = currentRoutingEnabled;
-            willDoInPlace = true;
-            break;
-
+        case kAudioServerPlugInIOOperationProcessOutput:
         case kAudioServerPlugInIOOperationWriteMix:
-            willDo = !currentRoutingEnabled;
-            willDoInPlace = true;
+            willDo = true;
             break;
     };
 
-    //    fill out the return values
     if (outWillDo != NULL) {
         *outWillDo = willDo;
     }
     if (outWillDoInPlace != NULL) {
-        *outWillDoInPlace = willDoInPlace;
+        *outWillDoInPlace = true;
     }
-
-Done:
-    return theAnswer;
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::BeginIOOperation(AudioServerPlugInDriverRef inDriver,
@@ -5326,26 +5380,11 @@ OSStatus ProxyAudioDevice::BeginIOOperation(AudioServerPlugInDriverRef inDriver,
                                             UInt32 inOperationID,
                                             UInt32 inIOBufferFrameSize,
                                             const AudioServerPlugInIOCycleInfo *inIOCycleInfo) {
-    //    This is called at the beginning of an IO operation. This device doesn't do anything, so just
-    //    check the arguments and return.
-
 #pragma unused(inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo)
-
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "BeginIOOperation: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "BeginIOOperation: bad device ID");
-
-Done:
-    return theAnswer;
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::DoIOOperation(AudioServerPlugInDriverRef inDriver,
@@ -5357,63 +5396,57 @@ OSStatus ProxyAudioDevice::DoIOOperation(AudioServerPlugInDriverRef inDriver,
                                          const AudioServerPlugInIOCycleInfo *inIOCycleInfo,
                                          void *ioMainBuffer,
                                          void *ioSecondaryBuffer) {
-    //    This is called to actuall perform a given operation. For this device, all we need to do is
-    //    clear the buffer for the ReadInput operation.
-
+    //    Real-time: no locks, allocation or logging.
 #pragma unused(ioSecondaryBuffer)
-
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "DoIOOperation: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "DoIOOperation: bad device ID");
-    FailWithAction((inStreamObjectID != kObjectID_Stream_Output),
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "DoIOOperation: bad stream ID");
-
-    //    clear the buffer if this iskAudioServerPlugInIOOperationReadInput
-    if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
-        memset(ioMainBuffer, 0, inIOBufferFrameSize * 8);
-
-    } else if (inOperationID == kAudioServerPlugInIOOperationMixOutput) {
-        if (inputBuffer && routeMixBuffer) {
-            RouteDestination destination = routeDestinationForClientIDSnapshot(inClientID);
-            CAMutex::Locker locker(IOMutex);
-            SInt64 startFrame = (SInt64)inIOCycleInfo->mOutputTime.mSampleTime;
-
-            inputBuffer->Fetch(routeMixBuffer, inIOBufferFrameSize, startFrame);
-            mixRoutedClientBuffer((const Float32 *)ioMainBuffer,
-                                  (Float32 *)routeMixBuffer,
-                                  inIOBufferFrameSize,
-                                  destination);
-            inputBuffer->Store(routeMixBuffer, inIOBufferFrameSize, startFrame);
-
-            lastInputFrameTime = inIOCycleInfo->mOutputTime.mSampleTime;
-            lastInputBufferFrameSize = inIOBufferFrameSize;
-            inputCycleCount += 1;
-        }
-    } else if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
-        if (inputBuffer) {
-            CAMutex::Locker locker(IOMutex);
-
-            inputBuffer->Store((const Byte *)ioMainBuffer, inIOBufferFrameSize, inIOCycleInfo->mOutputTime.mSampleTime);
-            
-            lastInputFrameTime = inIOCycleInfo->mOutputTime.mSampleTime;
-            lastInputBufferFrameSize = inIOBufferFrameSize;
-            inputCycleCount += 1;
-        }
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
+    if (inStreamObjectID != kObjectID_Stream_Output || ioMainBuffer == NULL) {
+        return kAudioHardwareBadObjectError;
     }
 
-Done:
-    return theAnswer;
+    switch (inOperationID) {
+        case kAudioServerPlugInIOOperationReadInput:
+            memset(ioMainBuffer, 0, inIOBufferFrameSize * gDevice_BytesPerFrameInChannel * gDevice_ChannelsPerFrame);
+            break;
+
+        case kAudioServerPlugInIOOperationProcessOutput:
+            routeMixer.process(routeTable, inClientID, (Float32 *)ioMainBuffer, inIOBufferFrameSize, engine.crossfadeFrames());
+            break;
+
+        case kAudioServerPlugInIOOperationWriteMix: {
+            const AudioTimeStamp &outputTime = inIOCycleInfo->mOutputTime;
+            const Float64 rateScalar = (outputTime.mFlags & kAudioTimeStampRateScalarValid) && outputTime.mRateScalar > 0
+                                           ? outputTime.mRateScalar
+                                           : 1.0;
+            const UInt64 hostTime = (outputTime.mFlags & kAudioTimeStampHostTimeValid) ? outputTime.mHostTime : 0;
+            const UInt64 now = mach_absolute_time();
+            const UInt64 cycleStart = inIOCycleInfo->mCurrentTime.mHostTime;
+            engine.write((const Float32 *)ioMainBuffer,
+                         inIOBufferFrameSize,
+                         outputTime.mSampleTime,
+                         hostTime,
+                         deviceClock.hostTicksPerFrame() * rateScalar,
+                         now > cycleStart ? now - cycleStart : 0);
+        } break;
+
+        default:
+            break;
+    }
+    return 0;
+}
+
+OSStatus ProxyAudioDevice::EndIOOperation(AudioServerPlugInDriverRef inDriver,
+                                          AudioObjectID inDeviceObjectID,
+                                          UInt32 inClientID,
+                                          UInt32 inOperationID,
+                                          UInt32 inIOBufferFrameSize,
+                                          const AudioServerPlugInIOCycleInfo *inIOCycleInfo) {
+#pragma unused(inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo)
+    if (inDriver != gAudioServerPlugInDriverRef || inDeviceObjectID != kObjectID_Device) {
+        return kAudioHardwareBadObjectError;
+    }
+    return 0;
 }
 
 OSStatus ProxyAudioDevice::outputDeviceIOProcStatic(AudioDeviceID inDevice,
@@ -5426,7 +5459,6 @@ OSStatus ProxyAudioDevice::outputDeviceIOProcStatic(AudioDeviceID inDevice,
     if (!inClientData) {
         return noErr;
     }
-
     return ((ProxyAudioDevice *)inClientData)
         ->outputDeviceIOProc(inDevice, inNow, inInputData, inInputTime, outOutputData, inOutputTime);
 }
@@ -5437,206 +5469,53 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
                                               const AudioTimeStamp *inInputTime,
                                               AudioBufferList *outOutputData,
                                               const AudioTimeStamp *inOutputTime) {
-#pragma unused(inDevice)
-#pragma unused(inNow)
-#pragma unused(inInputData)
-#pragma unused(inInputTime)
-    CAMutex::Locker locker1(IOMutex);
-
-    // In theory we don't need a locking mechanism here, because outputDevice will only be modified
-    // while it is not playing.
-    Float64 currentOutputDeviceSampleRate = outputDevice.sampleRate;
-    UInt32 currentOutputDeviceBufferFrameSize = outputDevice.bufferFrameSize;
-    UInt32 currentOutputDeviceSafetyOffset = outputDevice.safetyOffset;
-    // These independent scalar controls are lock-free; route parsing and
-    // persistence may hold stateMutex for much longer than an audio deadline.
-    const Float64 currentInputDeviceSampleRate = gDevice_SampleRate.load(std::memory_order_relaxed);
-    const UInt32 currentInputDeviceChannelCount = gDevice_ChannelsPerFrame;
-    const Float32 currentVolumeR = gVolume_Output_R_Value.load(std::memory_order_relaxed);
-    const Float32 currentVolumeL = gVolume_Output_L_Value.load(std::memory_order_relaxed);
-    const bool currentMute = gMute_Output_Mute.load(std::memory_order_relaxed);
-    
-    {
-        CAMutex::Locker locker(&getZeroTimestampMutex);
-        
-        // We don't need to keep taking samples of the device's ratio past
-        // 10000 samples. If we get that far then the device is idling.
-        if (outputAccumulatedRateRatioSamples < 10000) {
-            outputAccumulatedRateRatio += inOutputTime->mRateScalar;
-            outputAccumulatedRateRatioSamples += 1;
-        }
-    }
-    
-    inputCycleCount = 0;
-
-    if (lastInputFrameTime < 0 || lastInputBufferFrameSize < 0) {
+    //    The displays' IO thread. Real-time: no locks, allocation or logging.
+#pragma unused(inDevice, inInputData, inInputTime)
+    if (!outOutputData || !renderBuffer) {
         return noErr;
     }
 
-    if (currentOutputDeviceSampleRate != currentInputDeviceSampleRate) {
-        DebugMsg("ProxyAudio: cannot play, mismatched sample rate");
+    UInt32 frames = 0;
+    for (UInt32 index = 0; index < outOutputData->mNumberBuffers; ++index) {
+        const AudioBuffer &buffer = outOutputData->mBuffers[index];
+        if (buffer.mNumberChannels > 0 && buffer.mData) {
+            frames = buffer.mDataByteSize / (buffer.mNumberChannels * sizeof(Float32));
+            break;
+        }
+    }
+    if (frames == 0) {
         return noErr;
     }
 
-    if (inputOutputSampleDelta == -1) {
-        DebugMsg("ProxyAudio: outputDeviceIOProc recalculating inputOutputSampleDelta");
-        Float64 targetFrameTime = (lastInputFrameTime - lastInputBufferFrameSize - currentOutputDeviceBufferFrameSize
-                                   - currentOutputDeviceSafetyOffset);
-        inputOutputSampleDelta = targetFrameTime - inOutputTime->mSampleTime;
-        smallestFramesToBufferEnd = -1;
-    }
+    const UInt64 now = mach_absolute_time();
+    const UInt64 lateness = (inNow && now > inNow->mHostTime) ? now - inNow->mHostTime : 0;
+    Float32 gainLeft = 1.0f;
+    Float32 gainRight = 1.0f;
+    calculateVolumeFactors(gVolume_Output_L_Value.load(std::memory_order_relaxed),
+                           gVolume_Output_R_Value.load(std::memory_order_relaxed),
+                           gMute_Output_Mute.load(std::memory_order_relaxed),
+                           gainLeft,
+                           gainRight);
+    const bool hostTimeValid = inOutputTime && (inOutputTime->mFlags & kAudioTimeStampHostTimeValid);
+    const Float64 rateScalar = (inOutputTime && (inOutputTime->mFlags & kAudioTimeStampRateScalarValid))
+                                   ? inOutputTime->mRateScalar
+                                   : 1.0;
+    const Float64 ticksPerFrame = deviceClock.hostTicksPerFrame() * (rateScalar > 0 ? rateScalar : 1.0);
+    // While the rates disagree (during a change) the displays play silence.
+    const bool ratesMatch = fabs(engine.currentDeviceSampleRate() - engine.currentOutputSampleRate()) < 0.5;
 
-    Float64 startFrame = inOutputTime->mSampleTime + inputOutputSampleDelta;
-
-    if (inputFinalFrameTime != -1 && startFrame >= inputFinalFrameTime) {
-        return noErr;
-    }
-
-    bool overrun = inputBuffer->Fetch(workBuffer, currentOutputDeviceBufferFrameSize, (SInt64)startFrame);
-    if (overrun && inputFinalFrameTime == -1) {
-        outputOverrunCount += 1;
-    } else {
-        outputOverrunCount = 0;
-    }
-
-    if (outputOverrunCount >= kOutputOverrunResyncThreshold) {
-        syslog(LOG_WARNING, "ProxyAudio: output overrun persisted, resyncing");
-        inputOutputSampleDelta = -1;
-        smallestFramesToBufferEnd = -1;
-        outputOverrunCount = 0;
-
-        for (UInt32 bufferIndex = 0; bufferIndex < outOutputData->mNumberBuffers; bufferIndex++) {
-            AudioBuffer &outputBuffer = outOutputData->mBuffers[bufferIndex];
-            if (outputBuffer.mData != NULL) {
-                memset(outputBuffer.mData, 0, outputBuffer.mDataByteSize);
-            }
-        }
-        return noErr;
-    }
-
-#if DEBUG
-    // This is just some debugging info to tell when we might be gradually
-    // approaching the end of the input buffer and headed for a buffer
-    // overrun
-    SInt64 framesToBufferEnd =
-        inputBuffer->mEndFrame - (SInt64(startFrame) + SInt64(currentOutputDeviceBufferFrameSize));
-
-    if (smallestFramesToBufferEnd == -1
-        || (framesToBufferEnd < smallestFramesToBufferEnd && smallestFramesToBufferEnd >= 0)) {
-        smallestFramesToBufferEnd = framesToBufferEnd;
-        //DebugMsg("ProxyAudio: frames to buffer end shrunk, is now: %lld", smallestFramesToBufferEnd);
-    }
-#endif
-
-    if (overrun && inputFinalFrameTime == -1 && startFrame >= inputBuffer->mStartFrame) {
-        // Since this warning could conceivably happen every cycle, explicitly make it
-        // only appear once every five seconds at most
-        static time_t lastBufferOverrunWarning = 0;
-        time_t seconds;
-        time(&seconds);
-        
-        if ((seconds - lastBufferOverrunWarning) > 5) {
-            lastBufferOverrunWarning = seconds;
-            syslog(LOG_WARNING, "ProxyAudio: output unexpected overrun");
-            syslog(LOG_WARNING, "ProxyAudio: output frame: %lf", startFrame);
-            syslog(LOG_WARNING,
-                   "ProxyAudio: output buffer start: %llu    end: %llu",
-                   inputBuffer->mStartFrame,
-                   inputBuffer->mEndFrame);
-        }
-    }
-    
-    Float32 volumeFactorL = 1.0, volumeFactorR = 1.0;
-    calculateVolumeFactors(currentVolumeL, currentVolumeR, currentMute, volumeFactorL, volumeFactorR);
-
-    for (UInt32 bufferIndex = 0; bufferIndex < outOutputData->mNumberBuffers; bufferIndex++) {
-        AudioBuffer &outputBuffer = outOutputData->mBuffers[bufferIndex];
-        UInt32 outputChannelCount = outputBuffer.mNumberChannels;
-
-        if (outputChannelCount == 0 || outputBuffer.mData == NULL) {
-            continue;
-        }
-
-        memset(outputBuffer.mData, 0, outputBuffer.mDataByteSize);
-
-        UInt32 frameSize = outputChannelCount * sizeof(Float32);
-        UInt32 frameCount = outputBuffer.mDataByteSize / frameSize;
-        Float32 *outputData = (Float32 *)outputBuffer.mData;
-
-        if (outOutputData->mNumberBuffers > 1) {
-            UInt32 targetChannelCount = std::min<UInt32>(outputChannelCount, currentInputDeviceChannelCount);
-            bool isThreeDisplayCenter = outOutputData->mNumberBuffers >= 3 && bufferIndex == 1;
-
-            for (UInt32 targetChannel = 0; targetChannel < targetChannelCount; targetChannel++) {
-                Float32 *out = outputData + targetChannel;
-
-                if (isThreeDisplayCenter && currentInputDeviceChannelCount >= 2) {
-                    Float32 *inL = (Float32 *)workBuffer;
-                    Float32 *inR = (Float32 *)workBuffer + 1;
-                    for (UInt32 frame = 0; frame < frameCount; frame++) {
-                        *out = ((*inL * volumeFactorL) + (*inR * volumeFactorR)) * 0.5f;
-                        inL += currentInputDeviceChannelCount;
-                        inR += currentInputDeviceChannelCount;
-                        out += outputChannelCount;
-                    }
-                } else {
-                    UInt32 inputChannelIndex = outOutputData->mNumberBuffers >= 3
-                        ? (bufferIndex == 0 ? 0 : 1)
-                        : bufferIndex % currentInputDeviceChannelCount;
-                    Float32 volumeFactor = (inputChannelIndex == 0) ? volumeFactorL : volumeFactorR;
-                    Float32 *in = (Float32 *)workBuffer + inputChannelIndex;
-                    for (UInt32 frame = 0; frame < frameCount; frame++) {
-                        *out = *in * volumeFactor;
-                        in += currentInputDeviceChannelCount;
-                        out += outputChannelCount;
-                    }
-                }
-            }
+    UInt32 offset = 0;
+    while (offset < frames) {
+        const UInt32 count = std::min<UInt32>(nearfield::kMaxRenderFrames, frames - offset);
+        if (ratesMatch) {
+            const UInt64 hostTime = hostTimeValid ? inOutputTime->mHostTime + (UInt64)(offset * ticksPerFrame) : 0;
+            engine.read(renderBuffer, count, hostTime, rateScalar, gainLeft, gainRight, lateness);
         } else {
-            UInt32 targetChannelCount = std::min<UInt32>(outputChannelCount, currentInputDeviceChannelCount);
-
-            if (outputChannelCount >= 3 && currentInputDeviceChannelCount >= 2) {
-                Float32 *inL = (Float32 *)workBuffer;
-                Float32 *inR = (Float32 *)workBuffer + 1;
-
-                for (UInt32 frame = 0; frame < frameCount; frame++) {
-                    Float32 left = *inL * volumeFactorL;
-                    Float32 right = *inR * volumeFactorR;
-                    Float32 *out = outputData + (frame * outputChannelCount);
-                    out[0] = left;
-                    out[1] = (left + right) * 0.5f;
-                    out[2] = right;
-                    inL += currentInputDeviceChannelCount;
-                    inR += currentInputDeviceChannelCount;
-                }
-            } else if (outputChannelCount == 1 && currentInputDeviceChannelCount >= 2) {
-                Float32 *inL = (Float32 *)workBuffer;
-                Float32 *inR = (Float32 *)workBuffer + 1;
-                Float32 *out = outputData;
-
-                for (UInt32 frame = 0; frame < frameCount; frame++) {
-                    *out = ((*inL * volumeFactorL) + (*inR * volumeFactorR)) * 0.5;
-                    inL += currentInputDeviceChannelCount;
-                    inR += currentInputDeviceChannelCount;
-                    out += outputChannelCount;
-                }
-            } else {
-                for (UInt32 channelIndex = 0; channelIndex < targetChannelCount; channelIndex++) {
-                    UInt32 inputChannelIndex = channelIndex % currentInputDeviceChannelCount;
-                    Float32 *in = (Float32 *)workBuffer + inputChannelIndex;
-                    Float32 *out = outputData + channelIndex;
-                    Float32 volumeFactor = (inputChannelIndex == 0) ? volumeFactorL : volumeFactorR;
-
-                    for (UInt32 frame = 0; frame < frameCount; frame++) {
-                        *out = *in * volumeFactor;
-                        in += currentInputDeviceChannelCount;
-                        out += outputChannelCount;
-                    }
-                }
-            }
+            memset(renderBuffer, 0, sizeof(Float32) * count * nearfield::kStreamChannels);
         }
+        nearfield::renderToBufferList(renderBuffer, count, offset, outOutputData);
+        offset += count;
     }
-
     return noErr;
 }
 
@@ -5681,839 +5560,526 @@ void ProxyAudioDevice::calculateVolumeFactors(Float32 volumeL,
     volumeFactorR = mute ? 0.0 : volumeScalarToGain(volumeR);
 }
 
-ProxyAudioDevice::RouteDestination ProxyAudioDevice::routeDestinationForClientNoLock(const std::string &bundleID,
-                                                                                     pid_t processID) {
-    auto processRule = routeRulesByProcessID.find(processID);
-    if (processRule != routeRulesByProcessID.end()) {
-        return processRule->second;
-    }
-    if (!bundleID.empty()) {
-        auto bundleRule = routeRulesByBundleID.find(bundleID);
-        if (bundleRule != routeRulesByBundleID.end()) {
-            return bundleRule->second;
-        }
-    }
-    return RouteDestination::pair;
+#pragma mark Settings and Status
+
+// Settings may only be changed by Nearfield itself. A Developer ID signed
+// driver requires writers signed by the same team; a development (ad hoc)
+// driver accepts any writer. When the check cannot run (for example because
+// the driver service's sandbox blocks it), writes are allowed and the status
+// reports it.
+//
+// The team comes from the driver bundle's own signature. The process the
+// driver runs in is Apple's audio service, which has no Team ID, so asking
+// for the running process's signature would treat every driver as unsigned.
+
+// "/…/NearfieldAudioDevice.driver/Contents/MacOS/NearfieldAudioDevice" names
+// its bundle; any other path is used as it is.
+static std::string codePathForImage(const std::string &imagePath) {
+    const std::string::size_type contents = imagePath.rfind("/Contents/MacOS/");
+    return contents == std::string::npos || contents == 0 ? imagePath : imagePath.substr(0, contents);
 }
 
-ProxyAudioDevice::RouteDestination ProxyAudioDevice::routeDestinationForClientIDSnapshot(UInt32 clientID) {
-    std::shared_ptr<const RouteSnapshot> snapshot = std::atomic_load(&routeSnapshot);
-    if (!snapshot || !snapshot->routingEnabled) {
-        return RouteDestination::pair;
+// The bundle (or binary) this code was loaded from.
+static std::string driverCodePath() {
+    Dl_info info;
+    if (dladdr(reinterpret_cast<const void *>(&driverCodePath), &info) == 0 || !info.dli_fname) {
+        return std::string();
     }
-    auto client = snapshot->destinationsByClientID.find(clientID);
-    if (client == snapshot->destinationsByClientID.end()) {
-        return RouteDestination::pair;
-    }
-    return client->second;
+    return codePathForImage(info.dli_fname);
 }
 
-void ProxyAudioDevice::rebuildRouteRulesNoLock() {
-    routeRulesByBundleID.clear();
-    routeRulesByProcessID.clear();
+static CFStringRef copyTeamIdentifier(const std::string &codePath) {
+    if (codePath.empty()) {
+        return NULL;
+    }
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, reinterpret_cast<const UInt8 *>(codePath.c_str()),
+                                                           (CFIndex)codePath.size(), false);
+    if (!url) {
+        return NULL;
+    }
+    SecStaticCodeRef staticCode = NULL;
+    OSStatus status = SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &staticCode);
+    CFRelease(url);
+    if (status != errSecSuccess || !staticCode) {
+        return NULL;
+    }
+    CFDictionaryRef information = NULL;
+    status = SecCodeCopySigningInformation(staticCode, kSecCSSigningInformation, &information);
+    CFRelease(staticCode);
+    if (status != errSecSuccess || !information) {
+        return NULL;
+    }
+    CFTypeRef team = CFDictionaryGetValue(information, kSecCodeInfoTeamIdentifier);
+    CFStringRef result = (team && CFGetTypeID(team) == CFStringGetTypeID()) ? (CFStringRef)CFRetain(team) : NULL;
+    CFRelease(information);
+    return result;
+}
 
-    if (routeRulesString == NULL) {
-        updateClientDestinationsNoLock();
-        return;
+static CFStringRef copyOwnTeamIdentifier() {
+    return copyTeamIdentifier(driverCodePath());
+}
+
+void ProxyAudioDevice::loadOwnTeamIdentifier() {
+    std::call_once(teamIdentifierOnce, [this] { ownTeamIdentifier = copyOwnTeamIdentifier(); });
+}
+
+bool ProxyAudioDevice::writerIsAuthorized(pid_t processID) {
+    loadOwnTeamIdentifier();
+    CFStringRef teamIdentifier = ownTeamIdentifier;
+    if (!teamIdentifier) {
+        StateLocker locker(stateMutex);
+        writerVerification = "unsigned driver";
+        return true;
+    }
+    if (processID <= 0) {
+        return false;
     }
 
-    std::string rules = CFStringToStdString(routeRulesString);
-    size_t offset = 0;
-    while (offset < rules.size()) {
-        size_t separator = rules.find_first_of(";\n", offset);
-        std::string rule = rules.substr(offset, separator == std::string::npos ? std::string::npos : separator - offset);
-        offset = separator == std::string::npos ? rules.size() : separator + 1;
-
-        size_t equals = rule.find('=');
-        if (equals == std::string::npos) {
-            continue;
+    struct proc_bsdinfo info;
+    UInt64 startTime = 0;
+    if (proc_pidinfo(processID, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == (int)sizeof(info)) {
+        startTime = ((UInt64)info.pbi_start_tvsec * 1000000ull) + info.pbi_start_tvusec;
+    }
+    {
+        StateLocker locker(stateMutex);
+        auto cached = verifiedWriters.find(processID);
+        if (startTime != 0 && cached != verifiedWriters.end() && cached->second.first == startTime) {
+            return cached->second.second;
         }
+    }
 
-        std::string routeKey = trimString(rule.substr(0, equals));
-        std::string destinationString = trimString(rule.substr(equals + 1));
-        RouteDestination destination = RouteDestination::pair;
-        if (routeKey.empty() || !routeDestinationFromString(destinationString, destination)) {
-            continue;
-        }
-
-        std::string normalizedKey = lowercaseString(routeKey);
-        if (normalizedKey.rfind("pid:", 0) == 0) {
-            char *end = NULL;
-            long processID = strtol(normalizedKey.c_str() + 4, &end, 10);
-            if (end != NULL && *end == '\0' && processID > 0) {
-                routeRulesByProcessID[(pid_t)processID] = destination;
+    bool allowed = true;
+    std::string verification = "enforced";
+    CFNumberSmartRef pidNumber(CFNumberCreate(NULL, kCFNumberIntType, &processID));
+    const void *keys[] = {kSecGuestAttributePid};
+    const void *values[] = {pidNumber.ref()};
+    CFDictionarySmartRef attributes(
+        CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+    SecCodeRef code = NULL;
+    OSStatus status = SecCodeCopyGuestWithAttributes(NULL, attributes, kSecCSDefaultFlags, &code);
+    if (status == errSecSuccess && code) {
+        CFStringSmartRef requirementText(CFStringCreateWithFormat(
+            NULL, NULL,
+            CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"%@\" and identifier \"com.kemuri.Nearfield\""),
+            teamIdentifier));
+        SecRequirementRef requirement = NULL;
+        status = SecRequirementCreateWithString(requirementText, kSecCSDefaultFlags, &requirement);
+        if (status == errSecSuccess && requirement) {
+            status = SecCodeCheckValidity(code, kSecCSDefaultFlags, requirement);
+            CFRelease(requirement);
+            if (status == errSecCSReqFailed) {
+                allowed = false;
+            } else if (status != errSecSuccess) {
+                verification = "unavailable";
             }
         } else {
-            routeRulesByBundleID[routeKey] = destination;
+            verification = "unavailable";
+        }
+        CFRelease(code);
+    } else {
+        verification = "unavailable";
+    }
+
+    {
+        StateLocker locker(stateMutex);
+        writerVerification = verification;
+        if (startTime != 0) {
+            verifiedWriters[processID] = std::make_pair(startTime, allowed);
         }
     }
-
-    updateClientDestinationsNoLock();
-}
-
-void ProxyAudioDevice::updateClientDestinationsNoLock() {
-    for (auto &entry : clientsByID) {
-        entry.second.destination = routeDestinationForClientNoLock(entry.second.bundleID, entry.second.processID);
+    if (!allowed) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: ignoring settings from pid %d, which is not Nearfield", processID);
+    } else if (verification == "unavailable") {
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: could not verify the settings writer (pid %d, status %d)", processID, (int)status);
     }
-    publishRouteSnapshotNoLock();
+    return allowed;
 }
 
-void ProxyAudioDevice::publishRouteSnapshotNoLock() {
-    std::shared_ptr<RouteSnapshot> mutableSnapshot = std::make_shared<RouteSnapshot>();
-    mutableSnapshot->routingEnabled = routingEnabled;
-    for (const auto &entry : clientsByID) {
-        mutableSnapshot->destinationsByClientID[entry.first] = entry.second.destination;
+OSStatus ProxyAudioDevice::applySettings(const nearfield::SettingsUpdate &update, pid_t writer) {
+    if (update.isEmpty()) {
+        return noErr;
     }
-    std::shared_ptr<const RouteSnapshot> snapshot = mutableSnapshot;
-    std::atomic_store(&routeSnapshot, snapshot);
-}
-
-const char *ProxyAudioDevice::routeDestinationName(RouteDestination destination) {
-    switch (destination) {
-        case RouteDestination::left:
-            return "left";
-        case RouteDestination::right:
-            return "right";
-        case RouteDestination::muted:
-            return "muted";
-        case RouteDestination::pair:
-        default:
-            return "pair";
+    if (!writerIsAuthorized(writer)) {
+        return kAudioHardwareIllegalOperationError;
     }
+    uint32_t changes = 0;
+    {
+        StateLocker locker(stateMutex);
+        nearfield::SettingsUpdate effective = update;
+        if (effective.outputDeviceUID && *effective.outputDeviceUID == kDriverTargetAggregate_UID) {
+            // Older Nearfield versions name the driver's own aggregate here.
+            effective.outputDeviceUID.reset();
+        }
+        changes = nearfield::applySettingsUpdate(settings, processRoutes, effective);
+        if (changes & nearfield::kChangedTargets) {
+            ++targetConfigurationRevision;
+            readyTargetConfigurationRevision.store(0);
+        }
+        if (changes & nearfield::kChangedRouting) {
+            bundleRoutes = nearfield::parseRouteRules(settings.routeRules).bundleRoutes;
+        }
+        if (changes & (nearfield::kChangedRouting | nearfield::kChangedProcessRoutes)) {
+            // The fast path: route changes reach the IO thread through atomics
+            // and are never written to storage.
+            updateClientRoutesNoLock();
+        }
+        if (changes & (nearfield::kChangedPlayback | nearfield::kChangedDiagnostics)) {
+            applyPlaybackSettingsNoLock();
+        }
+        persistSettingsIfChangedNoLock();
+    }
+    applySettingsEffects(changes);
+    return noErr;
 }
 
-void ProxyAudioDevice::mixRoutedClientBuffer(const Float32 *inputData,
-                                             Float32 *outputData,
-                                             UInt32 frameCount,
-                                             RouteDestination destination) {
-    if (destination == RouteDestination::muted || inputData == NULL || outputData == NULL) {
+void ProxyAudioDevice::applySettingsEffects(uint32_t changes) {
+    if (changes == 0) {
         return;
     }
-
-    for (UInt32 frame = 0; frame < frameCount; frame++) {
-        Float32 inL = inputData[(frame * gDevice_ChannelsPerFrame)];
-        Float32 inR = inputData[(frame * gDevice_ChannelsPerFrame) + 1];
-        Float32 *out = outputData + (frame * gDevice_ChannelsPerFrame);
-
-        switch (destination) {
-            case RouteDestination::left:
-                out[0] += (inL + inR) * 0.5f;
-                break;
-            case RouteDestination::right:
-                out[1] += (inL + inR) * 0.5f;
-                break;
-            case RouteDestination::pair:
-            default:
-                out[0] += inL;
-                out[1] += inR;
-                break;
+    if (changes & nearfield::kChangedDeviceName) {
+        ExecuteInAudioOutputThread(^() {
+            AudioObjectPropertyAddress address = {
+                kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &address);
+        });
+    }
+    if (changes & (nearfield::kChangedTargets | nearfield::kChangedOutputDevice | nearfield::kChangedOutputBuffer)) {
+        const bool forceRebuild = (changes & nearfield::kChangedTargets) != 0;
+        UInt64 revision;
+        {
+            StateLocker locker(stateMutex);
+            revision = targetConfigurationRevision;
         }
+        ExecuteInAudioOutputThread(^{
+            rebuildDriverOwnedTargetAggregate(forceRebuild);
+            setupTargetOutputDevice();
+            appliedTargetConfigurationRevision.store(revision);
+            refreshTargetOutputReadiness();
+        });
+    }
+    if (changes & nearfield::kChangedRouting) {
+        StateLocker locker(stateMutex);
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: routing %s, rules '%s'",
+               settings.routingEnabled ? "enabled" : "disabled", settings.routeRules.c_str());
+    }
+    if (changes & nearfield::kChangedDiagnostics) {
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: diagnostics %s", diagnostics.isEnabled() ? "on" : "off");
+    }
+    notifyStatusChanged();
+}
+
+UInt32 ProxyAudioDevice::currentLatencyFrames() {
+    const Float64 measured = engine.measuredLatencyFrames();
+    if (measured > 0) {
+        return (UInt32)llround(measured);
+    }
+    // Before anything played: the buffering target plus the displays' own latency.
+    return (UInt32)llround(engine.estimatedLatencyFrames());
+}
+
+void ProxyAudioDevice::notifyLatencyChanged() {
+    const UInt32 latency = currentLatencyFrames();
+    if (reportedLatencyFrames.exchange(latency) == latency) {
+        return;
+    }
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain};
+    gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &address);
+    notifyStatusChanged();
+}
+
+void ProxyAudioDevice::notifyDeviceListChanged() {
+    ExecuteInAudioOutputThread(^() {
+        AudioObjectPropertyAddress plugInAddresses[2] = {
+            {kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+            {kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain}};
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_PlugIn, 2, plugInAddresses);
+        AudioObjectPropertyAddress boxAddress = {
+            kAudioBoxPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Box, 1, &boxAddress);
+    });
+}
+
+void ProxyAudioDevice::notifyStatusChanged() {
+    statusGeneration.fetch_add(1);
+    if (statusNotificationScheduled.exchange(true)) {
+        return;
+    }
+    // Coalesce bursts (for example several underruns) into one notification.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), AudioOutputDispatchQueue(), ^{
+        statusNotificationScheduled.store(false);
+        if (!gPlugIn_Host) {
+            return;
+        }
+        AudioObjectPropertyAddress address = {
+            kNearfieldPropertyStatus, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Box, 1, &address);
+    });
+}
+
+void ProxyAudioDevice::handleEngineSignals(uintptr_t signals) {
+    if (signals & nearfield::kSignalOutputStarted) {
+        const UInt64 requested = engine.outputStartRequestTime();
+        const UInt64 started = engine.firstOutputCallbackTime();
+        if (requested != 0 && started > requested) {
+            const double milliseconds = nearfield::hostTicksToMilliseconds(started - requested);
+            lastColdStartMilliseconds.store(milliseconds);
+            diagnostics.record(nearfield::kDiagnosticOutputFirstCallback, 0, 0, 0, milliseconds);
+        }
+    }
+    if (signals & nearfield::kSignalLatency) {
+        notifyLatencyChanged();
+    }
+    if (signals & nearfield::kSignalDrained) {
+        updateOutputDeviceStartedState();
+    }
+    if (signals & (nearfield::kSignalCounters | nearfield::kSignalOutputStarted)) {
+        notifyStatusChanged();
+    }
+    if (signals & nearfield::kSignalDiagnostics) {
+        drainDiagnostics();
     }
 }
 
-OSStatus ProxyAudioDevice::EndIOOperation(AudioServerPlugInDriverRef inDriver,
-                                          AudioObjectID inDeviceObjectID,
-                                          UInt32 inClientID,
-                                          UInt32 inOperationID,
-                                          UInt32 inIOBufferFrameSize,
-                                          const AudioServerPlugInIOCycleInfo *inIOCycleInfo) {
-//    This is called at the end of an IO operation. This device doesn't do anything, so just check
-//    the arguments and return.
-
-#pragma unused(inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo)
-
-    //    declare the local variables
-    OSStatus theAnswer = 0;
-
-    //    check the arguments
-    FailWithAction(inDriver != gAudioServerPlugInDriverRef,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "EndIOOperation: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device,
-                   theAnswer = kAudioHardwareBadObjectError,
-                   Done,
-                   "EndIOOperation: bad device ID");
-
-Done:
-    return theAnswer;
+void ProxyAudioDevice::drainDiagnostics() {
+    nearfield::DiagnosticRecord entry;
+    int drained = 0;
+    while (drained < 512 && diagnostics.pop(entry)) {
+        ++drained;
+        syslog(LOG_NOTICE,
+               "NearfieldDiag: kind=%s host=%llu i0=%d i1=%lld i2=%lld d0=%.3f d1=%.3f d2=%.3f",
+               nearfield::diagnosticKindName(entry.kind),
+               entry.hostTime,
+               entry.i0,
+               entry.i1,
+               entry.i2,
+               entry.d0,
+               entry.d1,
+               entry.d2);
+    }
+    const uint64_t dropped = diagnostics.dropped();
+    if (dropped != reportedDroppedDiagnostics) {
+        syslog(LOG_NOTICE, "NearfieldDiag: kind=dropped total=%llu", dropped);
+        reportedDroppedDiagnostics = dropped;
+    }
 }
+
+CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
+    using namespace nearfield;
+    CFMutableDictionaryRef status =
+        CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!status) {
+        return NULL;
+    }
+
+    CFBundleRef bundle = CFBundleGetBundleWithIdentifier(CFSTR(kPlugIn_BundleID));
+    CFTypeRef version = bundle ? CFBundleGetValueForInfoDictionaryKey(bundle, CFSTR("CFBundleShortVersionString")) : NULL;
+    if (version && CFGetTypeID(version) == CFStringGetTypeID()) {
+        CFDictionarySetValue(status, CFSTR("driverVersion"), version);
+    }
+    setDictionaryInteger(status, CFSTR("protocolVersion"), kNearfieldProtocolVersion);
+    // The process hosting the driver plays Nearfield's audio on the displays;
+    // Nearfield must not count it as another app using them.
+    setDictionaryInteger(status, CFSTR("hostProcessID"), (int64_t)getpid());
+    // Changes whenever the driver restarts (settings sent only to a previous
+    // instance, such as process routes, must be sent again).
+    setDictionaryInteger(status, CFSTR("instance"), (int64_t)(initializedHostTime & 0x7fffffffffffffffULL));
+    setDictionaryStrings(status, CFSTR("capabilities"),
+                         {"driverOwnedTargetAggregate", "threeDisplayTargetAggregate", "targetOutputReadiness",
+                          "settingsDictionary", "statusNotifications", "processRoutes", "latencyReporting"});
+
+    const std::vector<Float64> rates = currentAvailableSampleRates();
+    {
+        StateLocker locker(stateMutex);
+        const UInt64 revision = targetConfigurationRevision;
+        const bool ready = settings.targetDevices.size() >= 2 &&
+                           readyTargetConfigurationRevision.load() == revision &&
+                           appliedTargetConfigurationRevision.load() == revision;
+        CFDictionarySetValue(status, CFSTR("ready"), ready ? kCFBooleanTrue : kCFBooleanFalse);
+        setDictionaryInteger(status, CFSTR("configurationRevision"), (int64_t)revision);
+        setDictionaryStrings(status, CFSTR("targetDevices"), settings.targetDevices);
+        setDictionaryString(status, CFSTR("targetMode"), settings.stereo ? "stereo" : "mono");
+        setDictionaryString(status, CFSTR("underrunStrategy"), underrunStrategyName(settings.underrunStrategy));
+        CFDictionarySetValue(status, CFSTR("published"), gBox_Acquired ? kCFBooleanTrue : kCFBooleanFalse);
+        setDictionaryInteger(status, CFSTR("ioClients"), (int64_t)gDevice_IOIsRunning);
+        setDictionaryString(status, CFSTR("writerVerification"), writerVerification);
+    }
+    setDictionaryInteger(status, CFSTR("displaysPresent"), presentTargetDisplays.load());
+    CFDictionarySetValue(status, CFSTR("hidden"), displaysHidden.load() ? kCFBooleanTrue : kCFBooleanFalse);
+    CFDictionarySetValue(status, CFSTR("outputRunning"), outputRunning.load() ? kCFBooleanTrue : kCFBooleanFalse);
+    CFDictionarySetValue(status, CFSTR("diagnostics"), diagnostics.isEnabled() ? kCFBooleanTrue : kCFBooleanFalse);
+
+    const Float64 sampleRate = gDevice_SampleRate.load();
+    setDictionaryNumber(status, CFSTR("sampleRate"), sampleRate);
+    setDictionaryNumber(status, CFSTR("outputSampleRate"), engine.currentOutputSampleRate());
+    setDictionaryNumbers(status, CFSTR("availableSampleRates"), rates);
+    const UInt32 latency = reportedLatencyFrames.load();
+    setDictionaryInteger(status, CFSTR("latencyFrames"), latency);
+    setDictionaryNumber(status, CFSTR("latencyMilliseconds"), latency * 1000.0 / sampleRate);
+    setDictionaryNumber(status, CFSTR("bufferedMilliseconds"), engine.lastBufferedMilliseconds());
+    setDictionaryNumber(status, CFSTR("safetyGapMilliseconds"), engine.currentSafetyGapMilliseconds());
+    setDictionaryNumber(status, CFSTR("rateScalar"), engine.rateScalarEstimate());
+    setDictionaryNumber(status, CFSTR("clockCorrectionPPM"), engine.steeringPPM());
+
+    const PlaybackCounters &counters = engine.counters();
+    CFMutableDictionaryRef counts =
+        CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (counts) {
+        setDictionaryInteger(counts, CFSTR("underruns"), (int64_t)counters.underruns.load());
+        setDictionaryInteger(counts, CFSTR("overruns"), (int64_t)counters.overruns.load());
+        setDictionaryInteger(counts, CFSTR("coldStarts"), (int64_t)counters.coldStarts.load());
+        setDictionaryNumber(counts, CFSTR("lastColdStartMilliseconds"), lastColdStartMilliseconds.load());
+        setDictionaryNumber(counts, CFSTR("lastColdStartBufferedMilliseconds"),
+                            counters.lastColdStartBufferedFrames.load() * 1000.0 / sampleRate);
+        setDictionaryNumber(counts, CFSTR("coldStartSkippedMilliseconds"),
+                            counters.coldStartSkippedFrames.load() * 1000.0 / sampleRate);
+        setDictionaryNumber(counts, CFSTR("trimmedMilliseconds"), counters.trimmedFrames.load() * 1000.0 / sampleRate);
+        setDictionaryInteger(counts, CFSTR("writerGaps"), (int64_t)counters.writerGaps.load());
+        setDictionaryInteger(counts, CFSTR("halRequests"), (int64_t)halRequestCount().load());
+        setDictionaryInteger(counts, CFSTR("readerCallbacks"), (int64_t)counters.readerCallbacks.load());
+        setDictionaryInteger(counts, CFSTR("writerCallbacks"), (int64_t)counters.writerCallbacks.load());
+        setDictionaryInteger(counts, CFSTR("droppedDiagnostics"), (int64_t)diagnostics.dropped());
+        CFDictionarySetValue(status, CFSTR("counters"), counts);
+        CFRelease(counts);
+    }
+    return status;
+}
+
+#pragma mark Legacy Configuration Channel
 
 void ProxyAudioDevice::parseConfigurationString(CFStringRef configString, ConfigType &action, CFStringRef &value) {
     CFRange splitter = CFStringFind(configString, CFSTR("="), 0);
-
     if (splitter.location == kCFNotFound) {
         return;
     }
 
-    CFStringSmartRef actionString = CFStringCreateWithSubstring(NULL, configString, CFRangeMake(0, splitter.location));
-
-    if (CFStringCompare(actionString, CFSTR("outputDevice"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::outputDevice;
-    } else if (CFStringCompare(actionString, CFSTR("outputDeviceBufferFrameSize"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::outputDeviceBufferFrameSize;
-    } else if (CFStringCompare(actionString, CFSTR("deviceName"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::deviceName;
-    } else if (CFStringCompare(actionString, CFSTR("outputDeviceActiveCondition"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::deviceActiveCondition;
-    } else if (CFStringCompare(actionString, CFSTR("routingEnabled"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::routingEnabled;
-    } else if (CFStringCompare(actionString, CFSTR("routeRules"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::routeRules;
-    } else if (CFStringCompare(actionString, CFSTR("targetAggregateDevices"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::targetAggregateDevices;
-    } else if (CFStringCompare(actionString, CFSTR("targetAggregateMode"), 0) == kCFCompareEqualTo) {
-        action = ConfigType::targetAggregateMode;
-    } else {
-        return;
+    CFStringSmartRef actionString(CFStringCreateWithSubstring(NULL, configString, CFRangeMake(0, splitter.location)));
+    static const std::pair<CFStringRef, ConfigType> kActions[] = {
+        {CFSTR("outputDevice"), ConfigType::outputDevice},
+        {CFSTR("outputDeviceBufferFrameSize"), ConfigType::outputDeviceBufferFrameSize},
+        {CFSTR("deviceName"), ConfigType::deviceName},
+        {CFSTR("outputDeviceActiveCondition"), ConfigType::deviceActiveCondition},
+        {CFSTR("routingEnabled"), ConfigType::routingEnabled},
+        {CFSTR("routeRules"), ConfigType::routeRules},
+        {CFSTR("targetAggregateDevices"), ConfigType::targetAggregateDevices},
+        {CFSTR("targetAggregateMode"), ConfigType::targetAggregateMode},
+    };
+    for (const auto &candidate : kActions) {
+        if (CFStringCompare(actionString, candidate.first, 0) == kCFCompareEqualTo) {
+            action = candidate.second;
+            value = CFStringCreateWithSubstring(
+                NULL, configString,
+                CFRangeMake(splitter.location + splitter.length,
+                            CFStringGetLength(configString) - splitter.location - splitter.length));
+            return;
+        }
     }
-
-    if (splitter.location == kCFNotFound) {
-        return;
-    }
-
-    value =
-        CFStringCreateWithSubstring(NULL,
-                                    configString,
-                                    CFRangeMake(splitter.location + splitter.length,
-                                                CFStringGetLength(configString) - splitter.location - splitter.length));
 }
 
-#pragma mark Driver Configuration
-
-void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value) {
+// Maps one legacy "setting=value" write onto a settings update.
+void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value, pid_t writer) {
+    CFStringRef keys[1] = {NULL};
     switch (type) {
-        case ConfigType::outputDevice:
-            setOutputDevice(value);
-            break;
-
-        case ConfigType::outputDeviceBufferFrameSize:
-            setOutputDeviceBufferFrameSize(CFStringGetIntValue(value));
-            break;
-
-        case ConfigType::deviceName:
-            setDeviceName(value);
-            break;
-
-        case ConfigType::deviceActiveCondition:
-            setOutputDeviceActiveCondition((ActiveCondition)CFStringGetIntValue(value));
-            break;
-
-        case ConfigType::routingEnabled:
-            setRoutingEnabled(CFStringGetIntValue(value) != 0);
-            break;
-
-        case ConfigType::routeRules:
-            setRouteRules(value);
-            break;
-
-        case ConfigType::targetAggregateDevices:
-            setTargetAggregateDevices(value);
-            break;
-
-        case ConfigType::targetAggregateMode:
-            setTargetAggregateMode(value);
-            break;
-        
-        default:
-            break;
+        case ConfigType::outputDevice: keys[0] = nearfield::kSettingsOutputDeviceKey; break;
+        case ConfigType::outputDeviceBufferFrameSize: keys[0] = nearfield::kSettingsOutputBufferFrameSizeKey; break;
+        case ConfigType::deviceName: keys[0] = nearfield::kSettingsDeviceNameKey; break;
+        case ConfigType::deviceActiveCondition: keys[0] = nearfield::kSettingsActiveConditionKey; break;
+        case ConfigType::routingEnabled: keys[0] = nearfield::kSettingsRoutingEnabledKey; break;
+        case ConfigType::routeRules: keys[0] = nearfield::kSettingsRouteRulesKey; break;
+        case ConfigType::targetAggregateDevices: keys[0] = nearfield::kSettingsTargetDevicesKey; break;
+        case ConfigType::targetAggregateMode: keys[0] = nearfield::kSettingsTargetModeKey; break;
+        default: return;
     }
+    const void *values[1] = {value};
+    CFDictionarySmartRef dictionary(CFDictionaryCreate(NULL, (const void **)keys, values, 1,
+                                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+    nearfield::SettingsUpdate update;
+    if (!dictionary || !nearfield::parseSettingsUpdate(dictionary, update)) {
+        return;
+    }
+    if (type == ConfigType::routeRules && !update.processRoutes) {
+        // Older Nearfield versions send the full rules each time; no process
+        // rules means none apply any more.
+        update.processRoutes = std::map<pid_t, nearfield::Route>();
+    }
+    applySettings(update, writer);
 }
 
 CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
-    CAMutex::Locker locker(stateMutex);
-    
+    StateLocker locker(stateMutex);
     switch (type) {
         case ConfigType::outputDevice:
-            return CFStringCreateCopy(NULL, outputDeviceUID);
-            
+            return settings.targetDevices.size() >= 2 ? CFStringCreateCopy(NULL, CFSTR(kDriverTargetAggregate_UID))
+                                                      : nearfield::createCFString(settings.outputDeviceUID);
         case ConfigType::outputDeviceBufferFrameSize:
-            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceBufferFrameSize);
-                
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), settings.outputBufferFrameSize);
         case ConfigType::deviceName:
-            return CFStringCreateCopy(NULL, deviceName);
-
+            return nearfield::createCFString(settings.deviceName);
         case ConfigType::deviceActiveCondition:
-            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceActiveCondition);
-
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%d"), settings.activeCondition);
         case ConfigType::routingEnabled:
-            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), routingEnabled ? 1 : 0);
-
-        case ConfigType::routeRules:
-            return routeRulesString ? CFStringCreateCopy(NULL, routeRulesString) : CFStringCreateCopy(NULL, CFSTR(""));
-
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%d"), settings.routingEnabled ? 1 : 0);
+        case ConfigType::routeRules: {
+            std::string rules = settings.routeRules;
+            for (const auto &entry : processRoutes) {
+                if (!rules.empty()) rules += "; ";
+                rules += "pid:" + std::to_string(entry.first) + "=" + nearfield::routeName(entry.second);
+            }
+            return nearfield::createCFString(rules);
+        }
         case ConfigType::driverCapabilities:
-            return CFStringCreateCopy(NULL, CFSTR("driverOwnedTargetAggregate,threeDisplayTargetAggregate"));
-
-        case ConfigType::targetAggregateDevices:
-            return targetAggregateDevicesString ? CFStringCreateCopy(NULL, targetAggregateDevicesString) : CFStringCreateCopy(NULL, CFSTR(""));
-
+            return CFStringCreateCopy(
+                NULL, CFSTR("driverOwnedTargetAggregate,threeDisplayTargetAggregate,targetOutputReadiness,settingsDictionary"));
+        case ConfigType::targetOutputReadiness: {
+            const UInt64 revision = targetConfigurationRevision;
+            if (readyTargetConfigurationRevision.load() != revision || appliedTargetConfigurationRevision.load() != revision ||
+                settings.targetDevices.size() < 2) {
+                return CFStringCreateCopy(NULL, CFSTR("pending"));
+            }
+            std::string status = std::string("ready\n") + (settings.stereo ? "stereo" : "mono");
+            for (const std::string &uid : settings.targetDevices) {
+                status += "\n" + uid;
+            }
+            return nearfield::createCFString(status);
+        }
+        case ConfigType::targetAggregateDevices: {
+            std::string devices;
+            for (const std::string &uid : settings.targetDevices) {
+                if (!devices.empty()) devices += "\n";
+                devices += uid;
+            }
+            return nearfield::createCFString(devices);
+        }
         case ConfigType::targetAggregateMode:
-            return CFStringCreateCopy(NULL, targetAggregateStereo ? CFSTR("stereo") : CFSTR("mono"));
-            
+            return CFStringCreateCopy(NULL, settings.stereo ? CFSTR("stereo") : CFSTR("mono"));
         default:
             return nullptr;
     }
 }
 
-CFStringRef ProxyAudioDevice::copyDeviceNameFromStorage()
-{
-    DebugMsg("ProxyAudio: copyDeviceNameFromStorage");
-    
-    if (!gPlugIn_Host) {
-        DebugMsg("ProxyAudio: copyDeviceNameFromStorage no plugin host");
-        return nullptr;
-    }
-    
-    CFStringRef result = nullptr;
-    CFPropertyListSmartRef data;
-    
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("deviceName"), &data);
-    
-    if (data != NULL && CFGetTypeID(data) == CFStringGetTypeID()) {
-        result = CFStringCreateCopy(NULL, CFStringRef(CFPropertyListRef(data)));
-    }
-
-    if (result == NULL) {
-        CFBundleRef bundle = CFBundleGetBundleWithIdentifier(CFSTR(kPlugIn_BundleID));
-        result = CFBundleCopyLocalizedString(
-            bundle, CFSTR("DeviceName"), CFSTR("Nearfield"), CFSTR("Localizable"));
-    }
-
-    if (result == NULL) {
-        result = CFStringCreateCopy(NULL, CFSTR("Nearfield"));
-    }
-    
-    DebugMsg("ProxyAudio: copyDeviceNameFromStorage finished");
-    
-    return result;
-}
-
-void ProxyAudioDevice::setDeviceName(CFStringRef newName) {
-    if (!newName || !gPlugIn_Host) {
-        return;
-    }
-    
-    {
-        CAMutex::Locker locker(stateMutex);
-        
-        if (deviceName) {
-            CFRelease(deviceName);
-        }
-        
-        deviceName = CFStringCreateCopy(NULL, newName);
-    }
-    
-    ExecuteInAudioOutputThread(^() {
-        CAMutex::Locker locker(stateMutex);
-        
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("deviceName"), deviceName);
-        
-        AudioObjectPropertyAddress theAddress = {
-            kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &theAddress);
-    });
+CFStringRef ProxyAudioDevice::copyDeviceName() {
+    StateLocker locker(stateMutex);
+    return nearfield::createCFString(settings.deviceName);
 }
 
 CFStringRef ProxyAudioDevice::copyDefaultProxyOutputDeviceUID() {
-    DebugMsg("ProxyAudio: copyDefaultProxyOutputDeviceUID");
-    
-    // First we check the default output device and make sure it's not the proxy audio device:
+    // The Mac's output, unless that is Nearfield itself; otherwise the first
+    // stereo output.
     AudioObjectID defaultDevice = AudioDevice::defaultOutputDevice();
-    
     if (defaultDevice != kAudioObjectUnknown) {
         CFStringRef uid = AudioDevice::copyDeviceUID(defaultDevice);
-        
         if (uid && CFStringCompare(uid, CFSTR(kDevice_UID), 0) != kCFCompareEqualTo) {
-            DebugMsg("ProxyAudio: copyDefaultProxyOutputDeviceUID returning default output device");
             return uid;
         }
+        if (uid) {
+            CFRelease(uid);
+        }
     }
-    
-    // Failing that, we scan through all devices with stereo output capabilities and find the first
-    // one that's not the proxy audio device:
     std::vector<AudioObjectID> outputDevices = AudioDevice::devicesWithOutputCapabilitiesThatAreNotProxyAudioDevice();
-    
-    if (outputDevices.size() > 0) {
-        DebugMsg("ProxyAudio: copyDefaultProxyOutputDeviceUID returning first viable output device in list");
+    if (!outputDevices.empty()) {
         return AudioDevice::copyDeviceUID(outputDevices[0]);
     }
-    
-    DebugMsg("ProxyAudio: copyDefaultProxyOutputDeviceUID could not find output device");
-    
     return nullptr;
-}
-
-CFStringRef ProxyAudioDevice::copyOutputDeviceUIDFromStorage() {
-    DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage");
-    
-    if (!gPlugIn_Host) {
-        DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage no plugin host");
-        return nullptr;
-    }
-
-    CFStringRef result = nullptr;
-    CFPropertyListSmartRef data;
-
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceUID"), &data);
-
-    if (data != NULL && CFGetTypeID(data) == CFStringGetTypeID()
-        && CFStringCompare(CFStringRef(CFPropertyListRef(data)), CFSTR(kDevice_UID), 0) != kCFCompareEqualTo) {
-        result = CFStringCreateCopy(NULL, CFStringRef(CFPropertyListRef(data)));
-        DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage finished with stored output device UID");
-        return result;
-    }
-
-    DebugMsg("ProxyAudio: copyOutputDeviceUIDFromStorage no output device UID in storage");
-    
-    return nullptr;
-}
-
-CFStringRef ProxyAudioDevice::copyTargetAggregateDevicesFromStorage() {
-    if (!gPlugIn_Host) {
-        return CFStringCreateCopy(NULL, CFSTR(""));
-    }
-
-    CFPropertyListSmartRef data;
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("targetAggregateDevices"), &data);
-
-    if (data != NULL && CFGetTypeID(data) == CFStringGetTypeID()) {
-        return CFStringCreateCopy(NULL, CFStringRef(CFPropertyListRef(data)));
-    }
-
-    return CFStringCreateCopy(NULL, CFSTR(""));
-}
-
-static CFStringRef createCoreAudioDictionaryKey(const char *key) {
-    return CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
-}
-
-Boolean ProxyAudioDevice::retrieveTargetAggregateStereoFromStorage() {
-    if (!gPlugIn_Host) {
-        return true;
-    }
-
-    CFPropertyListSmartRef data;
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("targetAggregateMode"), &data);
-
-    if (data == NULL || CFGetTypeID(data) != CFStringGetTypeID()) {
-        return true;
-    }
-
-    std::string mode = lowercaseString(trimString(CFStringToStdString(CFStringRef(CFPropertyListRef(data)))));
-    return mode != "mono";
-}
-
-void ProxyAudioDevice::destroyDriverOwnedTargetAggregateNoLock() {
-    if (targetAggregateID == kAudioObjectUnknown) {
-        AudioObjectID existingID = AudioDevice::audioDeviceIDForDeviceUID(CFSTR(kDriverTargetAggregate_UID));
-        if (existingID != kAudioObjectUnknown) {
-            targetAggregateID = existingID;
-        }
-    }
-
-    if (targetAggregateID == kAudioObjectUnknown) {
-        return;
-    }
-
-    if (outputDevice.isValid() && outputDevice.id == targetAggregateID) {
-        deinitializeOutputDeviceNoLock();
-    }
-
-    OSStatus status = AudioHardwareDestroyAggregateDevice(targetAggregateID);
-    if (status != noErr) {
-        syslog(LOG_WARNING,
-               "NearfieldAudioDevice: failed to destroy private target aggregate %u with status %d",
-               targetAggregateID,
-               status);
-    }
-    targetAggregateID = kAudioObjectUnknown;
-}
-
-void ProxyAudioDevice::rebuildDriverOwnedTargetAggregate(Boolean forceRebuild) {
-    CFStringSmartRef devicesString;
-    Boolean stereo = true;
-    {
-        CAMutex::Locker locker(&stateMutex);
-        devicesString = targetAggregateDevicesString ? CFStringCreateCopy(NULL, targetAggregateDevicesString) : CFStringCreateCopy(NULL, CFSTR(""));
-        stereo = targetAggregateStereo;
-    }
-
-    std::vector<std::string> deviceUIDs = splitTargetDeviceUIDs(devicesString);
-    if (deviceUIDs.size() < 2) {
-        return;
-    }
-
-    CAMutex::Locker outputLocker(outputDeviceMutex);
-    if (!forceRebuild) {
-        if (targetAggregateID == kAudioObjectUnknown) {
-            AudioObjectID existingID = AudioDevice::audioDeviceIDForDeviceUID(CFSTR(kDriverTargetAggregate_UID));
-            if (existingID != kAudioObjectUnknown) {
-                targetAggregateID = existingID;
-            }
-        }
-
-        if (targetAggregateID != kAudioObjectUnknown) {
-            return;
-        }
-    }
-
-    destroyDriverOwnedTargetAggregateNoLock();
-
-    CFMutableArrayRef subdevices = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-    if (!subdevices) {
-        syslog(LOG_WARNING, "NearfieldAudioDevice: failed to allocate private target subdevice list");
-        return;
-    }
-    CFArraySmartRef subdevicesRef(subdevices);
-
-    for (size_t index = 0; index < deviceUIDs.size() && index < 3; ++index) {
-        CFStringSmartRef subdeviceUID(CFStringCreateWithCString(NULL, deviceUIDs[index].c_str(), kCFStringEncodingUTF8));
-        if (!subdeviceUID) {
-            continue;
-        }
-
-        UInt32 outputChannels = 1;
-        UInt32 driftCompensation = index == 0 ? 0 : 1;
-        UInt32 driftQuality = kAudioAggregateDriftCompensationHighQuality;
-        CFNumberSmartRef outputChannelsRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &outputChannels));
-        CFNumberSmartRef driftCompensationRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &driftCompensation));
-        CFNumberSmartRef driftQualityRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &driftQuality));
-        CFStringSmartRef subdeviceUIDKey(createCoreAudioDictionaryKey(kAudioSubDeviceUIDKey));
-        CFStringSmartRef outputChannelsKey(createCoreAudioDictionaryKey(kAudioSubDeviceOutputChannelsKey));
-        CFStringSmartRef driftCompensationKey(createCoreAudioDictionaryKey(kAudioSubDeviceDriftCompensationKey));
-        CFStringSmartRef driftQualityKey(createCoreAudioDictionaryKey(kAudioSubDeviceDriftCompensationQualityKey));
-
-        if (!outputChannelsRef || !driftCompensationRef || !driftQualityRef ||
-            !subdeviceUIDKey || !outputChannelsKey || !driftCompensationKey || !driftQualityKey) {
-            syslog(LOG_WARNING, "NearfieldAudioDevice: failed to allocate private target subdevice description");
-            continue;
-        }
-
-        const void *keys[] = {
-            subdeviceUIDKey.ref(),
-            outputChannelsKey.ref(),
-            driftCompensationKey.ref(),
-            driftQualityKey.ref()
-        };
-        const void *values[] = {
-            subdeviceUID.ref(),
-            outputChannelsRef.ref(),
-            driftCompensationRef.ref(),
-            driftQualityRef.ref()
-        };
-        CFDictionarySmartRef subdevice(CFDictionaryCreate(
-            NULL,
-            keys,
-            values,
-            sizeof(keys) / sizeof(keys[0]),
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks
-        ));
-        if (subdevice) {
-            CFArrayAppendValue(subdevices, subdevice.ref());
-        }
-    }
-
-    if (CFArrayGetCount(subdevices) < 2) {
-        syslog(LOG_WARNING, "NearfieldAudioDevice: private target aggregate has fewer than two valid subdevices");
-        return;
-    }
-
-    UInt32 isPrivate = 1;
-    UInt32 isStacked = stereo ? 1 : 0;
-    CFStringSmartRef aggregateUID(CFStringCreateCopy(NULL, CFSTR(kDriverTargetAggregate_UID)));
-    CFStringSmartRef aggregateName(CFStringCreateCopy(NULL, CFSTR(kDriverTargetAggregate_Name)));
-    CFStringSmartRef mainSubdeviceUID(CFStringCreateWithCString(NULL, deviceUIDs[0].c_str(), kCFStringEncodingUTF8));
-    CFNumberSmartRef isPrivateRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &isPrivate));
-    CFNumberSmartRef isStackedRef(CFNumberCreate(NULL, kCFNumberSInt32Type, &isStacked));
-    CFStringSmartRef aggregateUIDKey(createCoreAudioDictionaryKey(kAudioAggregateDeviceUIDKey));
-    CFStringSmartRef aggregateNameKey(createCoreAudioDictionaryKey(kAudioAggregateDeviceNameKey));
-    CFStringSmartRef subdeviceListKey(createCoreAudioDictionaryKey(kAudioAggregateDeviceSubDeviceListKey));
-    CFStringSmartRef mainSubdeviceKey(createCoreAudioDictionaryKey(kAudioAggregateDeviceMainSubDeviceKey));
-    CFStringSmartRef isPrivateKey(createCoreAudioDictionaryKey(kAudioAggregateDeviceIsPrivateKey));
-    CFStringSmartRef isStackedKey(createCoreAudioDictionaryKey(kAudioAggregateDeviceIsStackedKey));
-
-    if (!aggregateUID || !aggregateName || !mainSubdeviceUID || !isPrivateRef || !isStackedRef ||
-        !aggregateUIDKey || !aggregateNameKey || !subdeviceListKey ||
-        !mainSubdeviceKey || !isPrivateKey || !isStackedKey) {
-        syslog(LOG_WARNING, "NearfieldAudioDevice: failed to allocate private target aggregate description");
-        return;
-    }
-
-    const void *keys[] = {
-        aggregateUIDKey.ref(),
-        aggregateNameKey.ref(),
-        subdeviceListKey.ref(),
-        mainSubdeviceKey.ref(),
-        isPrivateKey.ref(),
-        isStackedKey.ref()
-    };
-    const void *values[] = {
-        aggregateUID.ref(),
-        aggregateName.ref(),
-        subdevicesRef.ref(),
-        mainSubdeviceUID.ref(),
-        isPrivateRef.ref(),
-        isStackedRef.ref()
-    };
-    CFDictionarySmartRef description(CFDictionaryCreate(
-        NULL,
-        keys,
-        values,
-        sizeof(keys) / sizeof(keys[0]),
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks
-    ));
-
-    AudioObjectID newAggregateID = kAudioObjectUnknown;
-    OSStatus status = AudioHardwareCreateAggregateDevice(description, &newAggregateID);
-    if (status != noErr) {
-        syslog(LOG_WARNING,
-               "NearfieldAudioDevice: failed to create private target aggregate with status %d",
-               status);
-        return;
-    }
-
-    {
-        CAMutex::Locker locker(&stateMutex);
-        targetAggregateID = newAggregateID;
-        if (outputDeviceUID) {
-            CFRelease(outputDeviceUID);
-        }
-        outputDeviceUID = CFStringCreateCopy(NULL, CFSTR(kDriverTargetAggregate_UID));
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceUID"), outputDeviceUID);
-    }
-
-    syslog(LOG_NOTICE, "NearfieldAudioDevice: private target aggregate ready");
-}
-
-void ProxyAudioDevice::setTargetAggregateDevices(CFStringRef deviceUIDs) {
-    if (!deviceUIDs || !gPlugIn_Host) {
-        return;
-    }
-
-    Boolean devicesChanged = false;
-    {
-        CAMutex::Locker locker(&stateMutex);
-        devicesChanged = !targetAggregateDevicesString ||
-            CFStringCompare(targetAggregateDevicesString, deviceUIDs, 0) != kCFCompareEqualTo;
-        if (devicesChanged) {
-            if (targetAggregateDevicesString) {
-                CFRelease(targetAggregateDevicesString);
-            }
-            targetAggregateDevicesString = CFStringCreateCopy(NULL, deviceUIDs);
-            gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateDevices"), targetAggregateDevicesString);
-        }
-    }
-
-    // Only force a teardown when the target devices actually changed. The
-    // configurator re-sends the same UIDs on every audio state change, and
-    // destroying a live aggregate each time churns the CoreAudio device list,
-    // which in turn triggers another state change. Passing false lets
-    // rebuildDriverOwnedTargetAggregate adopt the existing aggregate, or build
-    // one if it is missing.
-    ExecuteInAudioOutputThread(^{
-        rebuildDriverOwnedTargetAggregate(devicesChanged);
-        setupTargetOutputDevice();
-    });
-}
-
-void ProxyAudioDevice::setTargetAggregateMode(CFStringRef mode) {
-    if (!mode || !gPlugIn_Host) {
-        return;
-    }
-
-    std::string normalizedMode = lowercaseString(trimString(CFStringToStdString(mode)));
-    Boolean newStereo = normalizedMode != "mono";
-    Boolean shouldRebuild = false;
-    {
-        CAMutex::Locker locker(&stateMutex);
-        if (targetAggregateStereo == newStereo) {
-            return;
-        }
-
-        targetAggregateStereo = newStereo;
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("targetAggregateMode"), mode);
-        shouldRebuild = true;
-    }
-
-    if (!shouldRebuild) {
-        return;
-    }
-
-    ExecuteInAudioOutputThread(^{
-        rebuildDriverOwnedTargetAggregate(true);
-        setupTargetOutputDevice();
-    });
-}
-
-void ProxyAudioDevice::setOutputDevice(CFStringRef deviceUID) {
-    if (!gPlugIn_Host) {
-        return;
-    }
-    
-    {
-        CAMutex::Locker locker(&stateMutex);
-        
-        if (outputDeviceUID) {
-            CFRelease(outputDeviceUID);
-        }
-        
-        outputDeviceUID = CFStringCreateCopy(NULL, deviceUID); 
-    }
-    
-    ExecuteInAudioOutputThread(^{
-        CAMutex::Locker locker(&stateMutex);
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceUID"), outputDeviceUID);
-    });
-    
-    ExecuteInAudioOutputThread(^{
-        setupTargetOutputDevice();
-    });
-}
-
-UInt32 ProxyAudioDevice::retrieveOutputDeviceBufferFrameSizeFromStorage() {
-    DebugMsg("ProxyAudio: retrieveOutputDeviceBufferFrameSizeFromStorage");
-    
-    if (!gPlugIn_Host) {
-        DebugMsg("ProxyAudio: retrieveOutputDeviceBufferFrameSizeFromStorage no plugin host");
-        return kOutputDeviceDefaultBufferFrameSize;
-    }
-
-    CFPropertyListSmartRef data;
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceBufferFrameSize"), &data);
-
-    if (data == NULL || CFGetTypeID(data) != CFNumberGetTypeID()) {
-        DebugMsg("ProxyAudio: retrieveOutputDeviceBufferFrameSizeFromStorage finished returning default buffer frame size");
-        return kOutputDeviceDefaultBufferFrameSize;
-    }
-
-    SInt32 value;
-    CFNumberGetValue(CFNumberRef(CFPropertyListRef(data)), kCFNumberSInt32Type, &value);
-    value = std::max(value, kOutputDeviceMinBufferFrameSize);
-    
-    DebugMsg("ProxyAudio: retrieveOutputDeviceBufferFrameSizeFromStorage finished returning stored buffer frame size");
-    
-    return UInt32(value);
-}
-
-void ProxyAudioDevice::setOutputDeviceBufferFrameSize(UInt32 newSize) {
-    if (newSize <= 0 || newSize > INT32_MAX) {
-        return;
-    }
-    
-    {
-        CAMutex::Locker locker(&stateMutex);
-        outputDeviceBufferFrameSize = newSize;
-        CFNumberSmartRef newSizeRef = CFNumberCreate(NULL, kCFNumberSInt32Type, &newSize);
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceBufferFrameSize"), newSizeRef);
-    }
-    
-    ExecuteInAudioOutputThread(^{
-        setupTargetOutputDevice();
-    });
-}
-
-ProxyAudioDevice::ActiveCondition ProxyAudioDevice::retrieveOutputDeviceActiveConditionFromStorage() {
-    DebugMsg("ProxyAudio: retrieveOutputDeviceActiveConditionFromStorage");
-
-    if (!gPlugIn_Host) {
-        DebugMsg("ProxyAudio: retrieveOutputDeviceActiveConditionFromStorage no plugin host");
-        return kOutputDeviceDefaultActiveCondition;
-    }
-
-    CFPropertyListSmartRef data;
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceActiveCondition"), &data);
-
-    if (data == NULL || CFGetTypeID(data) != CFNumberGetTypeID()) {
-        DebugMsg("ProxyAudio: retrieveOutputDeviceActiveConditionFromStorage finished returning default active condition");
-        return kOutputDeviceDefaultActiveCondition;
-    }
-
-    SInt32 value;
-    CFNumberGetValue(CFNumberRef(CFPropertyListRef(data)), kCFNumberSInt32Type, &value);
-
-    DebugMsg("ProxyAudio: retrieveOutputDeviceActiveConditionFromStorage finished returning stored active condition");
-
-    return ActiveCondition(value);
-}
-
-void ProxyAudioDevice::setOutputDeviceActiveCondition(ActiveCondition newActiveCondition) {
-    {
-        CAMutex::Locker locker(&stateMutex);
-        outputDeviceActiveCondition = newActiveCondition;
-        CFNumberSmartRef newActiveConditionRef = CFNumberCreate(NULL, kCFNumberSInt32Type, &newActiveCondition);
-        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceActiveCondition"), newActiveConditionRef);
-    }
-}
-
-Boolean ProxyAudioDevice::retrieveRoutingEnabledFromStorage() {
-    if (!gPlugIn_Host) {
-        return false;
-    }
-
-    CFPropertyListSmartRef data;
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("routingEnabled"), &data);
-
-    if (data == NULL || CFGetTypeID(data) != CFNumberGetTypeID()) {
-        return false;
-    }
-
-    SInt32 value = 0;
-    CFNumberGetValue(CFNumberRef(CFPropertyListRef(data)), kCFNumberSInt32Type, &value);
-    return value != 0;
-}
-
-void ProxyAudioDevice::setRoutingEnabled(Boolean enabled) {
-    CAMutex::Locker locker(&stateMutex);
-    routingEnabled = enabled;
-    SInt32 value = enabled ? 1 : 0;
-    CFNumberSmartRef valueRef = CFNumberCreate(NULL, kCFNumberSInt32Type, &value);
-    gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("routingEnabled"), valueRef);
-    updateClientDestinationsNoLock();
-    syslog(LOG_NOTICE, "NearfieldAudioDevice: routing %s", routingEnabled ? "enabled" : "disabled");
-}
-
-CFStringRef ProxyAudioDevice::copyRouteRulesFromStorage() {
-    if (!gPlugIn_Host) {
-        return CFStringCreateCopy(NULL, CFSTR(""));
-    }
-
-    CFPropertyListSmartRef data;
-    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("routeRules"), &data);
-
-    if (data != NULL && CFGetTypeID(data) == CFStringGetTypeID()) {
-        return CFStringCreateCopy(NULL, CFStringRef(CFPropertyListRef(data)));
-    }
-
-    return CFStringCreateCopy(NULL, CFSTR(""));
-}
-
-void ProxyAudioDevice::setRouteRules(CFStringRef newRules) {
-    if (!newRules || !gPlugIn_Host) {
-        return;
-    }
-
-    CAMutex::Locker locker(&stateMutex);
-    if (routeRulesString) {
-        CFRelease(routeRulesString);
-    }
-    routeRulesString = CFStringCreateCopy(NULL, newRules);
-    gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("routeRules"), routeRulesString);
-    rebuildRouteRulesNoLock();
-    syslog(LOG_NOTICE,
-           "NearfieldAudioDevice: route rules updated to '%s'",
-           CFStringToStdString(routeRulesString).c_str());
-}
-
-#pragma mark Other stuff!
-
-void ProxyAudioDevice::monitorUserActivity() {
-    {
-        CAMutex::Locker outputMutexLocker(outputDeviceMutex);
-        updateOutputDeviceStartedState();
-    }
 }
 
 dispatch_queue_t ProxyAudioDevice::AudioOutputDispatchQueue() {

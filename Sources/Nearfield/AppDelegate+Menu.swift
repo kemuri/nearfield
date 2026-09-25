@@ -50,6 +50,7 @@ extension AppDelegate {
     }
 
     @objc func openSettings() {
+        refreshDriverInstallState()
         guard !isInitialOnboardingInProgress else {
             if let onboardingWindowController {
                 onboardingWindowController.show()
@@ -80,9 +81,30 @@ extension AppDelegate {
 
     @objc func openOnboarding() {
         if onboardingWindowController == nil {
-            onboardingWindowController = OnboardingWindowController(delegate: self)
+            onboardingWindowController = makeOnboardingWindowController()
         }
         onboardingWindowController?.showOnboardingSimulation()
+    }
+
+    /// Once closed, the window, its SwiftUI views, the model, the animated
+    /// header and the app icons are released. First-run onboarding keeps its
+    /// window so it resumes at the same step.
+    func makeOnboardingWindowController() -> OnboardingWindowController {
+        // It may have changed in System Settings while the window was closed.
+        cachedOpenAtLogin = nil
+        let controller = OnboardingWindowController(delegate: self)
+        controller.onClose = { [weak self, weak controller] in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, let controller,
+                          self.onboardingWindowController === controller,
+                          !self.isInitialOnboardingInProgress,
+                          controller.window?.isVisible != true else { return }
+                    self.onboardingWindowController = nil
+                }
+            }
+        }
+        return controller
     }
 
     #if !NEARFIELD_DISTRIBUTION
@@ -93,7 +115,7 @@ extension AppDelegate {
 
     func showOnboardingSettingsStage(showsPageIndicator: Bool) {
         if onboardingWindowController == nil {
-            onboardingWindowController = OnboardingWindowController(delegate: self)
+            onboardingWindowController = makeOnboardingWindowController()
         }
         onboardingWindowController?.showSettingsStage(showsPageIndicator: showsPageIndicator)
     }
@@ -108,6 +130,7 @@ extension AppDelegate {
     #endif
 
     func setOpenAtLogin(_ enabled: Bool) {
+        cachedOpenAtLogin = nil
         do {
             if enabled {
                 try SMAppService.mainApp.register()

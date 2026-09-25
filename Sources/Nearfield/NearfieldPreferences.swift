@@ -12,6 +12,13 @@ enum NearfieldPreferences {
     static let appRoutingEnabledKey = "appRoutingEnabled"
     static let appRoutingRulesKey = "appRoutingRules"
     static let appRoutingAppBundleIDsKey = "appRoutingAppBundleIDs"
+    /// Testing switch for 0.2.0: leave the volume keys to macOS alone.
+    static let systemHandlesVolumeKeysKey = "systemHandlesVolumeKeys"
+    /// Testing switches for driver 1.1.0, forwarded when set.
+    static let driverDiagnosticsKey = "driverDiagnostics"
+    static let driverUnderrunStrategyKey = "driverUnderrunStrategy"
+    /// Decibels Nearfield's volume was raised by while the displays waited.
+    static let waitingDisplayCompensationKey = "waitingDisplayCompensation"
     static let latestOnboardingCompletionVersion = 1
     static let latestAggregateSchemaVersion = 12
 
@@ -26,7 +33,11 @@ enum NearfieldPreferences {
         proxyPreparedDisplayStateKey,
         appRoutingEnabledKey,
         appRoutingRulesKey,
-        appRoutingAppBundleIDsKey
+        appRoutingAppBundleIDsKey,
+        systemHandlesVolumeKeysKey,
+        driverDiagnosticsKey,
+        driverUnderrunStrategyKey,
+        waitingDisplayCompensationKey
     ]
 
     static func outputMode(in defaults: UserDefaults = .standard) -> NearfieldOutputMode {
@@ -149,6 +160,31 @@ enum NearfieldPreferences {
         } else {
             defaults.removeObject(forKey: proxyPreparedDisplayStateKey)
         }
+    }
+
+    static func systemHandlesVolumeKeys(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: systemHandlesVolumeKeysKey)
+    }
+
+    static func waitingDisplayCompensation(in defaults: UserDefaults = .standard) -> Float32 {
+        let value = Float32(defaults.double(forKey: waitingDisplayCompensationKey))
+        return value.isFinite ? value : 0
+    }
+
+    static func setWaitingDisplayCompensation(_ decibels: Float32, in defaults: UserDefaults = .standard) {
+        if decibels == 0 {
+            defaults.removeObject(forKey: waitingDisplayCompensationKey)
+        } else {
+            defaults.set(Double(decibels), forKey: waitingDisplayCompensationKey)
+        }
+    }
+
+    static func driverDiagnostics(in defaults: UserDefaults = .standard) -> Bool? {
+        defaults.object(forKey: driverDiagnosticsKey) == nil ? nil : defaults.bool(forKey: driverDiagnosticsKey)
+    }
+
+    static func driverUnderrunStrategy(in defaults: UserDefaults = .standard) -> String? {
+        defaults.string(forKey: driverUnderrunStrategyKey).flatMap { ["both", "steer", "gap"].contains($0) ? $0 : nil }
     }
 
     static func appRoutingEnabled(in defaults: UserDefaults = .standard) -> Bool {

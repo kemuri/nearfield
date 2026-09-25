@@ -49,6 +49,8 @@ class AudioDevice {
     bool isOutput;
     UInt32 safetyOffset;
     UInt32 bufferFrameSize;
+    // The device's and its first output stream's presentation latency.
+    UInt32 latencyFrames;
     Float64 sampleRate;
     AudioDeviceIOProcID procId;
     bool isStarted;

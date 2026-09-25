@@ -3,16 +3,25 @@
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreAudio/CoreAudio.h>
-#include <vector>
+#include <dispatch/dispatch.h>
+
 #include <atomic>
 #include <map>
-#include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "AudioDevice.h"
-#include "CAMutex.h"
+#include "NearfieldDiagnostics.h"
+#include "NearfieldPlayback.h"
+#include "NearfieldRouteTable.h"
+#include "NearfieldSettings.h"
 
-class AudioRingBuffer;
+// Builds made with build_router_driver.sh --diagnostics log diagnostics from
+// the start; other builds do when Nearfield turns them on in the settings.
+#ifndef NEARFIELD_DRIVER_DIAGNOSTICS
+#define NEARFIELD_DRIVER_DIAGNOSTICS 0
+#endif
 
 enum {
     kObjectID_PlugIn = kAudioObjectPlugInObject,
@@ -21,8 +30,7 @@ enum {
     kObjectID_Stream_Output = 4,
     kObjectID_Volume_Output_L = 5,
     kObjectID_Volume_Output_R = 6,
-    kObjectID_Mute_Output_Master = 7,
-    kObjectID_DataSource_Output_Master = 8
+    kObjectID_Mute_Output_Master = 7
 };
 
 #define kPlugIn_BundleID "com.kemuri.Nearfield.AudioDevice"
@@ -31,12 +39,31 @@ enum {
 #define kDevice_ModelUID "NearfieldAudioDevice_ModelUID"
 #define kDriverTargetAggregate_UID "com.kemuri.Nearfield.DriverTargetAggregate"
 #define kDriverTargetAggregate_Name "Nearfield Driver Target"
-#define kOutputDeviceDefaultBufferFrameSize 512
-#define kOutputDeviceMinBufferFrameSize 4
-#define kOutputDeviceDefaultActiveCondition ActiveCondition::proxiedDeviceActive
+
+// Custom box properties shared with Nearfield (see NearfieldSettings.h).
+// Settings: a CFDictionary Nearfield writes. Status: a CFDictionary it reads
+// and observes; the driver notifies listeners whenever it changes.
+constexpr AudioObjectPropertySelector kNearfieldPropertySettings = 'nfst';
+constexpr AudioObjectPropertySelector kNearfieldPropertyStatus = 'nfss';
+constexpr int kNearfieldProtocolVersion = 1;
+
+// Keep the displays running this long after the last sound. Starting them
+// again takes about 440 ms, and the audio written meanwhile is skipped to
+// keep the latency (and video) in step, so the start of the next sound would
+// be cut. The driver's output costs about 0.3-0.5% CPU while it runs.
+constexpr double kOutputKeepAliveSeconds = 120.0;
+// Hide Nearfield once fewer than two displays have been active this long.
+constexpr double kDisplayLossHideSeconds = 1.0;
+// Core Audio enumerates USB displays some seconds after boot; do not hide
+// Nearfield before they had a chance to appear.
+constexpr double kDisplayLossStartupGraceSeconds = 10.0;
+
+using StateLocker = std::lock_guard<std::recursive_mutex>;
 
 class ProxyAudioDevice {
   public:
+    // Legacy configuration channel (box Identify + name), kept for one
+    // release so older Nearfield versions can still configure this driver.
     enum class ConfigType {
         none,
         outputDevice,
@@ -47,56 +74,48 @@ class ProxyAudioDevice {
         routeRules,
         driverCapabilities,
         targetAggregateDevices,
-        targetAggregateMode
+        targetAggregateMode,
+        targetOutputReadiness
     };
-    enum class ActiveCondition { proxiedDeviceActive = 0, userActive = 1, always = 2 };
-    enum class RouteDestination { pair, left, right, muted };
 
     struct ClientInfo {
         UInt32 clientID = 0;
         pid_t processID = 0;
         std::string bundleID;
-        RouteDestination destination = RouteDestination::pair;
+        nearfield::Route route = nearfield::Route::pair;
     };
 
-    struct RouteSnapshot {
-        Boolean routingEnabled = false;
-        std::map<UInt32, RouteDestination> destinationsByClientID;
-    };
+    ProxyAudioDevice();
 
-    ProxyAudioDevice() : inputIOIsActive(false), routeSnapshot(std::make_shared<RouteSnapshot>()) {};
+    // MARK: Output device (all on the driver's queue)
     AudioDevice findTargetOutputAudioDevice();
-    static int outputDeviceAliveListenerStatic(AudioObjectID inObjectID,
+    static OSStatus outputDeviceListenerStatic(AudioObjectID inObjectID,
                                                UInt32 inNumberAddresses,
                                                const AudioObjectPropertyAddress *inAddresses,
                                                void *inClientData);
-    int outputDeviceAliveListener(AudioObjectID inObjectID,
-                                  UInt32 inNumberAddresses,
-                                  const AudioObjectPropertyAddress *inAddresses);
-    static int outputDeviceSampleRateListenerStatic(AudioObjectID inObjectID,
-                                                    UInt32 inNumberAddresses,
-                                                    const AudioObjectPropertyAddress *inAddresses,
-                                                    void *inClientData);
-    int outputDeviceSampleRateListener(AudioObjectID inObjectID,
-                                       UInt32 inNumberAddresses,
-                                       const AudioObjectPropertyAddress *inAddresses);
-    void updateOutputDeviceStartedState();
-    void matchOutputDeviceSampleRateNoLock();
-    void matchOutputDeviceSampleRate();
-    static int devicesListenerProcStatic(AudioObjectID inObjectID,
-                                         UInt32 inNumberAddresses,
-                                         const AudioObjectPropertyAddress *inAddresses,
-                                         void *inClientData);
-    int devicesListenerProc(AudioObjectID inObjectID,
-                            UInt32 inNumberAddresses,
-                            const AudioObjectPropertyAddress *inAddresses);
+    static OSStatus devicesListenerProcStatic(AudioObjectID inObjectID,
+                                              UInt32 inNumberAddresses,
+                                              const AudioObjectPropertyAddress *inAddresses,
+                                              void *inClientData);
+    void handleOutputDeviceChange(AudioObjectPropertySelector selector);
+    void handleDeviceListChange();
     void setupAudioDevicesListener();
     void setupTargetOutputDevice();
     void initializeOutputDevice();
-    void deinitializeOutputDeviceNoLock();
     void deinitializeOutputDevice();
-    void resetInputDataNoLock();
-    void resetInputData();
+    void updateOutputDeviceStartedState();
+    void scheduleOutputStop(double seconds);
+    void matchOutputDeviceSampleRate();
+    void scheduleSampleRateRetry();
+    void scheduleOutputSetupRetry();
+    void applyRequestedSampleRateToOutput(Float64 sampleRate);
+    void refreshAvailableSampleRates();
+    void refreshTargetOutputReadiness();
+    void updateDisplayPresence(int presentDisplays);
+    void setDisplaysHidden(bool hidden);
+    void rebuildDriverOwnedTargetAggregate(bool forceRebuild);
+    void destroyDriverOwnedTargetAggregate();
+    void publishOutputFormatToEngine();
     static OSStatus outputDeviceIOProcStatic(AudioDeviceID inDevice,
                                              const AudioTimeStamp *inNow,
                                              const AudioBufferList *inInputData,
@@ -110,47 +129,40 @@ class ProxyAudioDevice {
                                 const AudioTimeStamp *inInputTime,
                                 AudioBufferList *outOutputData,
                                 const AudioTimeStamp *inOutputTime);
-    void calculateVolumeFactors(Float32 volumeL,
-                                Float32 volumeR,
-                                bool mute,
-                                Float32 &volumeFactorL,
-                                Float32 &volumeFactorR);
+
+    // MARK: Volume
+    void calculateVolumeFactors(Float32 volumeL, Float32 volumeR, bool mute, Float32 &volumeFactorL, Float32 &volumeFactorR);
     Float32 volumeScalarToDecibels(Float32 scalar);
     Float32 volumeDecibelsToScalar(Float32 db);
     Float32 volumeScalarToGain(Float32 scalar);
-    bool isConfigurationString(CFStringRef val);
+
+    // MARK: Settings and status
+    OSStatus applySettings(const nearfield::SettingsUpdate &update, pid_t writer);
+    void applySettingsEffects(uint32_t changes);
+    void persistSettingsIfChangedNoLock();
+    void loadSettingsFromStorage();
+    void updateClientRoutesNoLock();
+    nearfield::Route routeForClientNoLock(const std::string &bundleID, pid_t processID) const;
+    void applyPlaybackSettingsNoLock();
+    CFDictionaryRef copyStatusDictionary();
+    void notifyStatusChanged();
+    void notifyDeviceListChanged();
+    void notifyLatencyChanged();
+    bool writerIsAuthorized(pid_t processID);
+    void loadOwnTeamIdentifier();
+    void handleEngineSignals(uintptr_t signals);
+    void drainDiagnostics();
+    std::vector<Float64> currentAvailableSampleRates();
+    bool isSupportedSampleRate(Float64 sampleRate);
+    UInt32 currentLatencyFrames();
+    bool deviceIsPublished();
+
+    // MARK: Legacy configuration channel
     void parseConfigurationString(CFStringRef configString, ConfigType &action, CFStringRef &value);
-    void setConfigurationValue(ConfigType action, CFStringRef value);
+    void setConfigurationValue(ConfigType action, CFStringRef value, pid_t writer);
     CFStringRef copyConfigurationValue(ConfigType action);
-    CFStringRef copyDeviceNameFromStorage();
-    void setDeviceName(CFStringRef newName);
+    CFStringRef copyDeviceName();
     CFStringRef copyDefaultProxyOutputDeviceUID();
-    CFStringRef copyOutputDeviceUIDFromStorage();
-    void setOutputDevice(CFStringRef deviceUID);
-    CFStringRef copyTargetAggregateDevicesFromStorage();
-    Boolean retrieveTargetAggregateStereoFromStorage();
-    void setTargetAggregateDevices(CFStringRef deviceUIDs);
-    void setTargetAggregateMode(CFStringRef mode);
-    void rebuildDriverOwnedTargetAggregate(Boolean forceRebuild);
-    void destroyDriverOwnedTargetAggregateNoLock();
-    UInt32 retrieveOutputDeviceBufferFrameSizeFromStorage();
-    void setOutputDeviceBufferFrameSize(UInt32 size);
-    ActiveCondition retrieveOutputDeviceActiveConditionFromStorage();
-    void setOutputDeviceActiveCondition(ActiveCondition newActiveCondition);
-    Boolean retrieveRoutingEnabledFromStorage();
-    void setRoutingEnabled(Boolean enabled);
-    CFStringRef copyRouteRulesFromStorage();
-    void setRouteRules(CFStringRef newRules);
-    void rebuildRouteRulesNoLock();
-    RouteDestination routeDestinationForClientNoLock(const std::string &bundleID, pid_t processID);
-    RouteDestination routeDestinationForClientIDSnapshot(UInt32 clientID);
-    void updateClientDestinationsNoLock();
-    void publishRouteSnapshotNoLock();
-    const char *routeDestinationName(RouteDestination destination);
-    void mixRoutedClientBuffer(const Float32 *inputData,
-                               Float32 *outputData,
-                               UInt32 frameCount,
-                               RouteDestination destination);
 
     static ProxyAudioDevice *deviceForDriver(void *inDriver);
 
@@ -520,65 +532,77 @@ class ProxyAudioDevice {
                                     const void *inData,
                                     UInt32 *outNumberPropertiesChanged,
                                     AudioObjectPropertyAddress outChangedAddresses[2]);
-    void monitorUserActivity();
     dispatch_queue_t AudioOutputDispatchQueue();
     void ExecuteInAudioOutputThread(void (^block)());
-    
-    CAMutex stateMutex = CAMutex("ProxyAudioStateMutex");
-    CAMutex IOMutex = CAMutex("ProxyAudioIOMutex");
-    CAMutex outputDeviceMutex = CAMutex("ProxyAudioOutputDeviceMutex");
-    CAMutex getZeroTimestampMutex = CAMutex("ProxyAudioGetZeroTimestampMutex");
+
+    // Configuration and client state. Never taken on an audio thread.
+    std::recursive_mutex stateMutex;
     dispatch_queue_t audioOutputQueue = NULL;
-    dispatch_source_t inputMonitoringTimer = NULL;
-    AudioRingBuffer *inputBuffer = NULL;
-    Byte *workBuffer = NULL;
-    Byte *routeMixBuffer = NULL;
+    dispatch_source_t engineSignalSource = NULL;
+
+    // Audio path (lock-free; see NearfieldPlayback.h).
+    nearfield::PlaybackEngine engine;
+    nearfield::DeviceClock deviceClock;
+    nearfield::RouteTable routeTable;
+    nearfield::ClientRouteMixer routeMixer;
+    nearfield::Diagnostics diagnostics;
+    Float32 *renderBuffer = NULL;
+
+    // Settings and clients (stateMutex).
+    nearfield::DriverSettings settings;
+    std::map<pid_t, nearfield::Route> processRoutes;
+    std::map<std::string, nearfield::Route> bundleRoutes;
+    std::map<UInt32, ClientInfo> clientsByID;
+    CFDictionaryRef lastPersistedSettings = NULL;
+    CFStringRef boxName = NULL;
+    pid_t configuratorPid = 0;
+    std::atomic<int> nextConfigurationToRead{0};
+    std::map<pid_t, std::pair<UInt64, bool>> verifiedWriters;
+    std::string writerVerification = "unchecked";
+    std::once_flag teamIdentifierOnce;
+    CFStringRef ownTeamIdentifier = NULL;
+
+    // Target output (driver queue). Audio threads never touch these.
     AudioDevice outputDevice;
     bool outputDeviceReady = false;
-    std::atomic_bool inputIOIsActive;
-    std::shared_ptr<const RouteSnapshot> routeSnapshot;
-    Float64 lastInputFrameTime = -1;
-    Float64 lastInputBufferFrameSize = -1;
-    Float64 inputOutputSampleDelta = -1;
-    Float64 inputFinalFrameTime = -1;
-    int inputCycleCount = 0;
-    int outputOverrunCount = 0;
-    const int kOutputOverrunResyncThreshold = 8;
-    ConfigType nextConfigurationToRead = ConfigType::none;
-    pid_t configuratorPid = 0;
-    CFStringRef deviceName = NULL;
-    CFStringRef boxName = NULL;
-    CFStringRef outputDeviceUID = NULL;
-    CFStringRef targetAggregateDevicesString = NULL;
-    Boolean targetAggregateStereo = true;
     AudioObjectID targetAggregateID = kAudioObjectUnknown;
-    CFStringRef routeRulesString = NULL;
-    Boolean routingEnabled = false;
-    std::map<UInt32, ClientInfo> clientsByID;
-    std::map<std::string, RouteDestination> routeRulesByBundleID;
-    std::map<pid_t, RouteDestination> routeRulesByProcessID;
-    UInt32 outputDeviceBufferFrameSize = kOutputDeviceDefaultBufferFrameSize;
-    SInt64 smallestFramesToBufferEnd = -1;
-    Float64 outputAccumulatedRateRatio = 0.0;
-    UInt64 outputAccumulatedRateRatioSamples = 0;
-    ActiveCondition outputDeviceActiveCondition = ActiveCondition::userActive;
-    
+    bool outputIsAggregate = false;
+    UInt64 outputStopToken = 0;
+    UInt64 hideToken = 0;
+    int sampleRateRetryCount = 0;
+    UInt64 sampleRateRetryToken = 0;
+    int outputSetupRetryCount = 0;
+    UInt64 outputSetupRetryToken = 0;
+    AudioObjectID outputSetupRetryDeviceID = kAudioObjectUnknown;
+    Float64 requestedOutputSampleRate = 0;
+    bool devicesListenerInstalled = false;
+    UInt64 initializedHostTime = 0;
+    // Tests turn this off so the driver never builds aggregates, opens
+    // devices or registers listeners through Core Audio.
+    bool manageOutputDevice = true;
+
+    // Readiness and presence, published for property reads.
+    UInt64 targetConfigurationRevision = 1;  // stateMutex
+    std::atomic<UInt64> appliedTargetConfigurationRevision{0};
+    std::atomic<UInt64> readyTargetConfigurationRevision{0};
+    std::atomic<int> presentTargetDisplays{-1};
+    std::atomic<bool> displaysHidden{false};
+    std::atomic<bool> outputRunning{false};
+    std::atomic<UInt32> reportedLatencyFrames{0};
+    std::atomic<UInt64> statusGeneration{0};
+    std::atomic<bool> statusNotificationScheduled{false};
+    std::atomic<double> lastColdStartMilliseconds{0};
+    uint64_t reportedDroppedDiagnostics = 0;
+
     UInt32 gPlugIn_RefCount = 0;
     AudioServerPlugInHostRef gPlugIn_Host = NULL;
     Boolean gBox_Acquired = true;
-    // Render callbacks must never wait for configuration/storage under stateMutex.
     static_assert(__atomic_always_lock_free(sizeof(Float64), nullptr), "Sample rate must be lock-free");
     static_assert(__atomic_always_lock_free(sizeof(Float32), nullptr), "Volume must be lock-free");
     static_assert(__atomic_always_lock_free(sizeof(bool), nullptr), "Mute must be lock-free");
-    std::atomic<Float64> gDevice_SampleRate{44100.0};
-    std::vector<Float64> gDevice_SampleRates = {22050, 44100, 48000, 88200, 96000, 176400, 192000};
+    std::atomic<Float64> gDevice_SampleRate{48000.0};
     UInt64 gDevice_IOIsRunning = 0;
-    const UInt32 kDevice_RingBufferSize = 16384;
-    Float64 gDevice_HostTicksPerFrame = 0.0;
-    UInt64 gDevice_NumberTimeStamps = 0;
-    Float64 gDevice_AnchorSampleTime = 0.0;
-    Float64 gDevice_ElapsedTicks = 0.0;
-    UInt64 gDevice_AnchorHostTime = 0;
+    const UInt32 kDevice_ZeroTimeStampPeriod = 16384;
     bool gStream_Output_IsActive = true;
     const Float32 kVolume_MinDB = -63.5;
     const Float32 kVolume_MaxDB = 0.0;

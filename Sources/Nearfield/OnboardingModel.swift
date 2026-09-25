@@ -250,7 +250,9 @@ final class OnboardingModel: ObservableObject {
     @Published var showMenubarApp = true
     @Published var balance: Double = 0
     @Published var driverInstalled = false
+    @Published var driverUpdateAvailable = false
     @Published var isInstallingDriver = false
+    @Published var isRemovingDriver = false
     @Published var driverInstallState: DriverInstallState = .idle
     @Published var nearfieldDriverSelected = false
     @Published var appVersionText = "Version 0.1.0"
@@ -279,6 +281,9 @@ final class OnboardingModel: ObservableObject {
     private var displayIdentificationTask: Task<Void, Never>?
     private var spatialRoutingActivityTask: Task<Void, Never>?
     private var isWindowVisible = false
+    /// Title and icon per bundle ID while this window exists: refreshes run
+    /// on every audio change, and routing rules also name helper apps.
+    private var spatialRoutingAppCache: [String: SpatialRoutingApp] = [:]
     private var installScenario: OnboardingInstallScenario = .smooth
     private var allowsMissingStudioDisplaysForLiveInstall = false
 
@@ -302,9 +307,11 @@ final class OnboardingModel: ObservableObject {
         balance = Double(delegate.settingsBalance())
         let installingDriver = delegate.settingsIsInstallingDriver()
         isInstallingDriver = installingDriver
+        isRemovingDriver = delegate.settingsIsRemovingDriver()
         driverInstallState = delegate.settingsDriverInstallState()
         if !installingDriver {
             driverInstalled = delegate.settingsDriverInstalled()
+            driverUpdateAvailable = delegate.settingsDriverUpdateAvailable()
             nearfieldDriverSelected = delegate.settingsNearfieldDriverSelected()
             let liveDisplays = DisplayEndpointVisibility.visibleDevices(
                 from: delegate.settingsDevices(),
@@ -328,7 +335,6 @@ final class OnboardingModel: ObservableObject {
             bundleIDs: delegate.settingsAppRoutingAppBundleIDs(),
             rawRules: delegate.settingsRoutingRules()
         )
-        reconcileSpatialRoutingAliasesIfNeeded(rawRules: delegate.settingsRoutingRules())
         updateSpatialRoutingActivityRefresh()
         if shouldRefreshSpatialRoutingActivity {
             refreshSpatialRoutingActivity(animated: false)
@@ -773,13 +779,11 @@ final class OnboardingModel: ObservableObject {
                       !spatialRoutingApps.contains(where: { $0.bundleIdentifier == bundleIdentifier }) else {
                     return nil
                 }
+                // Helper apps are found by Nearfield once the rules change.
                 return SpatialRoutingApp(
                     title: Self.appTitle(url: url),
                     bundleIdentifier: bundleIdentifier,
-                    routingBundleIdentifiers: Self.routingBundleIdentifiers(
-                        for: url,
-                        primaryBundleIdentifier: bundleIdentifier
-                    ),
+                    routingBundleIdentifiers: routingBundleIdentifiers(for: bundleIdentifier),
                     icon: Self.appIcon(url: url),
                     isEnabled: true,
                     activeChannel: nil,
@@ -822,6 +826,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return "Installing"
         }
+        if driverUpdateAvailable { return "Update available" }
         return driverInstalled ? "Installed" : "Missing"
     }
 
@@ -829,6 +834,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return "arrow.triangle.2.circlepath"
         }
+        if driverUpdateAvailable { return "arrow.down.circle.fill" }
         return driverInstalled ? "checkmark.seal.fill" : "xmark.circle.fill"
     }
 
@@ -836,6 +842,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return .blue
         }
+        if driverUpdateAvailable { return .blue }
         return driverInstalled ? .green : .yellow
     }
 
@@ -843,6 +850,7 @@ final class OnboardingModel: ObservableObject {
         if isInstallingDriver {
             return "Installing"
         }
+        if driverUpdateAvailable { return "Update" }
         return driverInstalled ? "Reinstall" : "Install"
     }
 
@@ -1185,7 +1193,13 @@ final class OnboardingModel: ObservableObject {
         }
 
         for bundleID in orderedIDs where appsByID[bundleID] == nil {
-            appsByID[bundleID] = Self.spatialRoutingApp(bundleIdentifier: bundleID)
+            appsByID[bundleID] = spatialRoutingApp(bundleIdentifier: bundleID)
+        }
+        for (bundleID, app) in appsByID {
+            let identifiers = routingBundleIdentifiers(for: bundleID)
+            if app.routingBundleIdentifiers != identifiers {
+                appsByID[bundleID]?.routingBundleIdentifiers = identifiers
+            }
         }
         let knownAliasBundleIDs = Set(appsByID.values.flatMap { app in
             app.routingBundleIdentifiers.filter { $0 != app.bundleIdentifier }
@@ -1214,31 +1228,6 @@ final class OnboardingModel: ObservableObject {
         }
     }
 
-    private func reconcileSpatialRoutingAliasesIfNeeded(rawRules: String) {
-        guard let delegate else { return }
-        let parsedRules = AppRoutingRules.parse(rawRules)
-        var nextRules = rawRules
-
-        for app in spatialRoutingApps where app.isEnabled {
-            guard parsedRules.contains(where: {
-                $0.bundleID == app.bundleIdentifier &&
-                    AppRoutingRules.isWindowScopedDestination($0.destination)
-            }) else {
-                continue
-            }
-            nextRules = AppRoutingRules.settingApp(
-                primaryBundleID: app.bundleIdentifier,
-                aliasBundleIDs: app.routingBundleIdentifiers.filter { $0 != app.bundleIdentifier },
-                enabled: true,
-                in: nextRules
-            )
-        }
-
-        if nextRules != rawRules {
-            delegate.settingsSetRoutingRules(nextRules)
-        }
-    }
-
     private func persistSpatialRoutingAppBundleIDs() {
         delegate?.settingsSetAppRoutingAppBundleIDs(spatialRoutingApps.map(\.bundleIdentifier))
     }
@@ -1255,19 +1244,34 @@ final class OnboardingModel: ObservableObject {
         refreshFromDelegate()
     }
 
-    private static func spatialRoutingApp(bundleIdentifier: String) -> SpatialRoutingApp {
+    private func spatialRoutingApp(bundleIdentifier: String) -> SpatialRoutingApp {
+        if var cached = spatialRoutingAppCache[bundleIdentifier] {
+            cached.routingBundleIdentifiers = routingBundleIdentifiers(for: bundleIdentifier)
+            cached.isEnabled = true
+            cached.activeChannel = nil
+            return cached
+        }
+        let app = makeSpatialRoutingApp(bundleIdentifier: bundleIdentifier)
+        spatialRoutingAppCache[bundleIdentifier] = app
+        return app
+    }
+
+    private func makeSpatialRoutingApp(bundleIdentifier: String) -> SpatialRoutingApp {
         let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
         return SpatialRoutingApp(
-            title: url.map { appTitle(url: $0) } ?? bundleIdentifier,
+            title: url.map { Self.appTitle(url: $0) } ?? bundleIdentifier,
             bundleIdentifier: bundleIdentifier,
-            routingBundleIdentifiers: url.map {
-                routingBundleIdentifiers(for: $0, primaryBundleIdentifier: bundleIdentifier)
-            } ?? ([bundleIdentifier] + AppRoutingAliases.aliasBundleIDs(for: bundleIdentifier)).uniquePreservingOrder(),
-            icon: url.map { appIcon(url: $0) } ?? fallbackAppIcon(),
+            routingBundleIdentifiers: routingBundleIdentifiers(for: bundleIdentifier),
+            icon: url.map { Self.appIcon(url: $0) } ?? Self.fallbackAppIcon(),
             isEnabled: true,
             activeChannel: nil,
             url: url
         )
+    }
+
+    private func routingBundleIdentifiers(for bundleIdentifier: String) -> [String] {
+        delegate?.settingsRoutingBundleIdentifiers(for: bundleIdentifier) ??
+            ([bundleIdentifier] + AppRoutingAliases.aliasBundleIDs(for: bundleIdentifier)).uniquePreservingOrder()
     }
 
     private static func appTitle(url: URL) -> String {
@@ -1275,45 +1279,7 @@ final class OnboardingModel: ObservableObject {
     }
 
     private static func appIcon(url: URL) -> NSImage {
-        let image = NSWorkspace.shared.icon(forFile: url.path)
-        image.size = NSSize(width: 24, height: 24)
-        return image
-    }
-
-    private static func routingBundleIdentifiers(
-        for appURL: URL,
-        primaryBundleIdentifier: String
-    ) -> [String] {
-        let bundleExtensions = Set(["app", "xpc"])
-        var bundleIdentifiers = [primaryBundleIdentifier]
-        let searchRoots = [
-            appURL.appendingPathComponent("Contents/Frameworks"),
-            appURL.appendingPathComponent("Contents/Helpers"),
-            appURL.appendingPathComponent("Contents/XPCServices"),
-            appURL.appendingPathComponent("Contents/PlugIns"),
-            appURL.appendingPathComponent("Contents/Library/LoginItems")
-        ]
-
-        for root in searchRoots where FileManager.default.fileExists(atPath: root.path) {
-            guard let enumerator = FileManager.default.enumerator(
-                at: root,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) else {
-                continue
-            }
-
-            for case let url as URL in enumerator {
-                guard bundleExtensions.contains(url.pathExtension.lowercased()) else { continue }
-                if let bundleIdentifier = Bundle(url: url)?.bundleIdentifier {
-                    bundleIdentifiers.append(bundleIdentifier)
-                }
-                enumerator.skipDescendants()
-            }
-        }
-
-        bundleIdentifiers.append(contentsOf: AppRoutingAliases.aliasBundleIDs(for: primaryBundleIdentifier))
-        return bundleIdentifiers.uniquePreservingOrder()
+        AppIconThumbnail.make(from: NSWorkspace.shared.icon(forFile: url.path))
     }
 
     private static func fallbackAppIcon() -> NSImage {

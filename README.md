@@ -20,6 +20,27 @@ Apple Studio Displays into one volume-controllable stereo output.
   both displays, or mute.
 - Includes an optional Wave Lab visualization and can launch at login.
 
+Connecting the second Studio Display automatically selects Nearfield as the
+Mac's sound output. You can select another output afterward; Nearfield switches
+back automatically when the display pair is disconnected and reconnected.
+Automatic selection waits for the driver's display route to be ready. On macOS
+14.2 or later, Nearfield also checks active audio processes without an app allowlist
+and attempts one output re-selection per connection if playback stays on the
+previous device. Monitoring includes apps that start playback later, even when
+another app has already switched successfully. Apps with their own explicit output
+setting keep that setting; recovery only changes the Mac's default output.
+Choosing another output cancels the handoff. This requires audio driver 1.1.0
+or later; older installations are offered the bundled driver update.
+
+Nearfield plays through the displays at full hardware volume and controls the
+level itself. It never raises a display that another app is playing on
+directly: until that app stops, the display keeps its volume and Nearfield's
+volume makes up the difference.
+
+When fewer than two Studio Displays remain connected for about a second, the
+driver hides the Nearfield output, even when the app is not running. Nearfield
+reports its measured output latency to macOS, so apps can keep video in sync.
+
 Nearfield is an early-stage project. App and per-window routing are experimental,
 and macOS may expose several windows from one app as a single audio process. In
 that case, Nearfield cannot split those windows into separate audio streams.
@@ -27,10 +48,13 @@ Window following keeps tracking the established window when another window from
 the same process opens or moves. If several windows already exist when routing
 starts, it initially chooses the largest visible window. It chooses a new window
 when the tracked window is no longer visible; it cannot detect playback switching
-between windows that share an audio process.
+between windows that share an audio process. Sound follows a window moved to the
+other display within two seconds, and right away when playback starts, an app
+comes to the front, or the Space or screens change.
 
 ## Requirements
 
+- A Mac with Apple silicon (Intel Macs are not supported)
 - macOS 14 Sonoma or later
 - Two Apple Studio Displays connected to the same Mac
 - Xcode with the macOS SDK and command-line tools
@@ -75,9 +99,15 @@ Useful scripts:
 | `./script/build_and_run.sh` | Build and launch the development app |
 | `./script/build_and_run.sh --debug` | Build and run under LLDB |
 | `./script/build_router_driver.sh` | Build the vendored HAL driver |
+| `./script/install_router_driver.sh --diagnostics` | Install a driver that logs underrun and timing records |
+| `./script/driver_diagnostics_report.py --last 1d` | Summarize the driver's diagnostic records |
+| `swift script/nearfield_driver_status.swift --watch` | Show the driver's status as it changes |
+| `swift script/nearfield_driver_status.swift --soak 120` | Count underruns over two hours of playback |
+| `swift script/measure_latency.swift` | Measure end-to-end latency with a Studio Display microphone |
+| `./script/measure_app_footprint.sh` | Measure the app's memory and idle CPU |
 
-The Metal toolchain is optional. Without it, Wave Lab uses its SwiftUI
-fallback. Xcode can install it with:
+Building the app requires the Metal toolchain, for the Settings header and
+Wave Lab effects. Xcode can install it with:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
