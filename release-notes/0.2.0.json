@@ -7,6 +7,7 @@
     "Hide the Nearfield output when fewer than two Studio Displays are connected, even while the app is not running.",
     "When the displays disconnect, return sound to the previous output or the built-in speakers.",
     "Never make an app playing directly on a Studio Display louder when Nearfield takes over; the display's volume changes once that app stops.",
+    "Settings uses the current macOS look again, and displays can be dragged to rearrange them.",
     "Nearfield now requires a Mac with Apple silicon."
   ]
 }

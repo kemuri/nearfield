@@ -42,11 +42,18 @@ SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
 mkdir -p "$SWIFT_MODULE_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$SWIFT_MODULE_CACHE_DIR"
 
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+
 SWIFT_BUILD_ARGUMENTS=(
   build
   --disable-sandbox
   --scratch-path "$SWIFT_BUILD_DIR"
   -c "$BUILD_CONFIGURATION"
+  # Swift Build, SwiftPM's default build system since Swift 6.4, records the
+  # deployment target as the SDK version. macOS then runs Nearfield in
+  # compatibility mode: old-style controls, and a Settings window that never
+  # becomes key, so its display tiles cannot be dragged.
+  -Xlinker -platform_version -Xlinker macos -Xlinker "$MIN_SYSTEM_VERSION" -Xlinker "$SDK_VERSION"
 )
 if [[ "$LAUNCH_DIAGNOSTICS" == "1" ]]; then
   SWIFT_BUILD_ARGUMENTS+=(-Xswiftc -DNEARFIELD_LAUNCH_DIAGNOSTICS)
@@ -58,6 +65,11 @@ BUILD_BINARY="$BUILD_BIN_DIR/$PRODUCT_NAME"
 # Nearfield supports Apple silicon only; its driver is built for arm64 only.
 if [[ "$(lipo -archs "$BUILD_BINARY")" != "arm64" ]]; then
   echo "Nearfield must be built for arm64 only; got: $(lipo -archs "$BUILD_BINARY")" >&2
+  exit 1
+fi
+BUILT_SDK_VERSION="$(vtool -show-build "$BUILD_BINARY" | awk '$1 == "sdk" { print $2; exit }')"
+if [[ "$BUILT_SDK_VERSION" != "$SDK_VERSION" ]]; then
+  echo "Nearfield must record the macOS $SDK_VERSION SDK it was built with; got: ${BUILT_SDK_VERSION:-none}" >&2
   exit 1
 fi
 
