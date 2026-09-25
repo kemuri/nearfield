@@ -131,13 +131,14 @@ Measured on the two-Studio-Display Mac on 2026-09-24, with driver 1.1.0
 | Driver Core Audio requests while playing | 0 (only on device changes) |
 | Access control (`--probe-write`) | Other processes rejected; the signed app configures the driver |
 | App CPU, no window, Nearfield playing | 0.09% |
-| App CPU, Settings open | 0.47% (about 12% for the first minutes after launch) |
+| App CPU, Settings open | 19-26% while the window is on screen: the animated header redraws every frame. 0.47% while it is covered (the header pauses) |
 | App memory, no window (after Settings was open and closed) | 43.0 MB (0.1.39: 45 MB; target ~20 MB not met). Live heap 13.6 MB, down from 26 MB while Settings was open; leaks under 3 KB |
 | App CPU, no window, idle | 0.12% |
 | End-to-end latency (`measure_latency.swift`, from Terminal) | Nearfield measured 58.8 ms vs 56.2 ms reported (+2.6 ms); one display directly measured 23.3 ms vs 22.0 ms reported (+1.3 ms, the method's own offset). Nearfield under-reports by about 1.3 ms. With the cold-start skip and 2-minute keep-alive: 54.1 ms measured vs 52.3 ms reported (+1.8 ms, about 0.5 ms under) |
 | Driver update from a signed local build (19:23) | Installed with a verified Developer ID signature; settings and diagnostics kept; the signed app configures it; other processes are still rejected |
 | 2-hour soak, 88.2 kHz, inaudible tone | Passed: 0 underruns, 0 overruns, 0 writer gaps; no cold-start drain (latency 38.2 ms from the start) |
 | 2-hour soak, 96 kHz, inaudible tone | Passed: 0 underruns, 0 overruns; the rate switches to and from 96 kHz restored 48 kHz afterwards |
+| SDK recorded in the app (`vtool -show-build`) | 27.0 since 2026-09-25. Builds with Swift 6.4 recorded 14.0, including the public 0.1.39: macOS ran Nearfield in compatibility mode, with old-style controls and a Settings window that never became key, so display tiles could not be dragged. The build now fails if the SDK is wrong |
 | Reported latency over long playback | Wanders within about 4 ms (38.2-42.2 ms at 88.2 kHz, 36.4-40.4 ms at 96 kHz), less than one output buffer, as the two clocks' buffer timing slides; it does not keep growing. Measured with clicks at 96 kHz 90 minutes apart: 41.0 and 40.3 ms against 40.4 and 38.4 ms reported, within about 1 ms after the method's offset |
 
 Found and fixed during these runs: steering rebuilt the cold-start delay
