@@ -1,8 +1,8 @@
 # Testing 0.2.0 before release
 
-0.2.0 ships with driver 1.1.0 and goes to everyone at once, after a few days of
-testing on real hardware. Only claim improvements in the release notes that the
-measurements below confirm.
+0.2.0 ships as 0.2.3 (0.2.1 and 0.2.2 were local builds) with driver 1.1.0 and
+goes to everyone at once, after a few days of testing on real hardware. Only
+claim improvements in the release notes that the measurements below confirm.
 
 ## 1. Baseline with 0.1.39
 
@@ -152,4 +152,4 @@ displays now keep running 2 minutes after the last sound, instead of 5 seconds).
 
 ## 6. Rollback
 
-Ship 0.2.1 with driver 1.1.1. Never reuse a driver version for changed driver code.
+Ship 0.2.4 with driver 1.1.1. Never reuse a driver version for changed driver code.
