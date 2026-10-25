@@ -115,6 +115,26 @@ final class RouterAudioDriverManager {
         }
     }
 
+    /// Lets the displays' own volume follow Nearfield's (driver 1.2.0 and
+    /// later), or hands the volume back to Nearfield's audio path. Returns
+    /// false for older drivers, whose displays play at full volume instead.
+    @discardableResult
+    func setHardwareDisplayVolume(_ enabled: Bool) throws -> Bool {
+        guard let boxID = routerBoxID() else {
+            throw RouterAudioDriverError.notInstalled
+        }
+        guard hasSettingsProperty(boxID: boxID),
+              let status = readStatus(boxID: boxID),
+              status.supportsHardwareDisplayVolume else {
+            return false
+        }
+        let mode = enabled ? "hardware" : "software"
+        if status.displayVolume != mode {
+            try sendChanges(["displayVolume": mode], boxID: boxID)
+        }
+        return true
+    }
+
     /// Resolved rules may contain window-following process routes, which a
     /// 1.1 driver applies on its next audio cycle without saving them.
     func setRouteRules(_ rules: String) throws {
@@ -415,10 +435,9 @@ final class RouterAudioDriverManager {
     /// Moves Nearfield's volume by |decibels| within its range, keeping
     /// |balance|. Returns the change actually applied.
     ///
-    /// Nearfield's driver maps its volume linearly in decibels across the
-    /// control's range. Core Audio does not pass the scalar/decibel conversion
-    /// properties through to the driver, so the mapping is computed here and
-    /// checked against the level the driver reports.
+    /// Core Audio does not pass the scalar/decibel conversion properties
+    /// through to the driver, so the mapping is computed here on the curve
+    /// that matches the level the driver reports (it changed in 1.2.0).
     func shiftBaseVolume(byDecibels decibels: Float32, balance: Float32) throws -> Float32 {
         guard decibels != 0 else { return 0 }
         guard let controls = volumeControlIDs(),
@@ -441,13 +460,34 @@ final class RouterAudioDriverManager {
         }
         let minimum = Float32(range.mMinimum)
         let span = Float32(range.mMaximum - range.mMinimum)
-        let current = minimum + base * span
-        guard abs(current - reported) < 0.5 else {
+        guard let curve = RouterVolumeCurve.matching(
+            scalar: base,
+            reportedDecibels: reported,
+            minimum: minimum,
+            span: span
+        ) else {
             throw RouterAudioDriverError.configurationFailed("volume in decibels", kAudioHardwareUnsupportedOperationError)
         }
+        let current = curve.decibels(forScalar: base, minimum: minimum, span: span)
         let target = min(max(current + decibels, minimum), minimum + span)
-        try setBalancedVolume((target - minimum) / span, balance: balance)
+        try setBalancedVolume(curve.scalar(forDecibels: target, minimum: minimum, span: span), balance: balance)
         return target - current
+    }
+
+    /// After an upgrade onto the display curve, sets the volume that plays
+    /// as loud as before; the slider then sits lower.
+    func keepVolumeLevelAfterCurveChange() throws {
+        guard let controls = volumeControlIDs() else {
+            throw RouterAudioDriverError.notInstalled
+        }
+        for (control, channel) in [(controls.left, "left"), (controls.right, "right")] {
+            guard let scalar = volumeControlValue(control) else { continue }
+            try setVolumeControl(
+                control,
+                value: RouterVolumeCurve.displayScalarKeepingLevel(ofLinearScalar: scalar),
+                channel: channel
+            )
+        }
     }
 
     func adjustVolume(by delta: Float32, balance: Float32) throws {

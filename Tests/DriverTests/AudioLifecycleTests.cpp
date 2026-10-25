@@ -13,6 +13,8 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <pthread.h>
 #include <random>
@@ -442,6 +444,167 @@ static void testRouteChangesCrossfade() {
     std::copy(f.samples, f.samples + kFrames * 2, settled);
     f.processOutput(1, settled, kFrames * 2);
     CHECK(allFrames(settled, 0.5f, 0.0f));
+}
+
+// MARK: Volume
+
+static void testVolumeCurveMatchesTheStudioDisplays() {
+    DriverFixture f;
+    // Measured on two Studio Displays: their volume control's decibels, which
+    // the hardware rounds to 0.5 dB.
+    const std::pair<Float32, Float32> display[] = {
+        {0.0625f, -47.5f}, {0.125f, -41.0f}, {0.25f, -31.5f}, {0.375f, -24.5f},
+        {0.5f, -18.5f},    {0.625f, -13.5f}, {0.75f, -8.5f},  {0.875f, -4.0f},
+        {1.0f, 0.0f},
+    };
+    for (const auto &point : display) {
+        const Float32 decibels = f.device.volumeScalarToDecibels(point.first);
+        CHECK(std::fabs(decibels - point.second) <= 0.5f);
+        CHECK(near(f.device.volumeDecibelsToScalar(decibels), point.first));
+        CHECK(near(f.device.volumeScalarToGain(point.first), std::pow(10.0f, decibels / 20.0f)));
+    }
+    CHECK(f.device.volumeScalarToDecibels(0) == -63.5f && f.device.volumeScalarToGain(0) == 0);
+
+    CFDictionarySmartRef status((CFDictionaryRef)f.copyBoxProperty(kNearfieldPropertyStatus));
+    CFArrayRef capabilities = (CFArrayRef)CFDictionaryGetValue(status, CFSTR("capabilities"));
+    CHECK(CFArrayContainsValue(capabilities, CFRangeMake(0, CFArrayGetCount(capabilities)), CFSTR("displayVolumeCurve")));
+}
+
+static CFStringRef stringValue(CFDictionaryRef dictionaryValue, CFStringRef key);
+
+struct FakeDisplayVolumes {
+    std::map<std::string, Float32> decibels;
+    int writes = 0;
+    bool failing = false;
+};
+
+static std::shared_ptr<FakeDisplayVolumes> fakeDisplayVolumes(DriverFixture &f) {
+    auto displays = std::make_shared<FakeDisplayVolumes>();
+    f.device.setDisplayDecibels = [displays](const std::string &uid, Float32 decibels) {
+        ++displays->writes;
+        if (displays->failing) {
+            return false;
+        }
+        displays->decibels[uid] = decibels;
+        return true;
+    };
+    return displays;
+}
+
+static void setNearfieldVolume(DriverFixture &f, AudioObjectID control, Float32 scalar) {
+    AudioObjectPropertyAddress address = {kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal,
+                                          kAudioObjectPropertyElementMain};
+    CHECK(f.device.SetPropertyData(gAudioServerPlugInDriverRef, control, getpid(), &address, 0, nullptr, sizeof(scalar),
+                                   &scalar) == noErr);
+    f.drain();
+}
+
+static void setDisplayVolumeMode(DriverFixture &f, CFStringRef mode) {
+    CFDictionarySmartRef update(dictionary({{nearfield::kSettingsDisplayVolumeKey, mode}}));
+    CHECK(f.applySettings(update) == noErr);
+}
+
+static void testHardwareDisplayVolumeFollowsNearfield() {
+    DriverFixture f;
+    auto displays = fakeDisplayVolumes(f);
+    CFArraySmartRef targets(strings({CFSTR("left-uid"), CFSTR("right-uid")}));
+    CFDictionarySmartRef configure(dictionary({{nearfield::kSettingsTargetDevicesKey, targets}}));
+    CHECK(f.applySettings(configure) == noErr);
+    f.start(1);
+    playUntilSteady(f);
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.5f);
+    setNearfieldVolume(f, kObjectID_Volume_Output_R, 0.25f);
+    const Float32 softwareLeft = 0.5f * f.device.volumeScalarToGain(0.5f);
+    const Float32 softwareRight = 0.5f * f.device.volumeScalarToGain(0.25f);
+
+    // Software (the default): the displays are left alone, the audio is attenuated.
+    f.cycleOnce();
+    f.cycleOnce();
+    CHECK(displays->writes == 0);
+    CHECK(allFrames(f.output, softwareLeft, softwareRight));
+
+    // Hardware: each display takes its channel's volume, the audio plays at unity.
+    setDisplayVolumeMode(f, CFSTR("hardware"));
+    CHECK(near(displays->decibels["left-uid"], f.device.volumeScalarToDecibels(0.5f)));
+    CHECK(near(displays->decibels["right-uid"], f.device.volumeScalarToDecibels(0.25f)));
+    CHECK(f.device.hardwareVolumeActive.load());
+    f.cycleOnce();
+    f.cycleOnce();
+    CHECK(allFrames(f.output, 0.5f, 0.5f));
+
+    // Volume changes reach the displays; silence and mute stay in the audio path.
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.75f);
+    CHECK(near(displays->decibels["left-uid"], f.device.volumeScalarToDecibels(0.75f)));
+    setNearfieldVolume(f, kObjectID_Volume_Output_R, 0.0f);
+    f.cycleOnce();
+    f.cycleOnce();
+    CHECK(allFrames(f.output, 0.5f, 0.0f));
+    f.device.gMute_Output_Mute = true;
+    f.cycleOnce();
+    f.cycleOnce();
+    CHECK(allFrames(f.output, 0.0f, 0.0f));
+    f.device.gMute_Output_Mute = false;
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.5f);
+    setNearfieldVolume(f, kObjectID_Volume_Output_R, 0.25f);
+
+    // A display that cannot be set: the audio is attenuated again.
+    displays->failing = true;
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.4f);
+    CHECK(!f.device.hardwareVolumeActive.load());
+    f.cycleOnce();
+    f.cycleOnce();
+    CHECK(allFrames(f.output, 0.5f * f.device.volumeScalarToGain(0.4f), softwareRight));
+    displays->failing = false;
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.5f);
+    CHECK(f.device.hardwareVolumeActive.load());
+
+    // Saved and reported.
+    CFDictionaryRef saved = NULL;
+    fakeCopyFromStorage(&gFakeHost, CFSTR("settings"), (CFPropertyListRef *)&saved);
+    CHECK(saved && CFEqual(stringValue(saved, nearfield::kSettingsDisplayVolumeKey), CFSTR("hardware")));
+    CFRelease(saved);
+    {
+        CFDictionarySmartRef status((CFDictionaryRef)f.copyBoxProperty(kNearfieldPropertyStatus));
+        CHECK(CFEqual(stringValue(status, CFSTR("displayVolume")), CFSTR("hardware")));
+        CHECK(CFDictionaryGetValue(status, CFSTR("displayVolumeApplied")) == kCFBooleanTrue);
+        CFArrayRef capabilities = (CFArrayRef)CFDictionaryGetValue(status, CFSTR("capabilities"));
+        CHECK(CFArrayContainsValue(capabilities, CFRangeMake(0, CFArrayGetCount(capabilities)), CFSTR("hardwareDisplayVolume")));
+    }
+
+    // Back to software: the audio is attenuated before the settings call
+    // returns, before Nearfield puts the displays' own volume back.
+    dispatch_suspend(f.device.audioOutputQueue);
+    nearfield::SettingsUpdate software;
+    software.hardwareDisplayVolume = false;
+    CHECK(f.device.applySettings(software, getpid()) == noErr);
+    CHECK(!f.device.hardwareVolumeActive.load());
+    dispatch_resume(f.device.audioOutputQueue);
+    f.drain();
+    const int writes = displays->writes;
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.6f);
+    CHECK(displays->writes == writes);
+    f.cycleOnce();
+    f.cycleOnce();
+    CHECK(allFrames(f.output, 0.5f * f.device.volumeScalarToGain(0.6f), softwareRight));
+
+    CFDictionarySmartRef invalid(dictionary({{nearfield::kSettingsDisplayVolumeKey, CFSTR("loud")}}));
+    CHECK(f.applySettings(invalid) != noErr);
+}
+
+static void testHardwareDisplayVolumeWithThreeDisplays() {
+    DriverFixture f;
+    auto displays = fakeDisplayVolumes(f);
+    CFArraySmartRef targets(strings({CFSTR("left-uid"), CFSTR("center-uid"), CFSTR("right-uid")}));
+    CFDictionarySmartRef configure(dictionary({{nearfield::kSettingsTargetDevicesKey, targets},
+                                               {nearfield::kSettingsDisplayVolumeKey, CFSTR("hardware")}}));
+    CHECK(f.applySettings(configure) == noErr);
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.3f);
+    setNearfieldVolume(f, kObjectID_Volume_Output_R, 0.6f);
+    // The center display plays both channels, at the louder one's volume.
+    CHECK(near(displays->decibels["left-uid"], f.device.volumeScalarToDecibels(0.3f)));
+    CHECK(near(displays->decibels["center-uid"], f.device.volumeScalarToDecibels(0.6f)));
+    CHECK(near(displays->decibels["right-uid"], f.device.volumeScalarToDecibels(0.6f)));
+    CHECK(f.device.hardwareVolumeActive.load());
 }
 
 // MARK: Output
@@ -1345,6 +1508,9 @@ int main(int argc, char **argv) {
         {"closing silent Safari client", testClosingSilentSafariClientPreservesPlayingHelper, false, false},
         {"routing toggle affects playing audio", testRoutingToggleAffectsAudioAlreadyPlaying, false, false},
         {"route changes crossfade", testRouteChangesCrossfade, false, false},
+        {"volume curve matches the Studio Displays", testVolumeCurveMatchesTheStudioDisplays, false, false},
+        {"hardware display volume follows Nearfield", testHardwareDisplayVolumeFollowsNearfield, false, false},
+        {"hardware display volume with three displays", testHardwareDisplayVolumeWithThreeDisplays, false, false},
         {"render never waits for the state mutex", testRenderDoesNotWaitForConfigurationMutex, true, false},
         {"volume, mute and balance are smoothed", testVolumeMuteAndBalanceAreSmoothed, false, false},
         {"cold start skips to the newest audio", testColdStartSkipsToTheNewestAudio, false, false},

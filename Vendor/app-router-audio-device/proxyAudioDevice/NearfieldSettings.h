@@ -8,6 +8,8 @@
 //   deviceName              string
 //   targetDevices           array of device UIDs (2 or 3, left to right)
 //   targetMode              "stereo" | "mono"
+//   displayVolume           "software" | "hardware": "hardware" sets the
+//                           displays' own volume to Nearfield's (saved)
 //   routingEnabled          boolean
 //   routeRules              "bundle.id=left; other.id=right" (saved)
 //   processRoutes           { "<pid>": "left" | "right" | "pair" | "muted" } (never saved)
@@ -40,6 +42,7 @@ inline const CFStringRef kSettingsVersionKey = CFSTR("version");
 inline const CFStringRef kSettingsDeviceNameKey = CFSTR("deviceName");
 inline const CFStringRef kSettingsTargetDevicesKey = CFSTR("targetDevices");
 inline const CFStringRef kSettingsTargetModeKey = CFSTR("targetMode");
+inline const CFStringRef kSettingsDisplayVolumeKey = CFSTR("displayVolume");
 inline const CFStringRef kSettingsRoutingEnabledKey = CFSTR("routingEnabled");
 inline const CFStringRef kSettingsRouteRulesKey = CFSTR("routeRules");
 inline const CFStringRef kSettingsProcessRoutesKey = CFSTR("processRoutes");
@@ -174,6 +177,7 @@ struct DriverSettings {
     std::string deviceName = "Nearfield";
     std::vector<std::string> targetDevices;
     bool stereo = true;
+    bool hardwareDisplayVolume = false;
     bool routingEnabled = false;
     std::string routeRules;
     uint32_t outputBufferFrameSize = kDefaultOutputBufferFrameSize;
@@ -191,6 +195,7 @@ struct SettingsUpdate {
     std::optional<std::string> deviceName;
     std::optional<std::vector<std::string>> targetDevices;
     std::optional<bool> stereo;
+    std::optional<bool> hardwareDisplayVolume;
     std::optional<bool> routingEnabled;
     std::optional<std::string> routeRules;
     std::optional<std::map<pid_t, Route>> processRoutes;
@@ -202,7 +207,7 @@ struct SettingsUpdate {
     std::optional<int> activeCondition;
 
     bool isEmpty() const {
-        return !deviceName && !targetDevices && !stereo && !routingEnabled && !routeRules && !processRoutes &&
+        return !deviceName && !targetDevices && !stereo && !hardwareDisplayVolume && !routingEnabled && !routeRules && !processRoutes &&
                !outputBufferFrameSize && !underrunStrategy && !safetyGapMilliseconds && !diagnostics &&
                !outputDeviceUID && !activeCondition;
     }
@@ -324,6 +329,13 @@ inline bool parseSettingsUpdate(CFDictionaryRef dictionary, SettingsUpdate &upda
         if (!stringFromCFValue(value, text)) return false;
         update.stereo = lowercased(trimmed(text)) != "mono";
     }
+    if ((value = CFDictionaryGetValue(dictionary, kSettingsDisplayVolumeKey))) {
+        if (!stringFromCFValue(value, text)) return false;
+        const std::string mode = lowercased(trimmed(text));
+        if (mode == "hardware") update.hardwareDisplayVolume = true;
+        else if (mode == "software") update.hardwareDisplayVolume = false;
+        else return false;
+    }
     if ((value = CFDictionaryGetValue(dictionary, kSettingsRoutingEnabledKey))) {
         bool enabled = false;
         if (!booleanFromCF(value, enabled)) return false;
@@ -404,6 +416,7 @@ enum SettingsChange : uint32_t {
     kChangedPlayback = 1u << 5,
     kChangedDiagnostics = 1u << 6,
     kChangedOutputDevice = 1u << 7,
+    kChangedDisplayVolume = 1u << 8,
 };
 
 // Applies |update| to |settings| and returns what changed.
@@ -421,6 +434,10 @@ inline uint32_t applySettingsUpdate(DriverSettings &settings, std::map<pid_t, Ro
     if (update.stereo && *update.stereo != settings.stereo) {
         settings.stereo = *update.stereo;
         changes |= kChangedTargets;
+    }
+    if (update.hardwareDisplayVolume && *update.hardwareDisplayVolume != settings.hardwareDisplayVolume) {
+        settings.hardwareDisplayVolume = *update.hardwareDisplayVolume;
+        changes |= kChangedDisplayVolume;
     }
     if (update.routingEnabled && *update.routingEnabled != settings.routingEnabled) {
         settings.routingEnabled = *update.routingEnabled;
@@ -522,6 +539,7 @@ inline CFDictionaryRef createPersistentSettings(const DriverSettings &settings) 
     setDictionaryString(dictionary, kSettingsDeviceNameKey, settings.deviceName);
     setDictionaryStrings(dictionary, kSettingsTargetDevicesKey, settings.targetDevices);
     setDictionaryString(dictionary, kSettingsTargetModeKey, settings.stereo ? "stereo" : "mono");
+    setDictionaryString(dictionary, kSettingsDisplayVolumeKey, settings.hardwareDisplayVolume ? "hardware" : "software");
     CFDictionarySetValue(dictionary, kSettingsRoutingEnabledKey, settings.routingEnabled ? kCFBooleanTrue : kCFBooleanFalse);
     setDictionaryString(dictionary, kSettingsRouteRulesKey, settings.routeRules);
     setDictionaryInteger(dictionary, kSettingsOutputBufferFrameSizeKey, settings.outputBufferFrameSize);

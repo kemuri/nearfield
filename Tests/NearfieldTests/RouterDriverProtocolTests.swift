@@ -376,17 +376,22 @@ final class RouterOutputActivationTests: XCTestCase {
         var otherPlayback: Set<String> = []
         var failing: String?
         var savedCompensation: Float32 = 0
+        /// Driver 1.2.0: raising hands the displays' volume to Nearfield.
+        var raiseFollows = false
+        /// The displays play at Nearfield's volume; the audio is not attenuated.
+        var following = false
         private(set) var loudestNearfield: Float32 = -.infinity
         private(set) var loudestDisplay: Float32 = -.infinity
 
-        var nearfieldLevel: Float32 { routerDecibels + displayDecibels }
+        var nearfieldLevel: Float32 { following ? routerDecibels : routerDecibels + displayDecibels }
+        var displayLevel: Float32 { following ? routerDecibels : displayDecibels }
 
         func step(_ name: String, _ work: () -> Void = {}) throws {
             events.append(name)
             if failing == name { throw NearfieldError.notEnoughStudioDisplays(1) }
             work()
             if routerIsDefault { loudestNearfield = max(loudestNearfield, nearfieldLevel) }
-            loudestDisplay = max(loudestDisplay, displayDecibels)
+            loudestDisplay = max(loudestDisplay, displayLevel)
         }
 
         func makeActivation() -> RouterOutputActivation {
@@ -402,13 +407,88 @@ final class RouterOutputActivationTests: XCTestCase {
                     try self.step("shift") { self.routerDecibels = min(max(before + decibels, -63.5), 0) }
                     return self.routerDecibels - before
                 },
-                raiseDisplays: { try self.step("raise") { self.displayDecibels = 0 } },
-                restoreDisplays: { try self.step("restore") { self.displayDecibels = -30 } },
+                raiseDisplays: {
+                    try self.step("raise") {
+                        if self.raiseFollows { self.following = true } else { self.displayDecibels = 0 }
+                    }
+                },
+                releaseDisplayVolume: {
+                    try self.step("release") {
+                        // The displays keep the level they had.
+                        if self.following { self.displayDecibels = self.routerDecibels }
+                        self.following = false
+                    }
+                },
+                restoreDisplays: {
+                    try self.step("restore") {
+                        self.following = false
+                        self.displayDecibels = -30
+                    }
+                },
                 routerIsDefault: { self.routerIsDefault },
                 applyBalance: { try self.step("balance") },
                 saveWaitingCompensation: { self.savedCompensation = $0 }
             ))
         }
+    }
+
+    func testFollowingDisplaysPlayAtNearfieldsLevel() throws {
+        let displays = Displays()
+        displays.raiseFollows = true
+        let activation = displays.makeActivation()
+
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        XCTAssertEqual(displays.events, ["capture", "volume", "select", "raise"])
+        XCTAssertTrue(displays.following)
+        XCTAssertEqual(displays.nearfieldLevel, -40)
+        XCTAssertLessThanOrEqual(displays.loudestNearfield, -40)
+        XCTAssertLessThanOrEqual(displays.loudestDisplay, -30)
+    }
+
+    func testDisplaysStillFollowingAreReleasedBeforeWaiting() throws {
+        // After a Core Audio restart the driver still sets the displays to
+        // Nearfield's volume; raising Nearfield to make up for a waiting
+        // display would make that display louder.
+        let displays = Displays()
+        displays.raiseFollows = true
+        displays.following = true
+        displays.otherPlayback = ["left"]
+        let activation = displays.makeActivation()
+
+        try activation.activate(displayUIDs: ["left", "right"])
+
+        XCTAssertEqual(displays.events, ["capture", "volume", "select", "release", "shift"])
+        XCTAssertEqual(activation.waitingDisplayUIDs, ["left", "right"])
+        XCTAssertEqual(displays.nearfieldLevel, -40, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(displays.loudestNearfield, -40)
+        XCTAssertLessThanOrEqual(displays.loudestDisplay, -40)
+
+        displays.otherPlayback = []
+        try activation.raiseWaitingDisplaysIfFree()
+        XCTAssertTrue(displays.following)
+        XCTAssertEqual(displays.nearfieldLevel, -40, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(displays.loudestNearfield, -40)
+    }
+
+    func testStatusReportsHardwareDisplayVolume() throws {
+        let current = try XCTUnwrap(RouterDriverStatus(dictionary: [
+            "protocolVersion": 1,
+            "capabilities": ["settingsDictionary", "hardwareDisplayVolume"],
+            "displayVolume": "hardware",
+            "displayVolumeApplied": true
+        ]))
+        XCTAssertTrue(current.supportsHardwareDisplayVolume)
+        XCTAssertEqual(current.displayVolume, "hardware")
+        XCTAssertTrue(current.displayVolumeApplied)
+
+        let older = try XCTUnwrap(RouterDriverStatus(dictionary: [
+            "protocolVersion": 1,
+            "capabilities": ["settingsDictionary"]
+        ]))
+        XCTAssertFalse(older.supportsHardwareDisplayVolume)
+        XCTAssertEqual(older.displayVolume, "software")
+        XCTAssertFalse(older.displayVolumeApplied)
     }
 
     func testDisplaysAreRaisedOnlyAfterNearfieldIsSelected() throws {

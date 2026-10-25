@@ -6,6 +6,11 @@ struct RouterVolumeContinuity {
         lastKnownVolume = volume
     }
 
+    /// The remembered volume, moved onto the display curve with its level kept.
+    mutating func keepLevelAfterCurveChange() {
+        lastKnownVolume = lastKnownVolume.map(RouterVolumeCurve.displayScalarKeepingLevel(ofLinearScalar:))
+    }
+
     func activationVolume(
         currentRouterVolume: Float32?,
         capturedDisplayVolume: Float32?

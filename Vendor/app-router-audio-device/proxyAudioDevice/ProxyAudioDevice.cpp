@@ -4442,6 +4442,9 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
                     theAnswer = kAudioHardwareUnknownPropertyError;
                     break;
             };
+            if (theAnswer == 0 && *outNumberPropertiesChanged > 0) {
+                scheduleDisplayVolumeUpdate();
+            }
             break;
 
         case kObjectID_Mute_Output_Master:
@@ -4588,6 +4591,7 @@ void ProxyAudioDevice::handleDeviceListChange() {
     rebuildDriverOwnedTargetAggregate(false);
     setupTargetOutputDevice();
     refreshTargetOutputReadiness();
+    applyDisplayVolumes();
 }
 
 void ProxyAudioDevice::handleOutputDeviceChange(AudioObjectPropertySelector selector) {
@@ -4707,6 +4711,8 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     applyRequestedSampleRateToOutput(gDevice_SampleRate.load());
     matchOutputDeviceSampleRate();
     notifyLatencyChanged();
+    // The displays may have come back at another volume.
+    applyDisplayVolumes();
 }
 
 // Creating the IO callback can fail transiently, for example while Core Audio
@@ -5491,11 +5497,17 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     const UInt64 lateness = (inNow && now > inNow->mHostTime) ? now - inNow->mHostTime : 0;
     Float32 gainLeft = 1.0f;
     Float32 gainRight = 1.0f;
-    calculateVolumeFactors(gVolume_Output_L_Value.load(std::memory_order_relaxed),
-                           gVolume_Output_R_Value.load(std::memory_order_relaxed),
-                           gMute_Output_Mute.load(std::memory_order_relaxed),
-                           gainLeft,
-                           gainRight);
+    const Float32 volumeLeft = gVolume_Output_L_Value.load(std::memory_order_relaxed);
+    const Float32 volumeRight = gVolume_Output_R_Value.load(std::memory_order_relaxed);
+    const bool mute = gMute_Output_Mute.load(std::memory_order_relaxed);
+    if (hardwareVolumeActive.load(std::memory_order_relaxed)) {
+        // The displays play at Nearfield's volume; only silence is left to
+        // the audio path.
+        gainLeft = (mute || volumeLeft <= 0) ? 0.0f : 1.0f;
+        gainRight = (mute || volumeRight <= 0) ? 0.0f : 1.0f;
+    } else {
+        calculateVolumeFactors(volumeLeft, volumeRight, mute, gainLeft, gainRight);
+    }
     const bool hostTimeValid = inOutputTime && (inOutputTime->mFlags & kAudioTimeStampHostTimeValid);
     const Float64 rateScalar = (inOutputTime && (inOutputTime->mFlags & kAudioTimeStampRateScalarValid))
                                    ? inOutputTime->mRateScalar
@@ -5519,6 +5531,10 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     return noErr;
 }
 
+// The Studio Displays' own volume curve (measured on the displays): the
+// decibels rise with the square root of the volume. The same volume then plays
+// as loud on Nearfield as on a display alone. Drivers before 1.2.0 were linear
+// in decibels, 8 to 16 dB quieter across the usual range.
 Float32 ProxyAudioDevice::volumeScalarToDecibels(Float32 scalar) {
     if (scalar < 0.0) {
         scalar = 0.0;
@@ -5526,7 +5542,7 @@ Float32 ProxyAudioDevice::volumeScalarToDecibels(Float32 scalar) {
         scalar = 1.0;
     }
 
-    return kVolume_MinDB + (scalar * (kVolume_MaxDB - kVolume_MinDB));
+    return kVolume_MinDB + (sqrtf(scalar) * (kVolume_MaxDB - kVolume_MinDB));
 }
 
 Float32 ProxyAudioDevice::volumeDecibelsToScalar(Float32 db) {
@@ -5536,7 +5552,8 @@ Float32 ProxyAudioDevice::volumeDecibelsToScalar(Float32 db) {
         db = kVolume_MaxDB;
     }
 
-    return (db - kVolume_MinDB) / (kVolume_MaxDB - kVolume_MinDB);
+    const Float32 position = (db - kVolume_MinDB) / (kVolume_MaxDB - kVolume_MinDB);
+    return position * position;
 }
 
 Float32 ProxyAudioDevice::volumeScalarToGain(Float32 scalar) {
@@ -5549,6 +5566,90 @@ Float32 ProxyAudioDevice::volumeScalarToGain(Float32 scalar) {
 
     Float32 volumeDB = volumeScalarToDecibels(scalar);
     return powf(10.0, volumeDB / 20.0);
+}
+
+// Sets |uid|'s output volume in decibels, within its range: on its main
+// volume control, or on its first two channels without one.
+static bool setDeviceVolumeDecibels(const std::string &uid, Float32 decibels) {
+    const AudioObjectID device = audioObjectForUID(uid);
+    if (device == kAudioObjectUnknown) {
+        return false;
+    }
+    auto setElement = [&](AudioObjectPropertyElement element) -> std::optional<bool> {
+        AudioObjectPropertyAddress address = {kAudioDevicePropertyVolumeDecibels, kAudioObjectPropertyScopeOutput, element};
+        Boolean settable = false;
+        if (!AudioObjectHasProperty(device, &address) ||
+            AudioObjectIsPropertySettable(device, &address, &settable) != noErr || !settable) {
+            return std::nullopt;
+        }
+        AudioObjectPropertyAddress rangeAddress = {kAudioDevicePropertyVolumeRangeDecibels, kAudioObjectPropertyScopeOutput,
+                                                   element};
+        AudioValueRange range = {};
+        UInt32 size = sizeof(range);
+        Float32 value = decibels;
+        if (AudioObjectGetPropertyData(device, &rangeAddress, 0, nullptr, &size, &range) == noErr && range.mMaximum > range.mMinimum) {
+            value = std::max((Float32)range.mMinimum, std::min((Float32)range.mMaximum, value));
+        }
+        nearfield::countHALRequest();
+        return AudioObjectSetPropertyData(device, &address, 0, nullptr, sizeof(value), &value) == noErr;
+    };
+    if (const std::optional<bool> main = setElement(kAudioObjectPropertyElementMain)) {
+        return *main;
+    }
+    const std::optional<bool> left = setElement(1);
+    const std::optional<bool> right = setElement(2);
+    return left.value_or(false) && right.value_or(false);
+}
+
+void ProxyAudioDevice::scheduleDisplayVolumeUpdate() {
+    if (displayVolumeUpdatePending.exchange(true)) {
+        return;
+    }
+    ExecuteInAudioOutputThread(^{ applyDisplayVolumes(); });
+}
+
+// With hardware display volume (while Nearfield is the output and the
+// displays are prepared for it), each display plays at its channel's volume
+// in hardware and the audio path only mutes. Studio Displays add bass as their
+// own volume goes down; attenuating the audio instead, with the displays at
+// full volume, loses it. Runs on the audio output queue.
+void ProxyAudioDevice::applyDisplayVolumes() {
+    displayVolumeUpdatePending.store(false);
+    bool hardware = false;
+    std::vector<std::string> targets;
+    {
+        StateLocker locker(stateMutex);
+        hardware = settings.hardwareDisplayVolume;
+        targets = settings.targetDevices;
+    }
+    bool applied = false;
+    if (hardware && targets.size() >= 2) {
+        const Float32 left = gVolume_Output_L_Value.load(std::memory_order_relaxed);
+        const Float32 right = gVolume_Output_R_Value.load(std::memory_order_relaxed);
+        applied = true;
+        for (size_t index = 0; index < targets.size(); ++index) {
+            // Left to right; a center display plays both channels.
+            const Float32 volume = index == 0 ? left : (index == targets.size() - 1 ? right : std::max(left, right));
+            const Float32 decibels = volumeScalarToDecibels(volume);
+            const bool set = setDisplayDecibels ? setDisplayDecibels(targets[index], decibels)
+                                                : setDeviceVolumeDecibels(targets[index], decibels);
+            applied = applied && set;
+        }
+    }
+    // The audio path stops attenuating only once every display plays at
+    // Nearfield's volume: until then Nearfield is quieter, never louder.
+    // Checked under the lock that turning hardware volume off holds, so an
+    // update that was already running cannot undo it.
+    bool changed = false;
+    {
+        StateLocker locker(stateMutex);
+        applied = applied && settings.hardwareDisplayVolume;
+        changed = hardwareVolumeActive.exchange(applied) != applied;
+    }
+    if (changed) {
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: volume %s", applied ? "set on the displays" : "applied to the audio");
+        notifyStatusChanged();
+    }
 }
 
 void ProxyAudioDevice::calculateVolumeFactors(Float32 volumeL,
@@ -5711,6 +5812,11 @@ OSStatus ProxyAudioDevice::applySettings(const nearfield::SettingsUpdate &update
             effective.outputDeviceUID.reset();
         }
         changes = nearfield::applySettingsUpdate(settings, processRoutes, effective);
+        if ((changes & nearfield::kChangedDisplayVolume) && !settings.hardwareDisplayVolume) {
+            // Attenuate in the audio path again before Nearfield puts the
+            // displays' own volume back, so nothing gets louder.
+            hardwareVolumeActive.store(false);
+        }
         if (changes & nearfield::kChangedTargets) {
             ++targetConfigurationRevision;
             readyTargetConfigurationRevision.store(0);
@@ -5756,6 +5862,9 @@ void ProxyAudioDevice::applySettingsEffects(uint32_t changes) {
             appliedTargetConfigurationRevision.store(revision);
             refreshTargetOutputReadiness();
         });
+    }
+    if (changes & (nearfield::kChangedDisplayVolume | nearfield::kChangedTargets)) {
+        scheduleDisplayVolumeUpdate();
     }
     if (changes & nearfield::kChangedRouting) {
         StateLocker locker(stateMutex);
@@ -5886,7 +5995,8 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
     setDictionaryInteger(status, CFSTR("instance"), (int64_t)(initializedHostTime & 0x7fffffffffffffffULL));
     setDictionaryStrings(status, CFSTR("capabilities"),
                          {"driverOwnedTargetAggregate", "threeDisplayTargetAggregate", "targetOutputReadiness",
-                          "settingsDictionary", "statusNotifications", "processRoutes", "latencyReporting"});
+                          "settingsDictionary", "statusNotifications", "processRoutes", "latencyReporting",
+                          "displayVolumeCurve", "hardwareDisplayVolume"});
 
     const std::vector<Float64> rates = currentAvailableSampleRates();
     {
@@ -5899,6 +6009,7 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
         setDictionaryInteger(status, CFSTR("configurationRevision"), (int64_t)revision);
         setDictionaryStrings(status, CFSTR("targetDevices"), settings.targetDevices);
         setDictionaryString(status, CFSTR("targetMode"), settings.stereo ? "stereo" : "mono");
+        setDictionaryString(status, CFSTR("displayVolume"), settings.hardwareDisplayVolume ? "hardware" : "software");
         setDictionaryString(status, CFSTR("underrunStrategy"), underrunStrategyName(settings.underrunStrategy));
         CFDictionarySetValue(status, CFSTR("published"), gBox_Acquired ? kCFBooleanTrue : kCFBooleanFalse);
         setDictionaryInteger(status, CFSTR("ioClients"), (int64_t)gDevice_IOIsRunning);
@@ -5907,6 +6018,7 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
     setDictionaryInteger(status, CFSTR("displaysPresent"), presentTargetDisplays.load());
     CFDictionarySetValue(status, CFSTR("hidden"), displaysHidden.load() ? kCFBooleanTrue : kCFBooleanFalse);
     CFDictionarySetValue(status, CFSTR("outputRunning"), outputRunning.load() ? kCFBooleanTrue : kCFBooleanFalse);
+    CFDictionarySetValue(status, CFSTR("displayVolumeApplied"), hardwareVolumeActive.load() ? kCFBooleanTrue : kCFBooleanFalse);
     CFDictionarySetValue(status, CFSTR("diagnostics"), diagnostics.isEnabled() ? kCFBooleanTrue : kCFBooleanFalse);
 
     const Float64 sampleRate = gDevice_SampleRate.load();

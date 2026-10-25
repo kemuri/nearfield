@@ -93,7 +93,8 @@ extension AppDelegate {
             shiftRouterVolume: { [unowned self] decibels in
                 try self.routerDriverManager.shiftBaseVolume(byDecibels: decibels, balance: self.currentBalance())
             },
-            raiseDisplays: { [unowned self] in try self.audioManager.prepareDisplaysForProxyOutput() },
+            raiseDisplays: { [unowned self] in try self.prepareDisplaysForNearfield() },
+            releaseDisplayVolume: { [unowned self] in try self.routerDriverManager.setHardwareDisplayVolume(false) },
             restoreDisplays: { [unowned self] in try self.restorePhysicalDisplayState() },
             routerIsDefault: { [unowned self] in self.routerDriverManager.isRouterDefaultOutput() },
             applyBalance: { [unowned self] in try self.routerDriverManager.setBalance(self.currentBalance()) },
@@ -363,7 +364,23 @@ extension AppDelegate {
         try routerOutputActivation.restoreDisplays()
     }
 
+    /// Unmutes the displays and lets Nearfield's volume set theirs, so they
+    /// keep their own tuning at every level; older drivers need them at full
+    /// volume instead. Their level never rises above Nearfield's on the way.
+    func prepareDisplaysForNearfield() throws {
+        let followsVolume = routerDriverManager.status()?.supportsHardwareDisplayVolume ?? false
+        try audioManager.prepareDisplaysForProxyOutput(fullVolume: !followsVolume)
+        if followsVolume {
+            try routerDriverManager.setHardwareDisplayVolume(true)
+        }
+    }
+
     func restorePhysicalDisplayState() throws {
+        if cachedRouterDriverAvailability.isLoaded {
+            // Nearfield attenuates again before the displays get their own
+            // volume back, so nothing gets louder.
+            try? routerDriverManager.setHardwareDisplayVolume(false)
+        }
         guard let displayState = proxyPreparedDisplayState else { return }
         let pendingDisplayState = try audioManager.restoreDisplayOutputState(displayState)
         proxyPreparedDisplayState = pendingDisplayState.isEmpty ? nil : pendingDisplayState

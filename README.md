@@ -32,10 +32,13 @@ setting keep that setting; recovery only changes the Mac's default output.
 Choosing another output cancels the handoff. This requires audio driver 1.1.0
 or later; older installations are offered the bundled driver update.
 
-Nearfield plays through the displays at full hardware volume and controls the
-level itself. It never raises a display that another app is playing on
-directly: until that app stops, the display keeps its volume and Nearfield's
-volume makes up the difference.
+Nearfield sets each display's own volume to its channel's level, so the same
+volume plays as loud as on a single display and the displays keep their own
+tuning, which adds bass at lower volumes. It never raises a display that
+another app is playing on directly: until that app stops, the display keeps
+its volume and Nearfield's volume makes up the difference. With an audio driver
+older than 1.2.0, the displays play at full volume and Nearfield controls the
+level itself.
 
 When fewer than two Studio Displays remain connected for about a second, the
 driver hides the Nearfield output, even when the app is not running. Nearfield

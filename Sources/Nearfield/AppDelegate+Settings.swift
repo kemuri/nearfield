@@ -594,8 +594,10 @@ extension AppDelegate: SettingsDelegate {
 
     func settingsPlayIdentificationChime(on display: AudioDevice) {
         do {
-            let physicalOutputsArePrepared = proxyPreparedDisplayState != nil ||
-                routerDriverManager.isRouterDefaultOutput()
+            // Displays that follow Nearfield's volume already play at its level.
+            let displaysFollowNearfield = routerDriverManager.status()?.displayVolumeApplied ?? false
+            let physicalOutputsArePrepared = !displaysFollowNearfield &&
+                (proxyPreparedDisplayState != nil || routerDriverManager.isRouterDefaultOutput())
             try testTonePlayer.playIdentificationChime(
                 on: display,
                 volume: IdentificationChimeGain.playerVolume(

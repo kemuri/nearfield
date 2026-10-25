@@ -135,6 +135,18 @@ extension AppDelegate {
                 return
             }
 
+            if let upgrade,
+               RouterVolumeCurve.upgradeChangesCurve(from: upgrade.installedVersion, to: upgrade.availableVersion) {
+                // Same loudness as before the upgrade, before anything else
+                // reads or sets Nearfield's volume.
+                self.routerVolumeContinuity.keepLevelAfterCurveChange()
+                do {
+                    try self.routerDriverManager.keepVolumeLevelAfterCurveChange()
+                } catch {
+                    self.recordRecoverableError(error, context: "Keeping Nearfield's volume after the driver update failed")
+                }
+            }
+
             self.driverInstallState = .installing(.configuration)
             self.refreshStatus()
             do {

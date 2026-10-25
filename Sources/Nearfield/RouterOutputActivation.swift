@@ -1,7 +1,10 @@
 import Foundation
 
 /// Makes Nearfield the Mac's output and remembers which displays are prepared
-/// for it (unmuted at full volume, with Nearfield controlling the volume).
+/// for it: unmuted, with Nearfield controlling their volume. With driver 1.2.0
+/// the displays' own volume follows Nearfield's, so they keep their tuning
+/// (Studio Displays add bass at lower volumes); with older drivers they play
+/// at full volume and Nearfield attenuates.
 ///
 /// Nothing may get louder on the way:
 /// - The displays' settings are captured first, then Nearfield is selected,
@@ -13,7 +16,7 @@ import Foundation
 ///   Nearfield's volume makes up the difference. Once no other app plays on
 ///   them, Nearfield's volume is lowered by the same amount and then the
 ///   displays are raised. When waiting ends otherwise, the extra volume is
-///   taken back.
+///   taken back. While displays wait, their volume never follows Nearfield's.
 /// - If any step fails, the displays are put back as they were.
 ///
 /// Restoring the displays always goes through here, so the preparation is
@@ -36,8 +39,11 @@ final class RouterOutputActivation {
         /// Moves Nearfield's volume by some decibels, keeping the balance;
         /// returns the change applied.
         var shiftRouterVolume: (_ decibels: Float32) throws -> Float32
-        /// Unmutes the displays and sets them to full volume.
+        /// Unmutes the displays and hands their volume to Nearfield.
         var raiseDisplays: () throws -> Void
+        /// Stops the displays' own volume following Nearfield's (Nearfield
+        /// attenuates instead), for displays that must keep their volume.
+        var releaseDisplayVolume: () throws -> Void = {}
         /// Puts the displays back to their captured settings.
         var restoreDisplays: () throws -> Void
         var routerIsDefault: () -> Bool
@@ -84,6 +90,9 @@ final class RouterOutputActivation {
                 try operations.raiseDisplays()
                 preparedDisplayUIDs = displayUIDs
             } else {
+                // Displays still following Nearfield (from before a Core Audio
+                // restart) would get louder with the compensation below.
+                try operations.releaseDisplayVolume()
                 waitingDisplayUIDs = displayUIDs
                 // Without the compensation Nearfield only plays quieter while
                 // the displays wait, so a failure here does not stop activation.

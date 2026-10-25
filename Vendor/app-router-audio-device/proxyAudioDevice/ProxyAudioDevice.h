@@ -6,6 +6,7 @@
 #include <dispatch/dispatch.h>
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -135,6 +136,8 @@ class ProxyAudioDevice {
     Float32 volumeScalarToDecibels(Float32 scalar);
     Float32 volumeDecibelsToScalar(Float32 db);
     Float32 volumeScalarToGain(Float32 scalar);
+    void scheduleDisplayVolumeUpdate();
+    void applyDisplayVolumes();
 
     // MARK: Settings and status
     OSStatus applySettings(const nearfield::SettingsUpdate &update, pid_t writer);
@@ -547,6 +550,13 @@ class ProxyAudioDevice {
     nearfield::ClientRouteMixer routeMixer;
     nearfield::Diagnostics diagnostics;
     Float32 *renderBuffer = NULL;
+
+    // The displays play at Nearfield's volume in hardware; the audio path
+    // only mutes (see applyDisplayVolumes).
+    std::atomic<bool> hardwareVolumeActive{false};
+    std::atomic<bool> displayVolumeUpdatePending{false};
+    // Sets a display's volume in decibels; replaced by tests.
+    std::function<bool(const std::string &uid, Float32 decibels)> setDisplayDecibels;
 
     // Settings and clients (stateMutex).
     nearfield::DriverSettings settings;

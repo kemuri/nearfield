@@ -461,14 +461,18 @@ final class StudioDisplayAudioManager {
         }
     }
 
-    func prepareDisplaysForProxyOutput() throws {
+    /// Unmutes the displays, and with |fullVolume| sets them to full volume
+    /// for Nearfield to attenuate (drivers before 1.2.0).
+    func prepareDisplaysForProxyOutput(fullVolume: Bool = true) throws {
         let displays = Array(studioDisplayOutputs().prefix(3))
         guard displays.count >= 2 else {
             throw NearfieldError.notEnoughStudioDisplays(displays.count)
         }
 
         try setMute(false, for: displays)
-        try setVolume(1, for: displays)
+        if fullVolume {
+            try setVolume(1, for: displays)
+        }
         if let aggregate = device(matchingUID: aggregateUID) {
             _ = try setDevicePropertyIfSupported(
                 UInt32(0),

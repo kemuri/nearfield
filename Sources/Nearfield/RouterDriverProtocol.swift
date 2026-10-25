@@ -18,6 +18,10 @@ struct RouterDriverStatus: Equatable {
     var ready: Bool
     var targetDevices: [String]
     var targetMode: String
+    /// "hardware" while the displays' own volume follows Nearfield's.
+    var displayVolume: String
+    /// Whether the displays currently play at Nearfield's volume.
+    var displayVolumeApplied: Bool
     var hidden: Bool
     var outputRunning: Bool
     var sampleRate: Double
@@ -37,6 +41,8 @@ struct RouterDriverStatus: Equatable {
         ready = dictionary["ready"] as? Bool ?? false
         targetDevices = dictionary["targetDevices"] as? [String] ?? []
         targetMode = dictionary["targetMode"] as? String ?? NearfieldOutputMode.stereo.rawValue
+        displayVolume = dictionary["displayVolume"] as? String ?? "software"
+        displayVolumeApplied = dictionary["displayVolumeApplied"] as? Bool ?? false
         hidden = dictionary["hidden"] as? Bool ?? false
         outputRunning = dictionary["outputRunning"] as? Bool ?? false
         sampleRate = (dictionary["sampleRate"] as? NSNumber)?.doubleValue ?? 0
@@ -52,6 +58,11 @@ struct RouterDriverStatus: Equatable {
     func isReady(deviceUIDs: [String], mode: NearfieldOutputMode) -> Bool {
         guard (2...3).contains(deviceUIDs.count) else { return false }
         return ready && targetDevices == deviceUIDs && targetMode == mode.rawValue
+    }
+
+    /// Driver 1.2.0 and later can set the displays' volume to Nearfield's.
+    var supportsHardwareDisplayVolume: Bool {
+        capabilities.contains("hardwareDisplayVolume")
     }
 }
 
