@@ -40,6 +40,13 @@ its volume and Nearfield's volume makes up the difference. With an audio driver
 older than 1.2.0, the displays play at full volume and Nearfield controls the
 level itself.
 
+The displays also boost their bass as their own volume falls, by up to 16 dB.
+The Character setting keeps that tuning (Studio Display) or removes a share of
+it (Warm, Balanced), up to Neutral, which plays at every volume with the balance
+the displays have at full volume. The driver applies it as a low shelf at
+150 Hz, measured against the displays' boost at each volume, and saves the
+setting. It requires audio driver 1.3.0 or later.
+
 When fewer than two Studio Displays remain connected for about a second, the
 driver hides the Nearfield output, even when the app is not running. Nearfield
 reports its measured output latency to macOS, so apps can keep video in sync.

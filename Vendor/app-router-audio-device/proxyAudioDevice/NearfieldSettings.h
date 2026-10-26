@@ -10,6 +10,8 @@
 //   targetMode              "stereo" | "mono"
 //   displayVolume           "software" | "hardware": "hardware" sets the
 //                           displays' own volume to Nearfield's (saved)
+//   character               number, 0...1: the share of the displays' low-volume
+//                           bass boost Nearfield removes (0 keeps it)
 //   routingEnabled          boolean
 //   routeRules              "bundle.id=left; other.id=right" (saved)
 //   processRoutes           { "<pid>": "left" | "right" | "pair" | "muted" } (never saved)
@@ -43,6 +45,7 @@ inline const CFStringRef kSettingsDeviceNameKey = CFSTR("deviceName");
 inline const CFStringRef kSettingsTargetDevicesKey = CFSTR("targetDevices");
 inline const CFStringRef kSettingsTargetModeKey = CFSTR("targetMode");
 inline const CFStringRef kSettingsDisplayVolumeKey = CFSTR("displayVolume");
+inline const CFStringRef kSettingsCharacterKey = CFSTR("character");
 inline const CFStringRef kSettingsRoutingEnabledKey = CFSTR("routingEnabled");
 inline const CFStringRef kSettingsRouteRulesKey = CFSTR("routeRules");
 inline const CFStringRef kSettingsProcessRoutesKey = CFSTR("processRoutes");
@@ -178,6 +181,7 @@ struct DriverSettings {
     std::vector<std::string> targetDevices;
     bool stereo = true;
     bool hardwareDisplayVolume = false;
+    double character = 0;
     bool routingEnabled = false;
     std::string routeRules;
     uint32_t outputBufferFrameSize = kDefaultOutputBufferFrameSize;
@@ -196,6 +200,7 @@ struct SettingsUpdate {
     std::optional<std::vector<std::string>> targetDevices;
     std::optional<bool> stereo;
     std::optional<bool> hardwareDisplayVolume;
+    std::optional<double> character;
     std::optional<bool> routingEnabled;
     std::optional<std::string> routeRules;
     std::optional<std::map<pid_t, Route>> processRoutes;
@@ -207,7 +212,7 @@ struct SettingsUpdate {
     std::optional<int> activeCondition;
 
     bool isEmpty() const {
-        return !deviceName && !targetDevices && !stereo && !hardwareDisplayVolume && !routingEnabled && !routeRules && !processRoutes &&
+        return !deviceName && !targetDevices && !stereo && !hardwareDisplayVolume && !character && !routingEnabled && !routeRules && !processRoutes &&
                !outputBufferFrameSize && !underrunStrategy && !safetyGapMilliseconds && !diagnostics &&
                !outputDeviceUID && !activeCondition;
     }
@@ -336,6 +341,11 @@ inline bool parseSettingsUpdate(CFDictionaryRef dictionary, SettingsUpdate &upda
         else if (mode == "software") update.hardwareDisplayVolume = false;
         else return false;
     }
+    if ((value = CFDictionaryGetValue(dictionary, kSettingsCharacterKey))) {
+        double character = 0;
+        if (!finiteNumberFromCF(value, 0, 1, character)) return false;
+        update.character = character;
+    }
     if ((value = CFDictionaryGetValue(dictionary, kSettingsRoutingEnabledKey))) {
         bool enabled = false;
         if (!booleanFromCF(value, enabled)) return false;
@@ -439,6 +449,10 @@ inline uint32_t applySettingsUpdate(DriverSettings &settings, std::map<pid_t, Ro
         settings.hardwareDisplayVolume = *update.hardwareDisplayVolume;
         changes |= kChangedDisplayVolume;
     }
+    if (update.character && *update.character != settings.character) {
+        settings.character = *update.character;
+        changes |= kChangedPlayback;
+    }
     if (update.routingEnabled && *update.routingEnabled != settings.routingEnabled) {
         settings.routingEnabled = *update.routingEnabled;
         changes |= kChangedRouting;
@@ -540,6 +554,7 @@ inline CFDictionaryRef createPersistentSettings(const DriverSettings &settings) 
     setDictionaryStrings(dictionary, kSettingsTargetDevicesKey, settings.targetDevices);
     setDictionaryString(dictionary, kSettingsTargetModeKey, settings.stereo ? "stereo" : "mono");
     setDictionaryString(dictionary, kSettingsDisplayVolumeKey, settings.hardwareDisplayVolume ? "hardware" : "software");
+    setDictionaryNumber(dictionary, kSettingsCharacterKey, settings.character);
     CFDictionarySetValue(dictionary, kSettingsRoutingEnabledKey, settings.routingEnabled ? kCFBooleanTrue : kCFBooleanFalse);
     setDictionaryString(dictionary, kSettingsRouteRulesKey, settings.routeRules);
     setDictionaryInteger(dictionary, kSettingsOutputBufferFrameSizeKey, settings.outputBufferFrameSize);

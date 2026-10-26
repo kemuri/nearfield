@@ -22,6 +22,8 @@ struct RouterDriverStatus: Equatable {
     var displayVolume: String
     /// Whether the displays currently play at Nearfield's volume.
     var displayVolumeApplied: Bool
+    /// The share of the displays' low-volume bass boost removed, 0...1.
+    var character: Double
     var hidden: Bool
     var outputRunning: Bool
     var sampleRate: Double
@@ -43,6 +45,7 @@ struct RouterDriverStatus: Equatable {
         targetMode = dictionary["targetMode"] as? String ?? NearfieldOutputMode.stereo.rawValue
         displayVolume = dictionary["displayVolume"] as? String ?? "software"
         displayVolumeApplied = dictionary["displayVolumeApplied"] as? Bool ?? false
+        character = (dictionary["character"] as? NSNumber)?.doubleValue ?? 0
         hidden = dictionary["hidden"] as? Bool ?? false
         outputRunning = dictionary["outputRunning"] as? Bool ?? false
         sampleRate = (dictionary["sampleRate"] as? NSNumber)?.doubleValue ?? 0
@@ -63,6 +66,11 @@ struct RouterDriverStatus: Equatable {
     /// Driver 1.2.0 and later can set the displays' volume to Nearfield's.
     var supportsHardwareDisplayVolume: Bool {
         capabilities.contains("hardwareDisplayVolume")
+    }
+
+    /// Driver 1.3.0 and later has the Character setting.
+    var supportsCharacter: Bool {
+        capabilities.contains("character")
     }
 }
 

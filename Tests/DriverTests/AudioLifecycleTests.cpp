@@ -591,6 +591,137 @@ static void testHardwareDisplayVolumeFollowsNearfield() {
     CHECK(f.applySettings(invalid) != noErr);
 }
 
+// The level, in dB, of a |hz| sine on each channel after the filter has
+// ramped and settled, with the displays at these volumes.
+static std::pair<double, double> characterLevels(double amount, double hz, double rate, double leftDisplay,
+                                                 double rightDisplay) {
+    nearfield::CharacterFilter filter;
+    filter.setAmount(amount);
+    const UInt32 block = 512;
+    const UInt32 settle = (UInt32)rate;  // 1 s: the ramp takes up to 330 ms
+    const UInt32 measure = (UInt32)rate; // a whole number of cycles for 40 Hz and up
+    std::vector<float> audio(block * 2);
+    double sumIn = 0, sumLeft = 0, sumRight = 0;
+    for (UInt32 start = 0; start < settle + measure; start += block) {
+        for (UInt32 frame = 0; frame < block; ++frame) {
+            audio[frame * 2] = audio[frame * 2 + 1] = 0.5f * (float)std::sin(2 * M_PI * hz * (start + frame) / rate);
+        }
+        std::vector<float> input = audio;
+        filter.process(audio.data(), block, rate, leftDisplay, rightDisplay);
+        if (start >= settle) {
+            for (UInt32 frame = 0; frame < block; ++frame) {
+                sumIn += input[frame * 2] * input[frame * 2];
+                sumLeft += audio[frame * 2] * audio[frame * 2];
+                sumRight += audio[frame * 2 + 1] * audio[frame * 2 + 1];
+            }
+        }
+    }
+    return {10 * std::log10(sumLeft / sumIn), 10 * std::log10(sumRight / sumIn)};
+}
+
+static void testCharacterRemovesTheDisplaysBassBoost() {
+    // The displays' measured boost, between and beyond the measured volumes.
+    CHECK(nearfield::displayBassBoostDecibels(0) == 0);
+    CHECK(nearfield::displayBassBoostDecibels(3) == 0);
+    CHECK(near((Float32)nearfield::displayBassBoostDecibels(-18.5), 9.4f));
+    CHECK(near((Float32)nearfield::displayBassBoostDecibels(-9), 3.8f));
+    CHECK(near((Float32)nearfield::displayBassBoostDecibels(-63.5), 15.8f));
+
+    // Neutral removes the whole boost, half removes half; the voice range and
+    // displays at full volume are left alone. Each channel follows its display.
+    auto neutral = characterLevels(1, 40, 48000, -18.5, 0);
+    CHECK(std::fabs(neutral.first - -9.3) < 0.2);
+    CHECK(std::fabs(neutral.second) < 0.01);
+    auto half = characterLevels(0.5, 40, 48000, -31.5, -31.5);
+    CHECK(std::fabs(half.first - -6.95) < 0.2 && std::fabs(half.second - -6.95) < 0.2);
+    auto voice = characterLevels(1, 1000, 48000, -31.5, -31.5);
+    CHECK(std::fabs(voice.first) < 0.1);
+    auto fast = characterLevels(1, 40, 96000, -18.5, -18.5);
+    CHECK(std::fabs(fast.first - -9.3) < 0.2);
+
+    // Studio Display (0) leaves the audio untouched at any volume.
+    nearfield::CharacterFilter filter;
+    float audio[] = {0.25f, -0.5f, 0.125f, 1.0f};
+    filter.process(audio, 2, 48000, -40, -40);
+    CHECK(audio[0] == 0.25f && audio[1] == -0.5f && audio[2] == 0.125f && audio[3] == 1.0f);
+
+    // Changes ramp: one 10 ms block moves the level by about half a decibel.
+    filter.setAmount(1);
+    std::vector<float> steady(512 * 2, 0.5f);
+    filter.process(steady.data(), 512, 48000, -40, -40);
+    CHECK(steady[1023] > 0.5f * std::pow(10.0f, -0.6f / 20));
+
+    filter.setAmount(-1);
+    CHECK(filter.amount() == 0);
+    filter.setAmount(2);
+    CHECK(filter.amount() == 1);
+}
+
+static double numberValue(CFDictionaryRef dictionaryValue, CFStringRef key) {
+    CFNumberRef number = (CFNumberRef)CFDictionaryGetValue(dictionaryValue, key);
+    double value = NAN;
+    if (number && CFGetTypeID(number) == CFNumberGetTypeID()) {
+        CFNumberGetValue(number, kCFNumberDoubleType, &value);
+    }
+    return value;
+}
+
+static void testCharacterFollowsTheDisplaysVolume() {
+    DriverFixture f;
+    auto displays = fakeDisplayVolumes(f);
+    CFArraySmartRef targets(strings({CFSTR("left-uid"), CFSTR("right-uid")}));
+    CFDictionarySmartRef configure(dictionary({{nearfield::kSettingsTargetDevicesKey, targets},
+                                               {nearfield::kSettingsDisplayVolumeKey, CFSTR("hardware")}}));
+    CHECK(f.applySettings(configure) == noErr);
+    f.start(1);
+    setNearfieldVolume(f, kObjectID_Volume_Output_L, 0.25f);
+    setNearfieldVolume(f, kObjectID_Volume_Output_R, 1.0f);
+    playUntilSteady(f);
+
+    // Neutral. The fixture plays a constant level, which a low shelf scales by
+    // its full depth: the left display (quiet) loses its boost, the right
+    // display (full volume) has none.
+    double amount = 1;
+    CFNumberSmartRef neutral(CFNumberCreate(NULL, kCFNumberDoubleType, &amount));
+    CFDictionarySmartRef setNeutral(dictionary({{nearfield::kSettingsCharacterKey, neutral}}));
+    CHECK(f.applySettings(setNeutral) == noErr);
+    for (int cycle = 0; cycle < 40; ++cycle) {
+        f.cycleOnce();
+    }
+    const double boost = nearfield::displayBassBoostDecibels(f.device.volumeScalarToDecibels(0.25f));
+    CHECK(boost > 13 && boost < 15);
+    CHECK(allFrames(f.output, 0.5f * (Float32)std::pow(10.0, -boost / 20), 0.5f));
+
+    // In software volume the displays play at full volume: nothing to remove.
+    setDisplayVolumeMode(f, CFSTR("software"));
+    for (int cycle = 0; cycle < 40; ++cycle) {
+        f.cycleOnce();
+    }
+    CHECK(allFrames(f.output, 0.5f * f.device.volumeScalarToGain(0.25f), 0.5f));
+    CHECK(displays->writes > 0);
+
+    // Saved and reported.
+    CFDictionaryRef saved = NULL;
+    fakeCopyFromStorage(&gFakeHost, CFSTR("settings"), (CFPropertyListRef *)&saved);
+    CHECK(saved && numberValue(saved, nearfield::kSettingsCharacterKey) == 1);
+    if (saved) CFRelease(saved);
+    {
+        CFDictionarySmartRef status((CFDictionaryRef)f.copyBoxProperty(kNearfieldPropertyStatus));
+        CHECK(numberValue(status, CFSTR("character")) == 1);
+        CFArrayRef capabilities = (CFArrayRef)CFDictionaryGetValue(status, CFSTR("capabilities"));
+        CHECK(CFArrayContainsValue(capabilities, CFRangeMake(0, CFArrayGetCount(capabilities)), CFSTR("character")));
+    }
+
+    // Out of range or not a number: rejected, the setting stays.
+    double tooMuch = 1.5;
+    CFNumberSmartRef tooMuchNumber(CFNumberCreate(NULL, kCFNumberDoubleType, &tooMuch));
+    CFDictionarySmartRef invalidNumber(dictionary({{nearfield::kSettingsCharacterKey, tooMuchNumber}}));
+    CHECK(f.applySettings(invalidNumber) != noErr);
+    CFDictionarySmartRef invalidText(dictionary({{nearfield::kSettingsCharacterKey, CFSTR("warm")}}));
+    CHECK(f.applySettings(invalidText) != noErr);
+    CHECK(f.device.settings.character == 1);
+}
+
 static void testHardwareDisplayVolumeWithThreeDisplays() {
     DriverFixture f;
     auto displays = fakeDisplayVolumes(f);
@@ -1511,6 +1642,8 @@ int main(int argc, char **argv) {
         {"volume curve matches the Studio Displays", testVolumeCurveMatchesTheStudioDisplays, false, false},
         {"hardware display volume follows Nearfield", testHardwareDisplayVolumeFollowsNearfield, false, false},
         {"hardware display volume with three displays", testHardwareDisplayVolumeWithThreeDisplays, false, false},
+        {"character removes the displays' bass boost", testCharacterRemovesTheDisplaysBassBoost, false, false},
+        {"character follows the displays' volume", testCharacterFollowsTheDisplaysVolume, false, false},
         {"render never waits for the state mutex", testRenderDoesNotWaitForConfigurationMutex, true, false},
         {"volume, mute and balance are smoothed", testVolumeMuteAndBalanceAreSmoothed, false, false},
         {"cold start skips to the newest audio", testColdStartSkipsToTheNewestAudio, false, false},

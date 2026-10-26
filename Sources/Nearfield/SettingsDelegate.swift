@@ -68,6 +68,9 @@ protocol SettingsPreferencesControlling: AnyObject {
     func settingsAppVersionText() -> String
     func settingsBalance() -> Float
     func settingsSetBalance(_ balance: Float)
+    /// Character, or nil when the installed driver has none.
+    func settingsCharacter() -> RouterCharacter?
+    func settingsSetCharacter(_ character: RouterCharacter)
     func settingsSetMode(_ mode: NearfieldOutputMode)
     func settingsSetLeftDeviceUID(_ uid: String)
     func settingsSetDisplayOrderUIDs(_ uids: [String])

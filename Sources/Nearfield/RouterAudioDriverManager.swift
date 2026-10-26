@@ -135,6 +135,24 @@ final class RouterAudioDriverManager {
         return true
     }
 
+    /// Sets Character. Returns false for drivers before 1.3.0. The driver
+    /// saves the setting.
+    @discardableResult
+    func setCharacter(_ character: RouterCharacter) throws -> Bool {
+        guard let boxID = routerBoxID() else {
+            throw RouterAudioDriverError.notInstalled
+        }
+        guard hasSettingsProperty(boxID: boxID),
+              let status = readStatus(boxID: boxID),
+              status.supportsCharacter else {
+            return false
+        }
+        if status.character != character.amount {
+            try sendChanges(["character": character.amount], boxID: boxID)
+        }
+        return true
+    }
+
     /// Resolved rules may contain window-following process routes, which a
     /// 1.1 driver applies on its next audio cycle without saving them.
     func setRouteRules(_ rules: String) throws {

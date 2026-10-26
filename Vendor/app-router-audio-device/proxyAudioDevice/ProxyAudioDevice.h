@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "AudioDevice.h"
+#include "NearfieldCharacter.h"
 #include "NearfieldDiagnostics.h"
 #include "NearfieldPlayback.h"
 #include "NearfieldRouteTable.h"
@@ -549,6 +550,7 @@ class ProxyAudioDevice {
     nearfield::RouteTable routeTable;
     nearfield::ClientRouteMixer routeMixer;
     nearfield::Diagnostics diagnostics;
+    nearfield::CharacterFilter character;
     Float32 *renderBuffer = NULL;
 
     // The displays play at Nearfield's volume in hardware; the audio path

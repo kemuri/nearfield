@@ -249,6 +249,8 @@ final class OnboardingModel: ObservableObject {
     @Published var openAtLogin = false
     @Published var showMenubarApp = true
     @Published var balance: Double = 0
+    /// Nil while the installed driver has no Character setting.
+    @Published var character: RouterCharacter?
     @Published var driverInstalled = false
     @Published var driverUpdateAvailable = false
     @Published var isInstallingDriver = false
@@ -305,6 +307,7 @@ final class OnboardingModel: ObservableObject {
         openAtLogin = delegate.settingsOpenAtLogin()
         showMenubarApp = delegate.settingsShowMenuBarApp()
         balance = Double(delegate.settingsBalance())
+        character = delegate.settingsCharacter()
         let installingDriver = delegate.settingsIsInstallingDriver()
         isInstallingDriver = installingDriver
         isRemovingDriver = delegate.settingsIsRemovingDriver()
@@ -595,6 +598,14 @@ final class OnboardingModel: ObservableObject {
         let clamped = min(max(value, -1), 1)
         balance = clamped
         delegate?.settingsSetBalance(Float(clamped))
+    }
+
+    func setCharacter(amount: Double) {
+        // Snaps to the named stops, so a drag sends at most a few changes.
+        let stop = RouterCharacter(amount: amount)
+        guard stop != character else { return }
+        character = stop
+        delegate?.settingsSetCharacter(stop)
     }
 
     func balanceText() -> String {

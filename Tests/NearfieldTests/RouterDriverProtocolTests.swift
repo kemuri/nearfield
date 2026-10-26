@@ -491,6 +491,33 @@ final class RouterOutputActivationTests: XCTestCase {
         XCTAssertFalse(older.displayVolumeApplied)
     }
 
+    func testStatusReportsCharacter() throws {
+        let current = try XCTUnwrap(RouterDriverStatus(dictionary: [
+            "protocolVersion": 1,
+            "capabilities": ["settingsDictionary", "hardwareDisplayVolume", "character"],
+            "character": 2.0 / 3
+        ]))
+        XCTAssertTrue(current.supportsCharacter)
+        XCTAssertEqual(RouterCharacter(amount: current.character), .balanced)
+
+        let older = try XCTUnwrap(RouterDriverStatus(dictionary: [
+            "protocolVersion": 1,
+            "capabilities": ["settingsDictionary", "hardwareDisplayVolume"]
+        ]))
+        XCTAssertFalse(older.supportsCharacter)
+        XCTAssertEqual(older.character, 0)
+    }
+
+    func testCharacterStopsSpanTheDriversRange() {
+        XCTAssertEqual(RouterCharacter.studioDisplay.amount, 0)
+        XCTAssertEqual(RouterCharacter.neutral.amount, 1)
+        XCTAssertEqual(RouterCharacter.allCases.map(\.title), ["Studio Display", "Warm", "Balanced", "Neutral"])
+        XCTAssertEqual(RouterCharacter(amount: 0.3), .warm)
+        XCTAssertEqual(RouterCharacter(amount: 0.6), .balanced)
+        XCTAssertEqual(RouterCharacter(amount: -1), .studioDisplay)
+        XCTAssertEqual(RouterCharacter(amount: 2), .neutral)
+    }
+
     func testDisplaysAreRaisedOnlyAfterNearfieldIsSelected() throws {
         let displays = Displays()
         let activation = displays.makeActivation()

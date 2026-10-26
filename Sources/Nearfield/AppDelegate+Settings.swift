@@ -293,6 +293,19 @@ extension AppDelegate: SettingsDelegate {
         refreshStatus()
     }
 
+    func settingsCharacter() -> RouterCharacter? {
+        guard let status = routerDriverManager.status(), status.supportsCharacter else { return nil }
+        return RouterCharacter(amount: status.character)
+    }
+
+    func settingsSetCharacter(_ character: RouterCharacter) {
+        do {
+            try routerDriverManager.setCharacter(character)
+        } catch {
+            showError(error)
+        }
+    }
+
     func settingsSetMode(_ mode: NearfieldOutputMode) {
         setMode(mode)
         refreshStatus()

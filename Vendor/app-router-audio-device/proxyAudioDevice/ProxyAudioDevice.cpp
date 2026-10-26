@@ -680,6 +680,7 @@ void ProxyAudioDevice::applyPlaybackSettingsNoLock() {
     const bool gap = settings.underrunStrategy != nearfield::UnderrunStrategy::steer;
     engine.setStrategy(steer, gap);
     engine.setBaseSafetyGapMilliseconds(settings.safetyGapMilliseconds);
+    character.setAmount(settings.character);
     diagnostics.enabled.store(settings.diagnostics || NEARFIELD_DRIVER_DIAGNOSTICS != 0);
 }
 
@@ -5500,7 +5501,8 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     const Float32 volumeLeft = gVolume_Output_L_Value.load(std::memory_order_relaxed);
     const Float32 volumeRight = gVolume_Output_R_Value.load(std::memory_order_relaxed);
     const bool mute = gMute_Output_Mute.load(std::memory_order_relaxed);
-    if (hardwareVolumeActive.load(std::memory_order_relaxed)) {
+    const bool displaysFollow = hardwareVolumeActive.load(std::memory_order_relaxed);
+    if (displaysFollow) {
         // The displays play at Nearfield's volume; only silence is left to
         // the audio path.
         gainLeft = (mute || volumeLeft <= 0) ? 0.0f : 1.0f;
@@ -5508,6 +5510,10 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     } else {
         calculateVolumeFactors(volumeLeft, volumeRight, mute, gainLeft, gainRight);
     }
+    // The volumes the displays boost their bass for: their own, while they
+    // follow Nearfield's; none at full volume.
+    const double leftDisplayDecibels = displaysFollow ? volumeScalarToDecibels(volumeLeft) : 0.0;
+    const double rightDisplayDecibels = displaysFollow ? volumeScalarToDecibels(volumeRight) : 0.0;
     const bool hostTimeValid = inOutputTime && (inOutputTime->mFlags & kAudioTimeStampHostTimeValid);
     const Float64 rateScalar = (inOutputTime && (inOutputTime->mFlags & kAudioTimeStampRateScalarValid))
                                    ? inOutputTime->mRateScalar
@@ -5522,6 +5528,8 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
         if (ratesMatch) {
             const UInt64 hostTime = hostTimeValid ? inOutputTime->mHostTime + (UInt64)(offset * ticksPerFrame) : 0;
             engine.read(renderBuffer, count, hostTime, rateScalar, gainLeft, gainRight, lateness);
+            character.process(renderBuffer, count, engine.currentOutputSampleRate(), leftDisplayDecibels,
+                              rightDisplayDecibels);
         } else {
             memset(renderBuffer, 0, sizeof(Float32) * count * nearfield::kStreamChannels);
         }
@@ -5996,7 +6004,7 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
     setDictionaryStrings(status, CFSTR("capabilities"),
                          {"driverOwnedTargetAggregate", "threeDisplayTargetAggregate", "targetOutputReadiness",
                           "settingsDictionary", "statusNotifications", "processRoutes", "latencyReporting",
-                          "displayVolumeCurve", "hardwareDisplayVolume"});
+                          "displayVolumeCurve", "hardwareDisplayVolume", "character"});
 
     const std::vector<Float64> rates = currentAvailableSampleRates();
     {
@@ -6010,6 +6018,7 @@ CFDictionaryRef ProxyAudioDevice::copyStatusDictionary() {
         setDictionaryStrings(status, CFSTR("targetDevices"), settings.targetDevices);
         setDictionaryString(status, CFSTR("targetMode"), settings.stereo ? "stereo" : "mono");
         setDictionaryString(status, CFSTR("displayVolume"), settings.hardwareDisplayVolume ? "hardware" : "software");
+        setDictionaryNumber(status, CFSTR("character"), settings.character);
         setDictionaryString(status, CFSTR("underrunStrategy"), underrunStrategyName(settings.underrunStrategy));
         CFDictionarySetValue(status, CFSTR("published"), gBox_Acquired ? kCFBooleanTrue : kCFBooleanFalse);
         setDictionaryInteger(status, CFSTR("ioClients"), (int64_t)gDevice_IOIsRunning);

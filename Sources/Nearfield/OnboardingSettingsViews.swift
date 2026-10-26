@@ -51,6 +51,10 @@ struct SettingsOnboardingView: View {
                                 SettingsGroup {
                                     BalanceSettingRow(model: model)
                                     SettingsDivider()
+                                    if model.character != nil {
+                                        CharacterSettingRow(model: model)
+                                        SettingsDivider()
+                                    }
                                     DisplayArrangementRow(model: model)
                                 }
                             }
@@ -279,15 +283,58 @@ private struct BalanceSettingRow: View {
                 Image(systemName: "l.circle.fill")
                     .balanceSideIconStyle()
 
-                NativeBalanceSlider(
+                NativeSettingsSlider(
                     value: Binding(
                         get: { model.balance },
                         set: { model.setBalance($0) }
-                    )
+                    ),
+                    range: -1...1,
+                    tickMarks: 11,
+                    altIncrement: 0.05
                 )
                 .frame(height: 30)
 
                 Image(systemName: "r.circle.fill")
+                    .balanceSideIconStyle()
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 66)
+    }
+}
+
+private struct CharacterSettingRow: View {
+    @ObservedObject var model: OnboardingModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Character")
+                    .settingsTitleStyle()
+                Spacer()
+                Text(model.character?.title ?? "")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 7) {
+                Image(systemName: "circle")
+                    .balanceSideIconStyle()
+
+                // Neutral on the left, the displays' own tuning (the default) on
+                // the right: the slider fills as the displays keep more of it.
+                NativeSettingsSlider(
+                    value: Binding(
+                        get: { 1 - (model.character?.amount ?? 0) },
+                        set: { model.setCharacter(amount: 1 - $0) }
+                    ),
+                    range: 0...1,
+                    tickMarks: RouterCharacter.allCases.count,
+                    altIncrement: 1.0 / Double(RouterCharacter.allCases.count - 1),
+                    snapsToTickMarks: true
+                )
+                .frame(height: 30)
+
+                Image(systemName: "circle.fill")
                     .balanceSideIconStyle()
             }
         }
@@ -696,18 +743,28 @@ private struct SpatialRoutingFooterRow: View {
     }
 }
 
-private struct NativeBalanceSlider: NSViewRepresentable {
+private struct NativeSettingsSlider: NSViewRepresentable {
     @Binding var value: Double
+    let range: ClosedRange<Double>
+    let tickMarks: Int
+    let altIncrement: Double
+    var snapsToTickMarks = false
 
     func makeNSView(context: Context) -> NSSlider {
-        let slider = NSSlider(value: value, minValue: -1, maxValue: 1, target: context.coordinator, action: #selector(Coordinator.valueChanged(_:)))
+        let slider = NSSlider(
+            value: value,
+            minValue: range.lowerBound,
+            maxValue: range.upperBound,
+            target: context.coordinator,
+            action: #selector(Coordinator.valueChanged(_:))
+        )
         slider.isContinuous = true
         slider.controlSize = .small
-        slider.numberOfTickMarks = 11
-        slider.allowsTickMarkValuesOnly = false
+        slider.numberOfTickMarks = tickMarks
+        slider.allowsTickMarkValuesOnly = snapsToTickMarks
         slider.tickMarkPosition = .below
         slider.sliderType = .linear
-        slider.altIncrementValue = 0.05
+        slider.altIncrementValue = altIncrement
         return slider
     }
 
