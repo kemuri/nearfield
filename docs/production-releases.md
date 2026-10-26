@@ -61,6 +61,10 @@ Prepare `release-notes/<version>.json` with the exact version being packaged:
 }
 ```
 
+The same notes appear in two places: the website changelog and Sparkle's update
+window, which shows them as a list above the install buttons. Write each change
+for someone deciding whether to update now.
+
 Full mode automatically loads the notes matching the release version. For
 example, with the current version at `0.1.38`, it loads
 `release-notes/0.1.39.json`:

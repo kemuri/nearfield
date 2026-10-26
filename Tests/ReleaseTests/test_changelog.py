@@ -47,6 +47,15 @@ class ChangelogTests(unittest.TestCase):
             with self.subTest(history=history), self.assertRaises(ValueError):
                 changelog.updated_releases(history, "0.1.10", "2026-09-07", self.notes)
 
+    def test_sparkle_notes_are_an_escaped_embeddable_list(self):
+        notes = {"version": "0.1.10", "changes": [" Fixed <volume> & balance. "]}
+        html = changelog.sparkle_release_notes(notes, "0.1.10")
+        self.assertEqual(html, "<ul>\n  <li>Fixed &lt;volume&gt; &amp; balance.</li>\n</ul>\n")
+        # Sparkle only embeds HTML release notes without DOCTYPE or body tags.
+        self.assertNotIn("<body", html.lower())
+        with self.assertRaises(ValueError):
+            changelog.sparkle_release_notes(notes, "0.1.11")
+
     def test_date_comes_from_matching_appcast_item_in_its_timezone(self):
         with tempfile.TemporaryDirectory() as directory:
             appcast = Path(directory) / "appcast.xml"

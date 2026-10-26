@@ -4,6 +4,7 @@
 import argparse
 from datetime import date
 from email.utils import parsedate_to_datetime
+from html import escape
 import json
 from pathlib import Path
 import re
@@ -47,6 +48,13 @@ def notes_path(version, explicit_path=None, required=False):
             "or set NEARFIELD_RELEASE_NOTES_FILE to a matching JSON file"
         )
     return None
+
+
+def sparkle_release_notes(notes, version):
+    """An HTML fragment for Sparkle to embed in the appcast item's description."""
+    changes = validate_notes(notes, version)
+    items = "\n".join(f"  <li>{escape(change, quote=False)}</li>" for change in changes)
+    return f"<ul>\n{items}\n</ul>\n"
 
 
 def release_date(appcast, version):
@@ -102,6 +110,10 @@ def main():
     preflight = commands.add_parser("validate-notes")
     preflight.add_argument("--version", required=True)
     preflight.add_argument("--notes", type=Path)
+    sparkle = commands.add_parser("sparkle-notes")
+    sparkle.add_argument("--version", required=True)
+    sparkle.add_argument("--notes", type=Path)
+    sparkle.add_argument("--output", required=True, type=Path)
     update = commands.add_parser("update")
     update.add_argument("--version", required=True)
     update.add_argument("--appcast", required=True, type=Path)
@@ -109,11 +121,15 @@ def main():
     update.add_argument("--notes", type=Path)
     args = parser.parse_args()
     try:
-        path = notes_path(args.version, args.notes, required=args.command == "validate-notes")
+        path = notes_path(args.version, args.notes, required=args.command != "update")
         notes = json.loads(path.read_text()) if path else None
         if args.command == "validate-notes":
             validate_notes(notes, args.version)
             print(path)
+            return 0
+        if args.command == "sparkle-notes":
+            args.output.write_text(sparkle_release_notes(notes, args.version))
+            print(args.output)
             return 0
         published = release_date(args.appcast, args.version)
         path = args.website / "src/data/releases.json"
