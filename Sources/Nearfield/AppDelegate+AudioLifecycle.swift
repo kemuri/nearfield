@@ -379,7 +379,7 @@ extension AppDelegate {
         if cachedRouterDriverAvailability.isLoaded {
             // Nearfield attenuates again before the displays get their own
             // volume back, so nothing gets louder.
-            try? routerDriverManager.setHardwareDisplayVolume(false)
+            _ = try? routerDriverManager.setHardwareDisplayVolume(false)
         }
         guard let displayState = proxyPreparedDisplayState else { return }
         let pendingDisplayState = try audioManager.restoreDisplayOutputState(displayState)
