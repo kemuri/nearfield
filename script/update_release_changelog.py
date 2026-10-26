@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 SPARKLE = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
 NOTES_DIRECTORY = Path(__file__).resolve().parents[1] / "release-notes"
+MAX_SUMMARY_ITEMS = 5
 
 
 def version_key(version):
@@ -35,6 +36,19 @@ def validate_notes(notes, version):
     return [change.strip() for change in changes]
 
 
+def validate_summary(notes, version):
+    """The short list Sparkle's update window shows; the website keeps the full changes."""
+    validate_notes(notes, version)
+    summary = notes.get("summary")
+    if not isinstance(summary, list) or not summary or any(
+        not isinstance(item, str) or not item.strip() for item in summary
+    ):
+        raise ValueError("Release notes must contain a nonempty summary list for the update window")
+    if len(summary) > MAX_SUMMARY_ITEMS:
+        raise ValueError(f"The update window summary is limited to {MAX_SUMMARY_ITEMS} items")
+    return [item.strip() for item in summary]
+
+
 def notes_path(version, explicit_path=None, required=False):
     version_key(version)
     if explicit_path is not None:
@@ -44,17 +58,20 @@ def notes_path(version, explicit_path=None, required=False):
         return path
     if required:
         raise ValueError(
-            f"Missing release notes for {version}; create {path} with version and changes, "
+            f"Missing release notes for {version}; create {path} with version, changes, and summary, "
             "or set NEARFIELD_RELEASE_NOTES_FILE to a matching JSON file"
         )
     return None
 
 
-def sparkle_release_notes(notes, version):
+def sparkle_release_notes(notes, version, full_notes_url=None):
     """An HTML fragment for Sparkle to embed in the appcast item's description."""
-    changes = validate_notes(notes, version)
-    items = "\n".join(f"  <li>{escape(change, quote=False)}</li>" for change in changes)
-    return f"<ul>\n{items}\n</ul>\n"
+    summary = validate_summary(notes, version)
+    items = "\n".join(f"  <li>{escape(item, quote=False)}</li>" for item in summary)
+    html = f"<ul>\n{items}\n</ul>\n"
+    if full_notes_url:
+        html += f'<p><a href="{escape(full_notes_url)}">Full release notes</a></p>\n'
+    return html
 
 
 def release_date(appcast, version):
@@ -114,6 +131,7 @@ def main():
     sparkle.add_argument("--version", required=True)
     sparkle.add_argument("--notes", type=Path)
     sparkle.add_argument("--output", required=True, type=Path)
+    sparkle.add_argument("--full-notes-url")
     update = commands.add_parser("update")
     update.add_argument("--version", required=True)
     update.add_argument("--appcast", required=True, type=Path)
@@ -124,11 +142,11 @@ def main():
         path = notes_path(args.version, args.notes, required=args.command != "update")
         notes = json.loads(path.read_text()) if path else None
         if args.command == "validate-notes":
-            validate_notes(notes, args.version)
+            validate_summary(notes, args.version)
             print(path)
             return 0
         if args.command == "sparkle-notes":
-            args.output.write_text(sparkle_release_notes(notes, args.version))
+            args.output.write_text(sparkle_release_notes(notes, args.version, args.full_notes_url))
             print(args.output)
             return 0
         published = release_date(args.appcast, args.version)

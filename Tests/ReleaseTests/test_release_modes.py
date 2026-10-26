@@ -77,7 +77,7 @@ class ReleaseModeTests(unittest.TestCase):
         shutil.copy2(ROOT / "script/update_release_changelog.py", self.root / "script")
         self.notes = self.root / "release-notes/0.1.40.json"
         self.notes.parent.mkdir()
-        self.notes.write_text(json.dumps({"version": "0.1.40", "changes": ["Test release."]}))
+        self.notes.write_text(json.dumps({"version": "0.1.40", "changes": ["Test release."], "summary": ["Test."]}))
         self.bin = self.root / "bin"
         self.bin.mkdir()
         stub = self.bin / "stub"
@@ -211,7 +211,7 @@ class ReleaseModeTests(unittest.TestCase):
 
     def test_explicit_version_and_notes_path_are_preserved(self):
         custom_notes = self.cwd / "custom notes.json"
-        custom_notes.write_text(json.dumps({"version": "0.2.0", "changes": ["Test release."]}))
+        custom_notes.write_text(json.dumps({"version": "0.2.0", "changes": ["Test release."], "summary": ["Test."]}))
         result = self.run_release("full", MARKETING_VERSION="0.2.0",
                                   NEARFIELD_RELEASE_NOTES_FILE=custom_notes.name)
         self.assertEqual(result.returncode, 0, result.stderr)

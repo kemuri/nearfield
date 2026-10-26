@@ -57,13 +57,20 @@ Prepare `release-notes/<version>.json` with the exact version being packaged:
   "version": "0.1.39",
   "changes": [
     "Replace this example with a short summary of a change in this release."
+  ],
+  "summary": [
+    "Replace this with a one-line highlight."
   ]
 }
 ```
 
-The same notes appear in two places: the website changelog and Sparkle's update
-window, which shows them as a list above the install buttons. Write each change
-for someone deciding whether to update now.
+`changes` is the full list published on the website changelog. `summary` is what
+Sparkle's update window shows above the install buttons: up to five one-line
+highlights for someone deciding whether to update now, followed by a
+"Full release notes" link to the release's entry on the changelog
+(`/changelog/#release-<version>`). The appcast also links the changelog as
+Sparkle's version history. Full mode checks both lists and prints the summary
+before building.
 
 Full mode automatically loads the notes matching the release version. For
 example, with the current version at `0.1.38`, it loads

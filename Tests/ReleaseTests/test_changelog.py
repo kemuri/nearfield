@@ -47,14 +47,30 @@ class ChangelogTests(unittest.TestCase):
             with self.subTest(history=history), self.assertRaises(ValueError):
                 changelog.updated_releases(history, "0.1.10", "2026-09-07", self.notes)
 
-    def test_sparkle_notes_are_an_escaped_embeddable_list(self):
-        notes = {"version": "0.1.10", "changes": [" Fixed <volume> & balance. "]}
+    def test_sparkle_notes_are_the_escaped_summary_not_the_full_changes(self):
+        notes = {"version": "0.1.10", "changes": ["Fixed volume recovery after sleep."],
+                 "summary": [" Fixed <volume> & balance. "]}
         html = changelog.sparkle_release_notes(notes, "0.1.10")
         self.assertEqual(html, "<ul>\n  <li>Fixed &lt;volume&gt; &amp; balance.</li>\n</ul>\n")
         # Sparkle only embeds HTML release notes without DOCTYPE or body tags.
         self.assertNotIn("<body", html.lower())
         with self.assertRaises(ValueError):
             changelog.sparkle_release_notes(notes, "0.1.11")
+
+    def test_sparkle_notes_can_link_to_the_full_changelog(self):
+        notes = {"version": "0.1.10", "changes": ["Fixed volume."], "summary": ["Fixed volume."]}
+        html = changelog.sparkle_release_notes(
+            notes, "0.1.10", "https://trynearfield.com/changelog/#release-0.1.10")
+        self.assertTrue(html.endswith(
+            '<p><a href="https://trynearfield.com/changelog/#release-0.1.10">Full release notes</a></p>\n'))
+
+    def test_summary_is_required_short_and_kept_off_the_website(self):
+        for summary in [None, [], [" "], ["Fix."] * (changelog.MAX_SUMMARY_ITEMS + 1)]:
+            with self.subTest(summary=summary), self.assertRaises(ValueError):
+                changelog.validate_summary({**self.notes, "summary": summary}, "0.1.10")
+        notes = {**self.notes, "summary": ["Fixed volume."]}
+        result = changelog.updated_releases(self.history, "0.1.10", "2026-09-07", notes)
+        self.assertNotIn("summary", result[0])
 
     def test_date_comes_from_matching_appcast_item_in_its_timezone(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -103,7 +119,7 @@ class ReleaseNotesDiscoveryTests(unittest.TestCase):
         shutil.copyfile(SCRIPT, self.script)
         self.notes = self.root / "release-notes/0.1.10.json"
         self.notes.parent.mkdir()
-        self.content = {"version": "0.1.10", "changes": ["Fixed volume recovery."]}
+        self.content = {"version": "0.1.10", "changes": ["Fixed volume recovery."], "summary": ["Fixed volume."]}
         self.notes.write_text(json.dumps(self.content))
         self.cwd = self.root / "unrelated-directory"
         self.cwd.mkdir()
@@ -140,9 +156,10 @@ class ReleaseNotesDiscoveryTests(unittest.TestCase):
         self.assertIn(str(self.root / "release-notes/0.1.11.json"), result.stderr)
         self.assertEqual(result.stdout, "")
 
-    def test_discovered_notes_still_require_exact_version_and_changes(self):
+    def test_discovered_notes_still_require_exact_version_changes_and_summary(self):
         for content in [{**self.content, "version": "0.1.9"},
-                        {**self.content, "changes": []}]:
+                        {**self.content, "changes": []},
+                        {key: value for key, value in self.content.items() if key != "summary"}]:
             with self.subTest(content=content):
                 self.notes.write_text(json.dumps(content))
                 result = self.run_command("validate-notes", "--version", "0.1.10")
@@ -165,7 +182,8 @@ class ReleaseNotesDiscoveryTests(unittest.TestCase):
         result = self.run_command(*arguments)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(history.read_text()),
-                         [{**self.content, "date": "2026-09-21"}])
+                         [{"version": "0.1.10", "date": "2026-09-21",
+                           "changes": self.content["changes"]}])
 
         # Retrying a published release still works when its local notes are absent.
         self.notes.unlink()

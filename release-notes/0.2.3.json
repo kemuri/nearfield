@@ -10,5 +10,12 @@
     "Never make an app playing directly on a Studio Display louder when Nearfield takes over; the display's volume changes once that app stops.",
     "Settings uses the current macOS look again, and displays can be dragged to rearrange them.",
     "Nearfield now requires a Mac with Apple silicon."
+  ],
+  "summary": [
+    "New audio driver: smoother volume, balance, and route changes.",
+    "Fixed brief dropouts during playback.",
+    "Sound follows a window to the other display faster.",
+    "Nearfield turns on when your second Studio Display connects, and hands sound back when it disconnects.",
+    "Settings has the current macOS look, and you can drag displays to rearrange them."
   ]
 }
