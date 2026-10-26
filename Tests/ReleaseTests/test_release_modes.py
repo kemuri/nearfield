@@ -84,7 +84,7 @@ class ReleaseModeTests(unittest.TestCase):
         stub.write_text(f"#!{sys.executable}\n" + STUB)
         stub.chmod(0o755)
         for name in ("security", "codesign", "xcrun", "hdiutil", "ditto",
-                     "spctl", "osascript", "bless", "sync"):
+                     "spctl", "osascript", "sync"):
             (self.bin / name).symlink_to(stub)
         (self.root / "script/build_app_bundle.sh").symlink_to(stub)
         for name in ("generate_appcast.sh", "publish_website_release.sh"):
