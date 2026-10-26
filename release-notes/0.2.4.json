@@ -1,0 +1,13 @@
+{
+  "version": "0.2.4",
+  "summary": [
+    "Nearfield now plays as loud as a single Studio Display at the same volume.",
+    "The displays keep their full bass at lower volumes."
+  ],
+  "changes": [
+    "Includes audio driver 1.2.0. Nearfield now uses the Studio Displays' own volume curve, so it plays as loud as a single display at the same volume; earlier drivers played up to 16 dB quieter.",
+    "The displays keep their full bass at lower volumes: their own volume now follows Nearfield's instead of staying at maximum, so their built-in bass compensation works as it does on a single display.",
+    "Updating the driver keeps your current loudness; the volume slider moves to match the new curve.",
+    "While Nearfield is active, an app playing directly on a Studio Display follows Nearfield's volume."
+  ]
+}
