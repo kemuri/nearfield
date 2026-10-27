@@ -79,6 +79,13 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
         hostingView.autoresizingMask = [.width, .height]
         window.contentView = hostingView
         self.hostingView = hostingView
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersDidChange(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
     }
 
     required init?(coder: NSCoder) {
@@ -186,8 +193,30 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     // Pause the header animation whenever the window isn't actually on screen
     // (covered, minimized, on another Space, or closed) so it doesn't burn CPU.
     func windowDidChangeOcclusionState(_ notification: Notification) {
+        updateWindowVisibility()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        updateWindowVisibility()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        updateWindowVisibility()
+    }
+
+    // Displays coming and going move the window without always reporting an
+    // occlusion change.
+    func windowDidChangeScreen(_ notification: Notification) {
+        updateWindowVisibility()
+    }
+
+    @objc private func screenParametersDidChange(_ notification: Notification) {
+        updateWindowVisibility()
+    }
+
+    private func updateWindowVisibility() {
         guard let window else { return }
-        let isVisible = window.occlusionState.contains(.visible)
+        let isVisible = window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible)
         model.headerPaused = !isVisible
         model.setWindowVisible(isVisible)
     }

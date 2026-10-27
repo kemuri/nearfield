@@ -62,6 +62,10 @@ final class WaveLabWindowController: NSWindowController, NSWindowDelegate {
         updatePreviewPauseState()
     }
 
+    func windowDidChangeScreen(_ notification: Notification) {
+        updatePreviewPauseState()
+    }
+
     func windowWillClose(_ notification: Notification) {
         visibility.isPreviewPaused = true
     }

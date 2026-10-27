@@ -11,8 +11,14 @@ struct NearfieldHeaderAnimation: View {
     var body: some View {
         // The render effect is applied to the animation only — callers overlay
         // the logo and title on top, so those stay crisp and untouched.
-        AnimationEffectsView(effect: configuration.effect, settings: configuration.effectSettings, paused: paused) {
-            CoreHeaderAnimation(configuration: configuration, paused: paused, audioLevel: audioLevel)
+        if HeaderAnimationRenderer.shared != nil {
+            GPUHeaderAnimation(configuration: configuration.audioReactive(level: audioLevel), paused: paused)
+        } else {
+            // Without the compiled shaders (a plain `swift build`): SwiftUI
+            // redraws the whole animation on the main thread every frame.
+            AnimationEffectsView(effect: configuration.effect, settings: configuration.effectSettings, paused: paused) {
+                CoreHeaderAnimation(configuration: configuration, paused: paused, audioLevel: audioLevel)
+            }
         }
     }
 }
@@ -67,6 +73,7 @@ private struct CoreHeaderAnimation: View {
         return clock.phase
     }
 
+    // The fallback renderer; GPUHeaderAnimation draws the same in one shader.
     var body: some View {
         TimelineView(.animation(paused: paused)) { timeline in
             let now = timeline.date
@@ -301,7 +308,7 @@ struct HeaderNoiseConfiguration {
     var blendMode: BlendMode
 }
 
-private extension NearfieldHeaderAnimationConfiguration {
+extension NearfieldHeaderAnimationConfiguration {
     func audioReactive(level: Double) -> NearfieldHeaderAnimationConfiguration {
         let level = min(max(level, 0), 1.5)
         guard level > 0 else { return self }
