@@ -145,6 +145,7 @@ class ProxyAudioDevice {
     void applySettingsEffects(uint32_t changes);
     void persistSettingsIfChangedNoLock();
     void loadSettingsFromStorage();
+    void writeToStorage(CFStringRef key, CFPropertyListRef value);
     void updateClientRoutesNoLock();
     nearfield::Route routeForClientNoLock(const std::string &bundleID, pid_t processID) const;
     void applyPlaybackSettingsNoLock();
@@ -543,6 +544,9 @@ class ProxyAudioDevice {
     std::recursive_mutex stateMutex;
     dispatch_queue_t audioOutputQueue = NULL;
     dispatch_source_t engineSignalSource = NULL;
+    // Saves settings in order, away from host callbacks and stateMutex (see
+    // writeToStorage).
+    dispatch_queue_t storageQueue = NULL;
 
     // Audio path (lock-free; see NearfieldPlayback.h).
     nearfield::PlaybackEngine engine;

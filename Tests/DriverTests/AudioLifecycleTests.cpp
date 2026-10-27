@@ -42,6 +42,8 @@ struct FakeHostState {
     int settingsWrites = 0;
     std::vector<AudioObjectPropertySelector> changedSelectors;
     std::vector<UInt64> configurationRequests;
+    // While set, writes wait for it, as they wait for a busy coreaudiod.
+    std::atomic<dispatch_semaphore_t> writeGate{nullptr};
 
     void reset() {
         std::lock_guard<std::mutex> lock(mutex);
@@ -77,6 +79,10 @@ OSStatus fakeCopyFromStorage(AudioServerPlugInHostRef, CFStringRef key, CFProper
 }
 
 OSStatus fakeWriteToStorage(AudioServerPlugInHostRef, CFStringRef key, CFPropertyListRef data) {
+    if (dispatch_semaphore_t gate = gHost.writeGate.load()) {
+        dispatch_semaphore_wait(gate, DISPATCH_TIME_FOREVER);
+        dispatch_semaphore_signal(gate);
+    }
     std::lock_guard<std::mutex> lock(gHost.mutex);
     CFDictionarySetValue(gHost.storage, key, data);
     if (CFEqual(key, CFSTR("settings"))) {
@@ -120,6 +126,7 @@ struct DriverFixture {
         device.manageOutputDevice = false;
         device.initializedHostTime = mach_absolute_time();
         device.audioOutputQueue = dispatch_queue_create("nearfield.driver-tests", DISPATCH_QUEUE_SERIAL);
+        device.storageQueue = dispatch_queue_create("nearfield.driver-tests.storage", DISPATCH_QUEUE_SERIAL);
         device.engineSignalSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0, device.audioOutputQueue);
         ProxyAudioDevice *driver = &device;
         dispatch_source_set_event_handler(device.engineSignalSource, ^{
@@ -139,7 +146,11 @@ struct DriverFixture {
 
     ~DriverFixture() { drain(); }
 
-    void drain() { dispatch_sync(device.audioOutputQueue, ^{}); }
+    // Work on the output queue can save settings, so the storage queue goes second.
+    void drain() {
+        dispatch_sync(device.audioOutputQueue, ^{});
+        dispatch_sync(device.storageQueue, ^{});
+    }
 
     void fill(Float32 left, Float32 right) {
         for (UInt32 frame = 0; frame < kFrames; ++frame) {
@@ -1082,6 +1093,54 @@ static void testSampleRateChangeIsRememberedAndResetsTheBuffer() {
     CHECK(restarted.device.settings.sampleRate == 96000);
 }
 
+// Unplugging a display makes coreaudiod ask Nearfield for its sample rate
+// while holding the locks a storage write waits for (2026-10-27: coreaudiod,
+// and every app using audio, hung until it was killed). Saving must never
+// keep a host callback or the state mutex waiting for coreaudiod.
+static void testSavingSettingsDoesNotWaitForCoreAudio() {
+    DriverFixture f;
+    f.drain();
+    dispatch_semaphore_t gate = dispatch_semaphore_create(0);
+    gHost.writeGate.store(gate);
+    const auto ready = [](auto &future) {
+        return future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    };
+
+    CFDictionarySmartRef update(dictionary({{nearfield::kSettingsDeviceNameKey, CFSTR("Unplugged")}}));
+    CFPropertyListRef list = update;
+    auto settings = std::async(std::launch::async, [&] {
+        return f.setBoxProperty(kNearfieldPropertySettings, sizeof(list), &list);
+    });
+    CHECK(ready(settings));
+    CHECK(settings.get() == noErr);
+
+    auto rateChange = std::async(std::launch::async, [&] {
+        return f.device.PerformDeviceConfigurationChange(gAudioServerPlugInDriverRef, kObjectID_Device, 96000, nullptr);
+    });
+    CHECK(ready(rateChange));
+    CHECK(rateChange.get() == noErr);
+
+    auto rate = std::async(std::launch::async, [&] {
+        AudioObjectPropertyAddress address = {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal,
+                                              kAudioObjectPropertyElementMain};
+        Float64 value = 0;
+        UInt32 size = 0;
+        f.device.GetPropertyData(gAudioServerPlugInDriverRef, kObjectID_Device, 0, &address, 0, nullptr, sizeof(value),
+                                 &size, &value);
+        return value;
+    });
+    CHECK(ready(rate));
+    CHECK(rate.get() == 96000);
+
+    // Once coreaudiod answers, everything is saved.
+    gHost.writeGate.store(nullptr);
+    dispatch_semaphore_signal(gate);
+    f.drain();
+    DriverFixture restarted(false);
+    CHECK(restarted.device.settings.deviceName == "Unplugged");
+    CHECK(restarted.device.settings.sampleRate == 96000);
+}
+
 static void testDisplaysGoneHidesNearfieldAfterAboutASecond() {
     DriverFixture f;
     f.device.settings.targetDevices = {"missing-left", "missing-right"};
@@ -1654,6 +1713,7 @@ int main(int argc, char **argv) {
         {"legacy readiness", testLegacyReadinessRequiresCurrentConfigurationAndInitializedOutput, false, false},
         {"status and custom properties", testStatusAndCustomProperties, false, false},
         {"sample rate is remembered", testSampleRateChangeIsRememberedAndResetsTheBuffer, false, false},
+        {"saving settings does not wait for Core Audio", testSavingSettingsDoesNotWaitForCoreAudio, true, false},
         {"displays gone hides Nearfield", testDisplaysGoneHidesNearfieldAfterAboutASecond, false, false},
         {"unsigned driver accepts writers", testUnsignedDriverAcceptsDevelopmentWriters, false, false},
         {"ring buffer with two threads and resizing", testRingBufferWithConcurrentWriterReaderAndResize, true, false},

@@ -562,6 +562,7 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
         DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, -1
     );
     audioOutputQueue = dispatch_queue_create("com.kemuri.Nearfield.AudioDevice.audioOutputQueue", priorityAttribute);
+    storageQueue = dispatch_queue_create("com.kemuri.Nearfield.AudioDevice.storageQueue", DISPATCH_QUEUE_SERIAL);
 
     // The audio threads report events (latency changes, underruns, drained
     // buffers) by merging bits into this source; the work runs on the queue.
@@ -668,11 +669,29 @@ void ProxyAudioDevice::persistSettingsIfChangedNoLock() {
         CFRelease(current);
         return;
     }
-    gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("settings"), current);
+    writeToStorage(CFSTR("settings"), current);
     if (lastPersistedSettings) {
         CFRelease(lastPersistedSettings);
     }
     lastPersistedSettings = current;
+}
+
+// Writing to storage waits for coreaudiod, which may itself be waiting for
+// this driver: when a display is unplugged, coreaudiod asks for Nearfield's
+// sample rate (which takes stateMutex) while holding the locks the write
+// needs. Writing from a host callback or with stateMutex held then deadlocks
+// coreaudiod and every app using audio, so writes run on their own queue.
+void ProxyAudioDevice::writeToStorage(CFStringRef key, CFPropertyListRef value) {
+    if (!gPlugIn_Host || !key || !value) {
+        return;
+    }
+    CFRetain(key);
+    CFRetain(value);
+    dispatch_async(storageQueue, ^{
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host, key, value);
+        CFRelease(value);
+        CFRelease(key);
+    });
 }
 
 void ProxyAudioDevice::applyPlaybackSettingsNoLock() {
@@ -2240,7 +2259,7 @@ OSStatus ProxyAudioDevice::SetBoxPropertyData(AudioServerPlugInDriverRef inDrive
                     CFRelease(boxName);
                 }
                 boxName = CFStringCreateCopy(NULL, *newValue);
-                gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("box name"), boxName);
+                writeToStorage(CFSTR("box name"), boxName);
                 *outNumberPropertiesChanged = 1;
                 outChangedAddresses[0].mSelector = kAudioObjectPropertyName;
                 outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
@@ -2289,8 +2308,7 @@ OSStatus ProxyAudioDevice::SetBoxPropertyData(AudioServerPlugInDriverRef inDrive
                     const bool acquired = *((const UInt32 *)inData) != 0;
                     if (gBox_Acquired != acquired) {
                         gBox_Acquired = acquired;
-                        gPlugIn_Host->WriteToStorage(
-                            gPlugIn_Host, CFSTR("box acquired"), gBox_Acquired ? kCFBooleanTrue : kCFBooleanFalse);
+                        writeToStorage(CFSTR("box acquired"), gBox_Acquired ? kCFBooleanTrue : kCFBooleanFalse);
                         changed = true;
                     }
                 }
