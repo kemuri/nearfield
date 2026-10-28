@@ -2,12 +2,25 @@ import AppKit
 import SwiftUI
 
 enum Theme {
-    static let background = Color(nsColor: .windowBackgroundColor)
     static let groupBackground = Color(nsColor: .labelColor).opacity(0.035)
     static let activeRowBackground = Color(nsColor: .labelColor).opacity(0.08)
     static let completedRowBackground = Color(nsColor: .labelColor).opacity(0.035)
     static let pendingRowBackground = Color(nsColor: .labelColor).opacity(0.055)
     static let separator = Color(nsColor: .separatorColor)
+}
+
+/// The system window material picks up the wallpaper tint like System
+/// Settings does; a flat window background color would not.
+struct WindowMaterialBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .windowBackground
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 extension Text {

@@ -9,6 +9,7 @@
     "Includes audio driver 1.3.1. Disconnecting the Studio Displays could hang the Mac's audio system: sound stopped everywhere, and Safari and other apps that use audio stopped loading until the Mac was restarted. The driver no longer waits on the audio system while it is busy, so this can't happen.",
     "New Character setting in Settings → Sound. Studio Displays add more bass the quieter they play; Character keeps that tuning (Studio Display, the default) or removes some of it (Warm, Balanced), up to Neutral, which keeps the balance the displays have at full volume at every volume.",
     "Character follows each display's volume and changes smoothly, without clicks.",
-    "The animated header in Settings and setup is now drawn on the graphics processor and uses a fraction of the CPU it did. It stops whenever its window can't be seen, including after displays are connected or disconnected."
+    "The animated header in Settings and setup is now drawn on the graphics processor and uses a fraction of the CPU it did. It stops whenever its window can't be seen, including after displays are connected or disconnected.",
+    "The Settings and setup window now uses the standard macOS window background, so it takes on your wallpaper's tint like System Settings instead of a flat gray."
   ]
 }

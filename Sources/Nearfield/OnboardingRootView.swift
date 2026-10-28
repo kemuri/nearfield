@@ -50,7 +50,7 @@ struct OnboardingRootView: View {
             .allowsHitTesting(false)
         }
         .frame(width: OnboardingLayout.baseSize.width, height: OnboardingLayout.baseSize.height, alignment: .top)
-        .background(Theme.background)
+        .background { WindowMaterialBackground() }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .ignoresSafeArea()
         .animation(.smooth(duration: model.stepTransitionDuration), value: model.step)

@@ -879,17 +879,22 @@ private struct ProgressiveTopFade: View {
     let isVisible: Bool
 
     var body: some View {
-        LinearGradient(
-            colors: [
-                Theme.background.opacity(0.98),
-                Theme.background.opacity(0.72),
-                Theme.background.opacity(0.22),
-                Theme.background.opacity(0)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-        .opacity(isVisible ? 1 : 0)
+        // Fade into the window material itself so the edge matches the
+        // background behind the scrolled content.
+        WindowMaterialBackground()
+            .mask {
+                LinearGradient(
+                    colors: [
+                        .black.opacity(0.98),
+                        .black.opacity(0.72),
+                        .black.opacity(0.22),
+                        .black.opacity(0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+            .opacity(isVisible ? 1 : 0)
         .frame(height: 74)
     }
 }
