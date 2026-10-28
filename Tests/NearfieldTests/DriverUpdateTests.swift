@@ -66,6 +66,13 @@ final class DriverUpdateTests: XCTestCase {
         XCTAssertThrowsError(try DriverInstaller.verifyInstalledDriverVersion("1.0.8", in: fixture.installedDirectory))
     }
 
+    func testInstalledDriverVersionReadsTheBundleOnDisk() throws {
+        let fixture = try DriverFixture(installedVersion: "1.0.7", bundledVersion: "1.0.8")
+        XCTAssertEqual(DriverInstaller.installedDriverVersion(in: fixture.installedDirectory), "1.0.7")
+        try FileManager.default.removeItem(at: fixture.installedURL)
+        XCTAssertNil(DriverInstaller.installedDriverVersion(in: fixture.installedDirectory))
+    }
+
     func testUpgradeRequestPreservesRoutingOnCancellationAndDoesNotRequireDisplays() {
         let request = DriverInstallRequest.driverUpgrade
         XCTAssertTrue(request.requiresConfirmation)

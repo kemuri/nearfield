@@ -261,10 +261,16 @@ extension AppDelegate: SettingsDelegate {
         let build = info?["CFBundleVersion"] as? String
         let resolvedVersion = version?.nilIfBlank ?? "0.1.0"
 
+        var text = "Version \(resolvedVersion)"
         if let build = build?.nilIfBlank, build != resolvedVersion {
-            return "Version \(resolvedVersion) (\(build))"
+            text += " (\(build))"
         }
-        return "Version \(resolvedVersion)"
+        // The running driver's version; the one on disk until Core Audio loads it.
+        let driverVersion = routerDriverManager.status()?.driverVersion ?? DriverInstaller.installedDriverVersion()
+        if let driverVersion = driverVersion?.nilIfBlank {
+            text += " · Driver \(driverVersion)"
+        }
+        return text
     }
 
     func settingsBalance() -> Float {

@@ -341,6 +341,12 @@ final class DriverInstaller {
         )
     }
 
+    static func installedDriverVersion(
+        in directoryURL: URL = URL(fileURLWithPath: halDriverDirectory, isDirectory: true)
+    ) -> String? {
+        driverBuildVersion(at: directoryURL.appendingPathComponent(routerDriverBundleName))
+    }
+
     static func verifyInstalledDriverVersion(
         _ expected: String,
         in directoryURL: URL = URL(fileURLWithPath: halDriverDirectory, isDirectory: true)
