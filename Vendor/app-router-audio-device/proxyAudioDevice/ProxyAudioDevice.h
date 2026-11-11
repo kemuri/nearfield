@@ -153,6 +153,7 @@ class ProxyAudioDevice {
     void notifyStatusChanged();
     void notifyDeviceListChanged();
     void notifyLatencyChanged();
+    void notifyPropertiesChanged(AudioObjectID objectID, UInt32 count, const AudioObjectPropertyAddress *addresses);
     bool writerIsAuthorized(pid_t processID);
     void loadOwnTeamIdentifier();
     void handleEngineSignals(uintptr_t signals);
@@ -547,6 +548,9 @@ class ProxyAudioDevice {
     // Saves settings in order, away from host callbacks and stateMutex (see
     // writeToStorage).
     dispatch_queue_t storageQueue = NULL;
+    // Tells the host what a call from the host changed, in order, without
+    // that call waiting (see notifyPropertiesChanged).
+    dispatch_queue_t notificationQueue = NULL;
 
     // Audio path (lock-free; see NearfieldPlayback.h).
     nearfield::PlaybackEngine engine;

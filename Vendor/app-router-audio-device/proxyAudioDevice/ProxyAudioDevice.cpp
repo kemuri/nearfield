@@ -563,6 +563,8 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     );
     audioOutputQueue = dispatch_queue_create("com.kemuri.Nearfield.AudioDevice.audioOutputQueue", priorityAttribute);
     storageQueue = dispatch_queue_create("com.kemuri.Nearfield.AudioDevice.storageQueue", DISPATCH_QUEUE_SERIAL);
+    notificationQueue =
+        dispatch_queue_create("com.kemuri.Nearfield.AudioDevice.notificationQueue", DISPATCH_QUEUE_SERIAL);
 
     // The audio threads report events (latency changes, underruns, drained
     // buffers) by merging bits into this source; the work runs on the queue.
@@ -1268,7 +1270,7 @@ OSStatus ProxyAudioDevice::SetPropertyData(AudioServerPlugInDriverRef inDriver,
 
     //    send any notifications
     if (theNumberPropertiesChanged > 0) {
-        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inObjectID, theNumberPropertiesChanged, theChangedAddresses);
+        notifyPropertiesChanged(inObjectID, theNumberPropertiesChanged, theChangedAddresses);
     }
 
 Done:
@@ -5921,6 +5923,25 @@ void ProxyAudioDevice::notifyLatencyChanged() {
         kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain};
     gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &address);
     notifyStatusChanged();
+}
+
+// Telling the host that properties changed waits for coreaudiod, as a storage
+// write does (see writeToStorage), and coreaudiod may be waiting for this
+// driver: after a wake it asked whether Nearfield has a property while
+// Nearfield, still inside SetPropertyData, waited to deliver a notification.
+// Neither could continue, and coreaudiod and every app using audio hung
+// (2026-11-11, driver 1.3.1). What a call from the host changed is therefore
+// reported from a queue of its own, which that call does not wait for.
+void ProxyAudioDevice::notifyPropertiesChanged(AudioObjectID objectID,
+                                               UInt32 count,
+                                               const AudioObjectPropertyAddress *addresses) {
+    if (!gPlugIn_Host || !addresses || count == 0) {
+        return;
+    }
+    const std::vector<AudioObjectPropertyAddress> changed(addresses, addresses + count);
+    dispatch_async(notificationQueue, ^{
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, objectID, (UInt32)changed.size(), changed.data());
+    });
 }
 
 void ProxyAudioDevice::notifyDeviceListChanged() {

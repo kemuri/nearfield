@@ -42,8 +42,9 @@ struct FakeHostState {
     int settingsWrites = 0;
     std::vector<AudioObjectPropertySelector> changedSelectors;
     std::vector<UInt64> configurationRequests;
-    // While set, writes wait for it, as they wait for a busy coreaudiod.
-    std::atomic<dispatch_semaphore_t> writeGate{nullptr};
+    // While set, calls into the host wait for it, as they wait for a busy
+    // coreaudiod.
+    std::atomic<dispatch_semaphore_t> gate{nullptr};
 
     void reset() {
         std::lock_guard<std::mutex> lock(mutex);
@@ -57,6 +58,18 @@ struct FakeHostState {
         std::lock_guard<std::mutex> lock(mutex);
         return std::find(changedSelectors.begin(), changedSelectors.end(), selector) != changedSelectors.end();
     }
+
+    // Every call that waits for coreaudiod comes through here. The driver may
+    // make them only from its own queues: on a call from the host, coreaudiod
+    // can be waiting for that call to return.
+    void waitForCoreAudio() {
+        const char *queue = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+        CHECK(std::string(queue ? queue : "").rfind("nearfield.driver-tests", 0) == 0);
+        if (dispatch_semaphore_t closed = gate.load()) {
+            dispatch_semaphore_wait(closed, DISPATCH_TIME_FOREVER);
+            dispatch_semaphore_signal(closed);
+        }
+    }
 };
 
 // Never destroyed: notifications queued by leaked drivers may still arrive
@@ -64,6 +77,7 @@ struct FakeHostState {
 FakeHostState &gHost = *new FakeHostState;
 
 OSStatus fakePropertiesChanged(AudioServerPlugInHostRef, AudioObjectID, UInt32 count, const AudioObjectPropertyAddress *addresses) {
+    gHost.waitForCoreAudio();
     std::lock_guard<std::mutex> lock(gHost.mutex);
     for (UInt32 index = 0; index < count; ++index) {
         gHost.changedSelectors.push_back(addresses[index].mSelector);
@@ -79,10 +93,7 @@ OSStatus fakeCopyFromStorage(AudioServerPlugInHostRef, CFStringRef key, CFProper
 }
 
 OSStatus fakeWriteToStorage(AudioServerPlugInHostRef, CFStringRef key, CFPropertyListRef data) {
-    if (dispatch_semaphore_t gate = gHost.writeGate.load()) {
-        dispatch_semaphore_wait(gate, DISPATCH_TIME_FOREVER);
-        dispatch_semaphore_signal(gate);
-    }
+    gHost.waitForCoreAudio();
     std::lock_guard<std::mutex> lock(gHost.mutex);
     CFDictionarySetValue(gHost.storage, key, data);
     if (CFEqual(key, CFSTR("settings"))) {
@@ -98,6 +109,7 @@ OSStatus fakeDeleteFromStorage(AudioServerPlugInHostRef, CFStringRef key) {
 }
 
 OSStatus fakeRequestConfigurationChange(AudioServerPlugInHostRef, AudioObjectID, UInt64 action, void *) {
+    gHost.waitForCoreAudio();
     std::lock_guard<std::mutex> lock(gHost.mutex);
     gHost.configurationRequests.push_back(action);
     return noErr;
@@ -127,6 +139,7 @@ struct DriverFixture {
         device.initializedHostTime = mach_absolute_time();
         device.audioOutputQueue = dispatch_queue_create("nearfield.driver-tests", DISPATCH_QUEUE_SERIAL);
         device.storageQueue = dispatch_queue_create("nearfield.driver-tests.storage", DISPATCH_QUEUE_SERIAL);
+        device.notificationQueue = dispatch_queue_create("nearfield.driver-tests.notifications", DISPATCH_QUEUE_SERIAL);
         device.engineSignalSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0, device.audioOutputQueue);
         ProxyAudioDevice *driver = &device;
         dispatch_source_set_event_handler(device.engineSignalSource, ^{
@@ -150,6 +163,7 @@ struct DriverFixture {
     void drain() {
         dispatch_sync(device.audioOutputQueue, ^{});
         dispatch_sync(device.storageQueue, ^{});
+        dispatch_sync(device.notificationQueue, ^{});
     }
 
     void fill(Float32 left, Float32 right) {
@@ -936,11 +950,11 @@ static void testSettingsApplyInOneStepAndSaveOnlyChanges() {
 static void testLegacyDriverSettingsAreMigrated() {
     gHost.reset();
     CFNumberSmartRef routing(CFNumberCreate(NULL, kCFNumberSInt32Type, (const SInt32[]){1}));
-    fakeWriteToStorage(&gFakeHost, CFSTR("deviceName"), CFSTR("Legacy"));
-    fakeWriteToStorage(&gFakeHost, CFSTR("targetAggregateDevices"), CFSTR("a\nb"));
-    fakeWriteToStorage(&gFakeHost, CFSTR("routingEnabled"), routing);
-    fakeWriteToStorage(&gFakeHost, CFSTR("routeRules"), CFSTR("x.app=right; pid:5=left"));
-    fakeWriteToStorage(&gFakeHost, CFSTR("outputDeviceUID"), CFSTR(kDriverTargetAggregate_UID));
+    CFDictionarySetValue(gHost.storage, CFSTR("deviceName"), CFSTR("Legacy"));
+    CFDictionarySetValue(gHost.storage, CFSTR("targetAggregateDevices"), CFSTR("a\nb"));
+    CFDictionarySetValue(gHost.storage, CFSTR("routingEnabled"), routing);
+    CFDictionarySetValue(gHost.storage, CFSTR("routeRules"), CFSTR("x.app=right; pid:5=left"));
+    CFDictionarySetValue(gHost.storage, CFSTR("outputDeviceUID"), CFSTR(kDriverTargetAggregate_UID));
     DriverFixture f(false);
     CHECK(f.device.settings.deviceName == "Legacy");
     CHECK((f.device.settings.targetDevices == std::vector<std::string>{"a", "b"}));
@@ -1101,7 +1115,7 @@ static void testSavingSettingsDoesNotWaitForCoreAudio() {
     DriverFixture f;
     f.drain();
     dispatch_semaphore_t gate = dispatch_semaphore_create(0);
-    gHost.writeGate.store(gate);
+    gHost.gate.store(gate);
     const auto ready = [](auto &future) {
         return future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
     };
@@ -1133,12 +1147,72 @@ static void testSavingSettingsDoesNotWaitForCoreAudio() {
     CHECK(rate.get() == 96000);
 
     // Once coreaudiod answers, everything is saved.
-    gHost.writeGate.store(nullptr);
+    gHost.gate.store(nullptr);
     dispatch_semaphore_signal(gate);
     f.drain();
     DriverFixture restarted(false);
     CHECK(restarted.device.settings.deviceName == "Unplugged");
     CHECK(restarted.device.settings.sampleRate == 96000);
+}
+
+// Waking the Mac made coreaudiod wait for Nearfield's answer while Nearfield,
+// still inside SetPropertyData, waited for coreaudiod to take the "property
+// changed" notification (2026-11-11: coreaudiod, and every app using audio,
+// hung until it restarted). Nothing the host calls may wait for the host.
+static void testHostCallsDoNotWaitForCoreAudio() {
+    DriverFixture f;
+    f.drain();
+    dispatch_semaphore_t gate = dispatch_semaphore_create(0);
+    gHost.gate.store(gate);
+    const auto returns = [](std::function<OSStatus()> call) {
+        auto status = std::async(std::launch::async, call);
+        CHECK(status.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        CHECK(status.get() == noErr);
+    };
+    const auto set = [&](AudioObjectID object, AudioObjectPropertySelector selector, UInt32 size, const void *data) {
+        returns([&] {
+            AudioObjectPropertyAddress address = {selector, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            return f.device.SetPropertyData(gAudioServerPlugInDriverRef, object, getpid(), &address, 0, nullptr, size, data);
+        });
+    };
+
+    const Float32 volume = 0.25f;
+    const UInt32 on = 1;
+    const UInt32 off = 0;
+    const Float64 rate = 96000;
+    CFStringRef name = CFSTR("Renamed");
+    set(kObjectID_Volume_Output_L, kAudioLevelControlPropertyScalarValue, sizeof(volume), &volume);
+    set(kObjectID_Volume_Output_R, kAudioLevelControlPropertyScalarValue, sizeof(volume), &volume);
+    set(kObjectID_Mute_Output_Master, kAudioBooleanControlPropertyValue, sizeof(on), &on);
+    set(kObjectID_Stream_Output, kAudioStreamPropertyIsActive, sizeof(off), &off);
+    set(kObjectID_Box, kAudioObjectPropertyName, sizeof(name), &name);
+    set(kObjectID_Box, kAudioBoxPropertyAcquired, sizeof(off), &off);
+    set(kObjectID_Device, kAudioDevicePropertyNominalSampleRate, sizeof(rate), &rate);
+    returns([&] { return f.device.StartIO(gAudioServerPlugInDriverRef, kObjectID_Device, 1); });
+    returns([&] { return f.device.StopIO(gAudioServerPlugInDriverRef, kObjectID_Device, 1); });
+    // Reads take the state mutex, which nothing waiting for the host may hold.
+    returns([&] {
+        AudioObjectPropertyAddress address = {kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal,
+                                              kAudioObjectPropertyElementMain};
+        Float32 value = 0;
+        UInt32 size = 0;
+        const OSStatus status = f.device.GetPropertyData(gAudioServerPlugInDriverRef, kObjectID_Volume_Output_L, 0,
+                                                         &address, 0, nullptr, sizeof(value), &size, &value);
+        return status == noErr && value == volume ? noErr : kAudioHardwareUnspecifiedError;
+    });
+
+    // Once coreaudiod answers, it hears about every change.
+    gHost.gate.store(nullptr);
+    dispatch_semaphore_signal(gate);
+    f.drain();
+    const AudioObjectPropertySelector changed[] = {
+        kAudioLevelControlPropertyScalarValue, kAudioBooleanControlPropertyValue, kAudioStreamPropertyIsActive,
+        kAudioObjectPropertyName,              kAudioBoxPropertyAcquired,         kAudioPlugInPropertyDeviceList};
+    for (AudioObjectPropertySelector selector : changed) {
+        CHECK(gHost.sawChange(selector));
+    }
+    std::lock_guard<std::mutex> lock(gHost.mutex);
+    CHECK(gHost.configurationRequests == std::vector<UInt64>{96000});
 }
 
 static void testDisplaysGoneHidesNearfieldAfterAboutASecond() {
@@ -1714,6 +1788,7 @@ int main(int argc, char **argv) {
         {"status and custom properties", testStatusAndCustomProperties, false, false},
         {"sample rate is remembered", testSampleRateChangeIsRememberedAndResetsTheBuffer, false, false},
         {"saving settings does not wait for Core Audio", testSavingSettingsDoesNotWaitForCoreAudio, true, false},
+        {"host calls do not wait for Core Audio", testHostCallsDoNotWaitForCoreAudio, true, false},
         {"displays gone hides Nearfield", testDisplaysGoneHidesNearfieldAfterAboutASecond, false, false},
         {"unsigned driver accepts writers", testUnsignedDriverAcceptsDevelopmentWriters, false, false},
         {"ring buffer with two threads and resizing", testRingBufferWithConcurrentWriterReaderAndResize, true, false},
