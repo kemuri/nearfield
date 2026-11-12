@@ -1,0 +1,9 @@
+{
+  "version": "0.2.7",
+  "summary": [
+    "Fixes another way the Mac's audio could hang, this time when a sound setting changed while macOS was rebuilding its list of audio devices, for example after waking from sleep."
+  ],
+  "changes": [
+    "Includes audio driver 1.3.2. Changing volume, mute, or another sound setting while macOS was rebuilding its list of audio devices, which happens after waking from sleep or when audio devices come and go, could hang the Mac's audio system. Sound stopped, Nearfield disappeared from the Sound settings, and apps that use audio stopped responding until CoreAudio was restarted. The driver now answers the audio system right away and reports the change afterwards, so the two no longer wait on each other."
+  ]
+}
