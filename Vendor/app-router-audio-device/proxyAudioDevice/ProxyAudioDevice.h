@@ -59,6 +59,10 @@ constexpr double kDisplayLossHideSeconds = 1.0;
 // Core Audio enumerates USB displays some seconds after boot; do not hide
 // Nearfield before they had a chance to appear.
 constexpr double kDisplayLossStartupGraceSeconds = 10.0;
+// How long to wait for coreaudiod to apply a sample rate change Nearfield
+// requested to follow the displays before asking again, and how often to ask.
+constexpr double kFollowSampleRateCheckSeconds = 1.0;
+constexpr int kFollowSampleRateAttempts = 6;
 
 using StateLocker = std::lock_guard<std::recursive_mutex>;
 
@@ -109,6 +113,8 @@ class ProxyAudioDevice {
     void scheduleOutputStop(double seconds);
     void matchOutputDeviceSampleRate();
     void scheduleSampleRateRetry();
+    void followDisplaysSampleRate(Float64 sampleRate);
+    void stopFollowingDisplaysSampleRate();
     void scheduleOutputSetupRetry();
     void applyRequestedSampleRateToOutput(Float64 sampleRate);
     void refreshAvailableSampleRates();
@@ -595,6 +601,11 @@ class ProxyAudioDevice {
     UInt64 outputSetupRetryToken = 0;
     AudioObjectID outputSetupRetryDeviceID = kAudioObjectUnknown;
     Float64 requestedOutputSampleRate = 0;
+    // The displays' rate Nearfield asked coreaudiod to switch it to; 0 when
+    // no such change is pending.
+    Float64 followedSampleRate = 0;
+    int followSampleRateAttempts = 0;
+    UInt64 followSampleRateToken = 0;
     bool devicesListenerInstalled = false;
     UInt64 initializedHostTime = 0;
     // Tests turn this off so the driver never builds aggregates, opens

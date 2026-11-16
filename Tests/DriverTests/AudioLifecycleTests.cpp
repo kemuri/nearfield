@@ -1244,6 +1244,52 @@ static void testDisplaysGoneHidesNearfieldAfterAboutASecond() {
     CHECK(f.device.deviceIsPublished());
 }
 
+// 2026-11-15: the displays came back at 48 kHz while Nearfield was hidden.
+// coreaudiod dropped the request to follow them, and Nearfield stayed silent at
+// 44.1 kHz until its rate was changed by hand.
+static void testFollowingTheDisplaysRateSurvivesAHiddenDevice() {
+    DriverFixture f;
+    CHECK(f.device.gDevice_SampleRate.load() == 48000);
+    auto requests = [] {
+        std::lock_guard<std::mutex> lock(gHost.mutex);
+        return gHost.configurationRequests;
+    };
+    auto onOutputQueue = [&](void (^block)()) {
+        dispatch_sync(f.device.audioOutputQueue, block);
+        f.drain();
+    };
+
+    // While hidden, Nearfield remembers the rate instead of asking for it.
+    onOutputQueue(^{ f.device.setDisplaysHidden(true); });
+    onOutputQueue(^{ f.device.followDisplaysSampleRate(44100); });
+    CHECK(requests().empty());
+
+    // Shown again, it asks once coreaudiod had time to add the device back.
+    onOutputQueue(^{ f.device.setDisplaysHidden(false); });
+    CHECK(requests().empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    f.drain();
+    CHECK(requests() == std::vector<UInt64>{44100});
+
+    // A request coreaudiod never applied is repeated.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    f.drain();
+    CHECK(requests() == (std::vector<UInt64>{44100, 44100}));
+
+    // Once the change arrives, Nearfield stops asking.
+    CHECK(f.device.PerformDeviceConfigurationChange(gAudioServerPlugInDriverRef, kObjectID_Device, 44100, nullptr) == noErr);
+    f.drain();
+    CHECK(f.device.followedSampleRate == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    f.drain();
+    CHECK(requests().size() == 2);
+
+    // Following the rate Nearfield already runs at asks for nothing.
+    onOutputQueue(^{ f.device.followDisplaysSampleRate(44100); });
+    CHECK(requests().size() == 2);
+    CHECK(f.device.followedSampleRate == 0);
+}
+
 static void testUnsignedDriverAcceptsDevelopmentWriters() {
     DriverFixture f;
     CHECK(f.device.writerIsAuthorized(getpid()));
@@ -1790,6 +1836,7 @@ int main(int argc, char **argv) {
         {"saving settings does not wait for Core Audio", testSavingSettingsDoesNotWaitForCoreAudio, true, false},
         {"host calls do not wait for Core Audio", testHostCallsDoNotWaitForCoreAudio, true, false},
         {"displays gone hides Nearfield", testDisplaysGoneHidesNearfieldAfterAboutASecond, false, false},
+        {"following the displays' rate survives a hidden device", testFollowingTheDisplaysRateSurvivesAHiddenDevice, false, false},
         {"unsigned driver accepts writers", testUnsignedDriverAcceptsDevelopmentWriters, false, false},
         {"ring buffer with two threads and resizing", testRingBufferWithConcurrentWriterReaderAndResize, true, false},
         {"device name reads and renames", testDeviceNameReadsDoNotRaceWithRenames, true, false},

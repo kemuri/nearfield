@@ -858,6 +858,7 @@ OSStatus ProxyAudioDevice::PerformDeviceConfigurationChange(AudioServerPlugInDri
 
     // Apps choose Nearfield's rate; pass it on to the displays.
     ExecuteInAudioOutputThread(^{
+        stopFollowingDisplaysSampleRate();
         applyRequestedSampleRateToOutput(sampleRate);
         matchOutputDeviceSampleRate();
         notifyLatencyChanged();
@@ -4790,6 +4791,7 @@ void ProxyAudioDevice::deinitializeOutputDevice() {
     }
     outputDeviceReady = false;
     requestedOutputSampleRate = 0;
+    stopFollowingDisplaysSampleRate();
 }
 
 void ProxyAudioDevice::setupAudioDevicesListener() {
@@ -4974,6 +4976,7 @@ void ProxyAudioDevice::matchOutputDeviceSampleRate() {
         requestedOutputSampleRate = 0;
         sampleRateRetryCount = 0;
         ++sampleRateRetryToken;
+        stopFollowingDisplaysSampleRate();
         if (!outputDeviceReady) {
             outputDeviceReady = true;
             notifyStatusChanged();
@@ -4997,8 +5000,7 @@ void ProxyAudioDevice::matchOutputDeviceSampleRate() {
     if (outputRate > 0 && isSupportedSampleRate(outputRate)) {
         // The displays' rate changed elsewhere (for example in Audio MIDI
         // Setup): Nearfield follows.
-        syslog(LOG_NOTICE, "NearfieldAudioDevice: following the displays to %.0f Hz", outputRate);
-        gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, (UInt64)outputRate, NULL);
+        followDisplaysSampleRate(outputRate);
         return;
     }
     // The displays report a rate Nearfield cannot use (seen at boot): ask
@@ -5026,6 +5028,51 @@ void ProxyAudioDevice::scheduleSampleRateRetry() {
         }
         matchOutputDeviceSampleRate();
     });
+}
+
+// Asks coreaudiod to move Nearfield to the displays' rate. coreaudiod drops
+// the request while Nearfield is hidden, so it waits until Nearfield is shown
+// and is repeated until the change arrives (2026-11-15: the displays came back
+// at 48 kHz 11 s before Nearfield was shown again, the request was lost, and
+// Nearfield stayed silent at 44.1 kHz until its rate was changed by hand).
+void ProxyAudioDevice::followDisplaysSampleRate(Float64 sampleRate) {
+    if (fabs(gDevice_SampleRate.load() - sampleRate) < 0.5) {
+        stopFollowingDisplaysSampleRate();
+        return;
+    }
+    if (fabs(followedSampleRate - sampleRate) >= 0.5) {
+        followedSampleRate = sampleRate;
+        followSampleRateAttempts = 0;
+    }
+    const UInt64 token = ++followSampleRateToken;
+    if (!deviceIsPublished()) {
+        syslog(LOG_NOTICE, "NearfieldAudioDevice: will follow the displays to %.0f Hz once Nearfield is shown", sampleRate);
+        return;
+    }
+    if (followSampleRateAttempts >= kFollowSampleRateAttempts) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: Core Audio did not switch Nearfield to %.0f Hz", sampleRate);
+        return;
+    }
+    ++followSampleRateAttempts;
+    syslog(LOG_NOTICE, "NearfieldAudioDevice: following the displays to %.0f Hz", sampleRate);
+    const OSStatus status =
+        gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, (UInt64)sampleRate, NULL);
+    if (status != noErr) {
+        syslog(LOG_WARNING, "NearfieldAudioDevice: Core Audio refused the change to %.0f Hz (%d)", sampleRate, (int)status);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kFollowSampleRateCheckSeconds * NSEC_PER_SEC)),
+                   AudioOutputDispatchQueue(), ^{
+        if (token != followSampleRateToken || followedSampleRate <= 0) {
+            return;
+        }
+        followDisplaysSampleRate(followedSampleRate);
+    });
+}
+
+void ProxyAudioDevice::stopFollowingDisplaysSampleRate() {
+    followedSampleRate = 0;
+    followSampleRateAttempts = 0;
+    ++followSampleRateToken;
 }
 
 // Recomputed only when the displays, their aggregate or the configuration
@@ -5153,6 +5200,19 @@ void ProxyAudioDevice::setDisplaysHidden(bool hidden) {
            hidden ? "fewer than two displays" : "displays are back");
     notifyDeviceListChanged();
     notifyStatusChanged();
+    if (!hidden && followedSampleRate > 0) {
+        // Give coreaudiod time to add the device back (0.7 s on 2026-11-15)
+        // before asking it to change the rate.
+        followSampleRateAttempts = 0;
+        const UInt64 token = ++followSampleRateToken;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kFollowSampleRateCheckSeconds * NSEC_PER_SEC)),
+                       AudioOutputDispatchQueue(), ^{
+            if (token != followSampleRateToken || followedSampleRate <= 0) {
+                return;
+            }
+            followDisplaysSampleRate(followedSampleRate);
+        });
+    }
 }
 
 bool ProxyAudioDevice::deviceIsPublished() {
