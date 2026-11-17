@@ -43,6 +43,11 @@ constexpr double kSafetyGapStepMilliseconds = 4.0;
 constexpr double kMaxExtraSafetyGapMilliseconds = 40.0;
 constexpr double kSafetyGapDecaySeconds = 60.0;
 constexpr double kMinimumTrimMilliseconds = 5.0;
+// Extra delay that stays above this for kBacklogSeconds while the audio
+// keeps playing is skipped with a short fade. Below it, steering drains the
+// delay at up to kMaxSteeringPPM without anything audible.
+constexpr double kBacklogMilliseconds = 50.0;
+constexpr double kBacklogSeconds = 1.0;
 // About -90 dBFS: treat as silence when trimming excess delay.
 constexpr float kSilenceThreshold = 3.2e-5f;
 constexpr double kRateEstimateSeconds = 4.0;
@@ -109,6 +114,10 @@ struct PlaybackCounters {
     std::atomic<uint64_t> lastColdStartBufferedFrames{0};
     // Audio written while the displays started, skipped to keep the latency.
     std::atomic<uint64_t> coldStartSkippedFrames{0};
+    // Extra delay skipped while the audio was playing (after the displays'
+    // output stalled), with the number of skips.
+    std::atomic<uint64_t> backlogSkips{0};
+    std::atomic<uint64_t> backlogSkippedFrames{0};
     std::atomic<uint64_t> readerCallbacks{0};
     std::atomic<uint64_t> writerCallbacks{0};
 };
@@ -402,6 +411,7 @@ class PlaybackEngine {
             updateSteering(end - readPosition, frames, rate, gap);
             decaySafetyGap();
         } else {
+            backlogFrames = 0;
             relaxSteering();
         }
         readerPublishedPosition.store(readPosition, std::memory_order_release);
@@ -552,6 +562,7 @@ class PlaybackEngine {
         state = State::idle;
         fadeInRemaining = 0;
         drainedSignalled = false;
+        backlogFrames = 0;
         relaxSteering();
         latencyAverageValid = false;
     }
@@ -618,23 +629,57 @@ class PlaybackEngine {
         recordDiagnostic(kDiagnosticSafetyGap, 0, 0, 0, currentSafetyGapMilliseconds());
     }
 
-    // Drops extra delay (from a cold start or a widened gap that has since
-    // shrunk) while the audio is silent, so nothing audible is skipped.
-    void trimExcessDelay(RingStorage *ring, const float *rendered, uint32_t frames, int64_t end, int64_t gap,
+    // Drops extra delay (from a cold start, a widened gap that has since
+    // shrunk, or an output stall) while the audio is silent, so nothing
+    // audible is skipped. Extra delay that lasts while the audio keeps
+    // playing is skipped with a fade (see skipBacklog).
+    void trimExcessDelay(RingStorage *ring, float *rendered, uint32_t frames, int64_t end, int64_t gap,
                          double rate) noexcept {
         const int64_t excess = (end - readPosition) - gap;
-        if (excess <= trimToleranceFrames(rate) || !isSilent(rendered, frames)) {
+        if (excess <= trimToleranceFrames(rate)) {
+            backlogFrames = 0;
             return;
         }
-        const uint32_t skippable = silentFrames(ring, readPosition, static_cast<uint32_t>(excess));
+        const uint32_t skippable =
+            isSilent(rendered, frames) ? silentFrames(ring, readPosition, static_cast<uint32_t>(excess)) : 0;
         if (skippable == 0) {
+            skipBacklog(rendered, frames, excess, rate);
             return;
         }
+        backlogFrames = 0;
         readPosition += skippable;
         stats.trimmedFrames.fetch_add(skippable, std::memory_order_relaxed);
         restartSteeringReference();
         latencyAverageValid = false;
         recordDiagnostic(kDiagnosticTrim, static_cast<int32_t>(skippable), 0, 0, static_cast<double>(excess));
+        raise(kSignalLatency | kSignalCounters);
+    }
+
+    // The displays' output can stall for most of a second while Core Audio
+    // reconfigures (another app starting or stopping its audio) while
+    // Nearfield's clock keeps running, leaving that much audio buffered.
+    // Steering would take about half an hour to drain 500 ms, with the
+    // sound late against video all along, and continuous audio may never
+    // be silent enough to trim. Once the extra delay has lasted a second,
+    // fade out, skip it and fade back in.
+    void skipBacklog(float *rendered, uint32_t frames, int64_t excess, double rate) noexcept {
+        if (static_cast<double>(excess) <= kBacklogMilliseconds * rate / 1000.0) {
+            backlogFrames = 0;
+            return;
+        }
+        backlogFrames += frames;
+        if (backlogFrames < static_cast<uint64_t>(kBacklogSeconds * rate)) {
+            return;
+        }
+        backlogFrames = 0;
+        applyFadeOut(rendered, frames, fadeFrames(rate));
+        readPosition += excess;
+        fadeInRemaining = fadeFrames(rate);
+        stats.backlogSkips.fetch_add(1, std::memory_order_relaxed);
+        stats.backlogSkippedFrames.fetch_add(static_cast<uint64_t>(excess), std::memory_order_relaxed);
+        restartSteeringReference();
+        latencyAverageValid = false;
+        recordDiagnostic(kDiagnosticBacklogSkip, static_cast<int32_t>(excess), 0, 0, static_cast<double>(excess));
         raise(kSignalLatency | kSignalCounters);
     }
 
@@ -668,8 +713,8 @@ class PlaybackEngine {
     // Keeps the buffered amount steady by nudging the Nearfield device's
     // clock when the output clock drifts relative to it. The target is the
     // amount buffered once playback settles, but never more than trimming
-    // keeps, so extra delay (from a cold start) also drains while the audio
-    // never pauses, at most 300 ppm (inaudible).
+    // keeps, so small extra delay also drains while the audio never pauses,
+    // at most 300 ppm (inaudible). Larger delay is skipped (skipBacklog).
     void updateSteering(int64_t buffered, uint32_t frames, double rate, int64_t gap) noexcept {
         if (!steeringEnabled.load(std::memory_order_relaxed)) {
             relaxSteering();
@@ -877,6 +922,8 @@ class PlaybackEngine {
     State state = State::idle;
     int64_t readPosition = 0;
     uint32_t fadeInRemaining = 0;
+    // Frames played in a row with more than kBacklogMilliseconds extra delay.
+    uint64_t backlogFrames = 0;
     bool drainedSignalled = false;
     double extraSafetyGapMilliseconds = 0;
     uint64_t lastUnderrunHostTime = 0;

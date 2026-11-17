@@ -46,6 +46,8 @@ enum DiagnosticKind : uint32_t {
     kDiagnosticBufferSizes = 15,
     // d0 rate correction (ppm), d1 output rate scalar
     kDiagnosticClock = 16,
+    // i0 frames skipped, d0 extra delay before skipping (frames); audio was playing
+    kDiagnosticBacklogSkip = 17,
 };
 
 struct DiagnosticRecord {
@@ -77,6 +79,7 @@ inline const char *diagnosticKindName(uint32_t kind) {
         case kDiagnosticLatency: return "latency";
         case kDiagnosticBufferSizes: return "buffer-sizes";
         case kDiagnosticClock: return "clock";
+        case kDiagnosticBacklogSkip: return "backlog-skip";
         default: return "unknown";
     }
 }

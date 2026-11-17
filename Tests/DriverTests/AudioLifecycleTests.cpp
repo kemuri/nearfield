@@ -1424,6 +1424,7 @@ struct SimulationResult {
     double finalBufferedMilliseconds = 0;
     // After |settledAfterSeconds|.
     double maximumSettledBufferedMilliseconds = 0;
+    uint64_t backlogSkips = 0;
 };
 
 struct SimulationOptions {
@@ -1433,6 +1434,10 @@ struct SimulationOptions {
     double silenceFrom = -1;
     double silenceUntil = -1;
     double settledAfterSeconds = 1e9;
+    // The displays' output stops calling back for this long at |stallAt|
+    // seconds while the Nearfield clock keeps running.
+    double stallAt = -1;
+    double stallMilliseconds = 0;
 };
 
 // Runs the writer on the Nearfield clock (steered by the engine) and the
@@ -1463,6 +1468,7 @@ static SimulationResult simulateClocks(double driftPPM, bool reportDrift, nearfi
     SimulationResult result;
     uint64_t underrunsAtWarmup = 0;
     bool warmedUp = false;
+    bool stalled = false;
     while (writerNominal < end || readerNominal < end) {
         const double writerAt = writerNominal + jitter(random);
         const double readerAt = readerNominal + jitter(random);
@@ -1477,6 +1483,10 @@ static SimulationResult simulateClocks(double driftPPM, bool reportDrift, nearfi
             engine.read(out.data(), kFrames, (uint64_t)readerAt, reportedRateScalar, 1.0f, 1.0f);
             readerNominal += kFrames * outputTicksPerFrame;
             const double simulatedSeconds = readerNominal / (kRate * ticksPerFrame);
+            if (!stalled && options.stallAt >= 0 && simulatedSeconds >= options.stallAt) {
+                stalled = true;
+                readerNominal += options.stallMilliseconds * kRate / 1000.0 * ticksPerFrame;
+            }
             if (!warmedUp && simulatedSeconds > 5) {
                 warmedUp = true;
                 underrunsAtWarmup = engine.counters().underruns.load();
@@ -1494,6 +1504,7 @@ static SimulationResult simulateClocks(double driftPPM, bool reportDrift, nearfi
     }
     result.underruns = engine.counters().underruns.load() - underrunsAtWarmup;
     result.finalCorrectionPPM = engine.steeringPPM();
+    result.backlogSkips = engine.counters().backlogSkips.load();
     return result;
 }
 
@@ -1518,6 +1529,11 @@ static void testSimulatedClockDriftAndBufferFill() {
     // underrunning, which is why the clock is steered as well.
     SimulationResult gapOnly = simulateClocks(80, false, Strategy::gap, 600, 1.0);
     CHECK(gapOnly.underruns > 0);
+
+    // Ordinary drift and jitter never look like a backlog to skip.
+    CHECK(reported.backlogSkips == 0);
+    CHECK(steered.backlogSkips == 0);
+    CHECK(steeredSlow.backlogSkips == 0);
 
     std::printf("  simulated drift: reported %.1f-%.1f ms, steered %.1f-%.1f ms (%.0f ppm), gap only %llu underruns\n",
                 reported.minimumBufferedMilliseconds, reported.maximumBufferedMilliseconds,
@@ -1560,6 +1576,39 @@ static void testColdStartDelayDoesNotComeBack() {
     CHECK(drained.maximumSettledBufferedMilliseconds < 50);
     CHECK(drifting.underruns == 0);
     CHECK(drifting.maximumSettledBufferedMilliseconds < 60);
+    CHECK(trimmed.backlogSkips == 0);
+    CHECK(drained.backlogSkips == 0);
+    CHECK(drifting.backlogSkips == 0);
+}
+
+// Measured on hardware (driver 1.3.3): another app starting its audio made
+// the displays' output stop calling back for 867 ms while the Nearfield
+// clock caught up after 335 ms, leaving 530 ms buffered. With video playing
+// the audio was never silent enough to trim, so it stayed about half a second
+// late, drifting by 18 ms a minute as steering drained it at 300 ppm.
+static void testOutputStallBacklogIsSkippedWhileAudioPlays() {
+    using Strategy = nearfield::UnderrunStrategy;
+    SimulationOptions stall;
+    stall.stallAt = 20;
+    stall.stallMilliseconds = 530;
+    stall.settledAfterSeconds = 23;
+    const SimulationResult steady = simulateClocks(0, true, Strategy::both, 120, 1.0, stall);
+    const SimulationResult drifting = simulateClocks(80, false, Strategy::both, 120, 1.0, stall);
+    const SimulationResult gapOnly = simulateClocks(0, true, Strategy::gap, 120, 1.0, stall);
+
+    std::printf("  output stall: settled %.1f ms (%llu skips, %llu underruns), drifting %.1f ms (%llu skips), "
+                "gap only %.1f ms (%llu skips)\n",
+                steady.maximumSettledBufferedMilliseconds, steady.backlogSkips, steady.underruns,
+                drifting.maximumSettledBufferedMilliseconds, drifting.backlogSkips,
+                gapOnly.maximumSettledBufferedMilliseconds, gapOnly.backlogSkips);
+    CHECK(steady.backlogSkips == 1);
+    CHECK(steady.underruns == 0);
+    CHECK(steady.maximumSettledBufferedMilliseconds < 50);
+    CHECK(drifting.backlogSkips == 1);
+    CHECK(drifting.maximumSettledBufferedMilliseconds < 60);
+    // Without steering the backlog would never drain at all.
+    CHECK(gapOnly.backlogSkips == 1);
+    CHECK(gapOnly.maximumSettledBufferedMilliseconds < 50);
 }
 
 // MARK: Allocation guard
@@ -1842,6 +1891,7 @@ int main(int argc, char **argv) {
         {"device name reads and renames", testDeviceNameReadsDoNotRaceWithRenames, true, false},
         {"simulated clock drift and buffer fill", testSimulatedClockDriftAndBufferFill, false, false},
         {"cold start delay does not come back", testColdStartDelayDoesNotComeBack, false, false},
+        {"output stall backlog is skipped while audio plays", testOutputStallBacklogIsSkippedWhileAudioPlays, false, false},
         {"audio callbacks do not allocate", testAudioCallbacksDoNotAllocate, false, true},
         {"zero time stamps under contention", testZeroTimeStampsAreConsistentUnderContention, true, false},
         {"team identifier from the driver bundle", testTeamIdentifierComesFromTheDriverBundle, false, false},
