@@ -1,0 +1,14 @@
+{
+  "version": "0.2.8",
+  "summary": [
+    "Keeps sound in sync with video when another app starts using the microphone, such as joining a call.",
+    "Fixes Nearfield staying silent after the displays came back at a different sample rate.",
+    "Audio from apps that show web content, like the Search browser or Raycast, now follows that app's window instead of Safari's."
+  ],
+  "changes": [
+    "Includes audio driver 1.3.4.",
+    "When an app starts using the microphone with voice processing, for example when joining a call, macOS briefly pauses all audio. The displays could resume later than the apps playing into Nearfield, leaving sound up to half a second behind the picture, and it took about half an hour to catch up while audio kept playing. Nearfield now skips the leftover delay after a second with a short fade.",
+    "If the displays changed their sample rate while they were disconnected or asleep, Nearfield could stay silent after they came back until the rate was changed by hand. It now follows the displays' rate once they return.",
+    "Apps that show web content, such as the Search browser, Raycast and Citrix Workspace, play their audio from a separate system process that followed Safari's window. That audio now follows the app it belongs to, and plays on both displays when that app has no routing rule."
+  ]
+}
