@@ -225,6 +225,68 @@ final class AudioReliabilityTests: XCTestCase {
         ], rawRules: "app.running=left; app.stopped=window"), ["app.running": "left"])
     }
 
+    // Seen 2026-11-16: the Search browser (a WebKit app) played YouTube from
+    // its own com.apple.WebKit.GPU process. Only window owners got process
+    // routes, so the helper matched the Safari alias rule and followed
+    // Safari's window; Raycast's and Citrix's WebKit audio did too.
+    @MainActor
+    func testWebKitHelpersFollowTheAppResponsibleForThem() {
+        var windows = [
+            Self.window(pid: 101, x: 10, size: 150, id: 1),   // Safari, left
+            Self.window(pid: 201, x: 510, size: 150, id: 2)   // Search, right
+        ]
+        let resolver = WindowAudioRouteResolver(
+            runningApplications: {
+                [
+                    .init(bundleID: "com.apple.Safari", processID: 101),
+                    .init(bundleID: "com.officecommun.search", processID: 201),
+                    .init(bundleID: "com.raycast.macos", processID: 301)
+                ]
+            },
+            windowList: { windows },
+            audioClientProcesses: {
+                [
+                    .init(processID: 102, bundleID: "com.apple.WebKit.GPU", responsibleProcessID: 101),
+                    .init(processID: 202, bundleID: "com.apple.WebKit.GPU", responsibleProcessID: 201),
+                    .init(processID: 302, bundleID: "com.apple.WebKit.GPU", responsibleProcessID: 301),
+                    // Responsible for itself: matched by its bundle rule as before.
+                    .init(processID: 401, bundleID: "com.apple.Safari.SandboxBroker", responsibleProcessID: 401),
+                    // Plays for an app without a route and has no rule of its own.
+                    .init(processID: 502, bundleID: "com.example.helper", responsibleProcessID: 501)
+                ]
+            },
+            displayTargets: {
+                [
+                    .init(route: "left", bounds: CGRect(x: 0, y: 0, width: 500, height: 500)),
+                    .init(route: "right", bounds: CGRect(x: 500, y: 0, width: 500, height: 500))
+                ]
+            }
+        )
+        let rules = "com.apple.Safari=window; com.apple.WebKit.GPU=window:com.apple.Safari; " +
+            "com.apple.Safari.SandboxBroker=window:com.apple.Safari; com.officecommun.search=window"
+        XCTAssertEqual(
+            resolver.resolvedRules(from: rules),
+            "pid:101=left; com.apple.Safari=left; pid:101=left; com.apple.WebKit.GPU=left; " +
+                "pid:101=left; com.apple.Safari.SandboxBroker=left; pid:201=right; com.officecommun.search=right; " +
+                "pid:102=left; pid:202=right; pid:302=pair"
+        )
+
+        // Search moves to the left display; its audio goes with it.
+        windows[1] = Self.window(pid: 201, x: 10, size: 120, id: 2)
+        XCTAssertTrue(resolver.resolvedRules(from: rules).hasSuffix("pid:102=left; pid:202=left; pid:302=pair"))
+
+        // Without a visible window, the helper plays where the app's rule falls back to.
+        windows.removeLast()
+        XCTAssertTrue(resolver.resolvedRules(from: rules).hasSuffix("pid:102=left; pid:202=pair; pid:302=pair"))
+
+        // Search routed on its own, Safari not at all: Search's helper still follows Search.
+        windows = [Self.window(pid: 201, x: 510, size: 150, id: 2)]
+        XCTAssertEqual(
+            resolver.resolvedRules(from: "com.officecommun.search=window"),
+            "pid:201=right; com.officecommun.search=right; pid:202=right"
+        )
+    }
+
     private static func window(pid: Int32, x: CGFloat, size: CGFloat, id: UInt32 = 1) -> [String: Any] {
         [
             kCGWindowNumber as String: NSNumber(value: id),

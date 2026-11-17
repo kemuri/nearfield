@@ -38,12 +38,16 @@ final class WindowRouteFollower: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var lastResult: (generation: UInt64, rules: String)?
     private var immediateCheckScheduled = false
+    private let audioClientProcesses = AudioClientProcessCatalog()
     private lazy var resolver = WindowAudioRouteResolver(
         runningApplications: { [unowned self] in self.checkedConfiguration.runningApplications },
         windowList: {
             CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] ?? []
         },
+        // Read on this queue: a check follows every change to Core Audio's
+        // process list (see ProcessPlaybackMonitor).
+        audioClientProcesses: { [unowned self] in self.audioClientProcesses.current() },
         displayTargets: { [unowned self] in self.checkedConfiguration.displayTargets }
     )
 

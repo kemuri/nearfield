@@ -15,6 +15,17 @@ final class WindowAudioRouteResolver {
         let processID: pid_t
     }
 
+    /// A Core Audio client and the process macOS holds responsible for it.
+    /// WebKit apps (Safari, and any app showing web content such as the
+    /// Search browser, Raycast or Citrix Workspace) play audio from their own
+    /// copy of the shared `com.apple.WebKit.GPU` process; its responsible
+    /// process is the app.
+    struct AudioClientProcess: Equatable, Sendable {
+        let processID: pid_t
+        let bundleID: String?
+        let responsibleProcessID: pid_t
+    }
+
     private struct WindowRoute {
         let processID: pid_t
         let windowID: CGWindowID?
@@ -33,6 +44,7 @@ final class WindowAudioRouteResolver {
     private let displayOrderUIDs: () -> [String]
     private let runningApplications: () -> [RunningApplication]
     private let windowList: () -> [[String: Any]]
+    private let audioClientProcesses: () -> [AudioClientProcess]
     private let targetProvider: (() -> [DisplayTarget])?
 
     init(
@@ -49,6 +61,7 @@ final class WindowAudioRouteResolver {
             CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] ?? []
         },
+        audioClientProcesses: @escaping () -> [AudioClientProcess] = { [] },
         displayTargets: (() -> [DisplayTarget])? = nil
     ) {
         self.studioDisplays = studioDisplays
@@ -56,6 +69,7 @@ final class WindowAudioRouteResolver {
         self.displayOrderUIDs = displayOrderUIDs
         self.runningApplications = runningApplications
         self.windowList = windowList
+        self.audioClientProcesses = audioClientProcesses
         self.targetProvider = displayTargets
     }
 
@@ -87,24 +101,81 @@ final class WindowAudioRouteResolver {
         let rules = AppRoutingRules.parse(rawRules)
         let sourceBundleIDs = Set(windowScopedSourceBundleIDs(in: rawRules))
         selectedWindows = selectedWindows.filter { sourceBundleIDs.contains($0.value.bundleID) }
+        let helpers = sourceBundleIDs.isEmpty ? [] : audioClientProcesses().filter {
+            $0.processID > 0 && $0.responsibleProcessID > 0 && $0.responsibleProcessID != $0.processID
+        }
+        let runningApps = sourceBundleIDs.isEmpty ? [] : runningApplications()
         let routesByBundleID = sourceBundleIDs.isEmpty ? [:] : visibleWindowRoutes(
             for: sourceBundleIDs,
-            runningApps: runningApplications()
+            runningApps: runningApps
         )
 
         var resolvedRules: [String] = []
+        var routeByBundleID: [String: String] = [:]
+        var windowRouteByProcessID: [pid_t: String] = [:]
         for rule in rules {
             if AppRoutingRules.isWindowScopedDestination(rule.destination) {
                 let routes = routesByBundleID[windowScopedSourceBundleID(for: rule)] ?? []
                 let expandedRule = windowScopedRules(routes: routes)
-                resolvedRules.append(contentsOf: expandedRule.processRules)
+                resolvedRules.append(contentsOf: Self.processRules(expandedRule.processRoutes))
                 resolvedRules.append("\(rule.bundleID)=\(expandedRule.fallbackRoute)")
+                routeByBundleID[rule.bundleID] = expandedRule.fallbackRoute
+                windowRouteByProcessID.merge(expandedRule.processRoutes) { current, _ in current }
             } else {
-                resolvedRules.append("\(rule.bundleID)=\(normalizedDestination(rule.destination))")
+                let destination = normalizedDestination(rule.destination)
+                resolvedRules.append("\(rule.bundleID)=\(destination)")
+                routeByBundleID[rule.bundleID] = destination
             }
         }
+        resolvedRules.append(contentsOf: Self.processRules(helperProcessRoutes(
+            helpers: helpers,
+            rules: rules,
+            routeByBundleID: routeByBundleID,
+            windowRouteByProcessID: windowRouteByProcessID,
+            runningApps: runningApps
+        )))
 
         return resolvedRules.joined(separator: "; ")
+    }
+
+    /// Routes for helper processes that play audio for an app, by the app
+    /// macOS holds responsible for them. The driver matches a client's
+    /// process before its bundle ID, and helpers often share a bundle ID
+    /// across apps: every WebKit app's audio comes from a process named
+    /// `com.apple.WebKit.GPU`, whose bundle rule follows Safari's window.
+    /// A helper of a routed app follows that app's window; a helper of any
+    /// other app plays on both displays instead of following Safari.
+    private func helperProcessRoutes(
+        helpers: [AudioClientProcess],
+        rules: [AppRoutingRule],
+        routeByBundleID: [String: String],
+        windowRouteByProcessID: [pid_t: String],
+        runningApps: [RunningApplication]
+    ) -> [pid_t: String] {
+        guard !helpers.isEmpty else { return [:] }
+        var bundleIDByPID: [pid_t: String] = [:]
+        for app in runningApps {
+            bundleIDByPID[app.processID] = app.bundleID
+        }
+        var routes: [pid_t: String] = [:]
+        for helper in helpers where windowRouteByProcessID[helper.processID] == nil {
+            if let appBundleID = bundleIDByPID[helper.responsibleProcessID],
+               let rule = rules.first(where: { $0.bundleID == appBundleID }),
+               let appRoute = routeByBundleID[appBundleID] {
+                routes[helper.processID] = AppRoutingRules.isWindowScopedDestination(rule.destination)
+                    ? windowRouteByProcessID[helper.responsibleProcessID] ?? appRoute
+                    : appRoute
+            } else if let bundleID = helper.bundleID, routeByBundleID[bundleID] != nil {
+                routes[helper.processID] = "pair"
+            }
+        }
+        return routes
+    }
+
+    private static func processRules(_ routes: [pid_t: String]) -> [String] {
+        routes
+            .sorted { $0.key < $1.key }
+            .map { "pid:\($0.key)=\($0.value)" }
     }
 
     func fallbackRulesWithoutProcessOverrides(from rawRules: String) -> String {
@@ -178,9 +249,9 @@ final class WindowAudioRouteResolver {
             .uniquePreservingOrder()
     }
 
-    private func windowScopedRules(routes: [WindowRoute]) -> (processRules: [String], fallbackRoute: String) {
+    private func windowScopedRules(routes: [WindowRoute]) -> (processRoutes: [pid_t: String], fallbackRoute: String) {
         guard !routes.isEmpty else {
-            return ([], "pair")
+            return ([:], "pair")
         }
 
         var bestRouteByProcessID: [pid_t: WindowRoute] = [:]
@@ -192,11 +263,8 @@ final class WindowAudioRouteResolver {
             bestRouteByProcessID[route.processID] = route
         }
 
-        let processRules = bestRouteByProcessID
-            .sorted { $0.key < $1.key }
-            .map { "pid:\($0.key)=\($0.value.route)" }
         let fallbackRoute = routes.max(by: { $0.area < $1.area })?.route ?? "pair"
-        return (processRules, fallbackRoute)
+        return (bestRouteByProcessID.mapValues(\.route), fallbackRoute)
     }
 
     private func isAnyBundleRunning(_ bundleIDs: [String]) -> Bool {
